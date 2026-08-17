@@ -1,0 +1,126 @@
+"""SQLite 持久化层：连接管理 + schema 初始化。
+
+单文件 ``platform.db``，WAL 模式（读写并发），``foreign_keys=ON``（tests 级联删除）。
+单连接 ``check_same_thread=False``，写事务由 ``service.import_lock`` / ``tests.test_lock``
+保护（避免并发写触发 SQLite BUSY）。
+
+迁移版本记在 ``meta.schema_version``，未来 schema 演进在此 bump + 加迁移逻辑。
+"""
+import sqlite3
+from pathlib import Path
+
+from .config import DB_PATH
+
+SCHEMA_VERSION = "2"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS objects(
+  id TEXT, version TEXT, type TEXT, layer TEXT, scope TEXT,
+  nf TEXT, domain TEXT, scenario TEXT,
+  source_path TEXT, name TEXT, frontmatter_json TEXT,
+  body_md TEXT, raw_md TEXT, mtime REAL,
+  PRIMARY KEY(id, version)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_objects_nf ON objects(nf);
+CREATE INDEX IF NOT EXISTS idx_objects_type ON objects(type);
+
+CREATE TABLE IF NOT EXISTS edges(
+  from_id TEXT, from_version TEXT, relation TEXT, "to" TEXT,
+  PRIMARY KEY(from_id, from_version, relation, "to")
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_edges_to ON edges("to");
+
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY, value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS users(
+  username TEXT PRIMARY KEY, key TEXT,
+  can_frontend INT, can_assets INT, can_upload INT, can_test INT, can_skill INT, is_admin INT,
+  created_at TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS trash(
+  id TEXT PRIMARY KEY, original_path TEXT, is_dir INT,
+  md_count INT, deleted_at TEXT, deleted_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS telemetry(
+  ts TEXT, level TEXT, caller TEXT, endpoint TEXT,
+  obj_id TEXT, obj_type TEXT, user TEXT, operator TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tel_stats ON telemetry(level, caller, endpoint, ts);
+CREATE INDEX IF NOT EXISTS idx_tel_user ON telemetry(user, level, ts);
+
+CREATE TABLE IF NOT EXISTS test_cases(
+  id TEXT PRIMARY KEY, domain TEXT, scenario TEXT, name TEXT,
+  status TEXT, solution TEXT, author TEXT, created_at TEXT,
+  body_md TEXT, raw_md TEXT, source_path TEXT, frontmatter_json TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS test_runs(
+  id TEXT PRIMARY KEY, case_id TEXT REFERENCES test_cases(id) ON DELETE CASCADE,
+  name TEXT, runner TEXT, run_at TEXT, status TEXT, latest_verdict TEXT,
+  body_md TEXT, raw_md TEXT, source_path TEXT, frontmatter_json TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS test_reviews(
+  id TEXT PRIMARY KEY, run_id TEXT REFERENCES test_runs(id) ON DELETE CASCADE,
+  reviewer TEXT, reviewed_at TEXT, verdict TEXT,
+  body_md TEXT, raw_md TEXT, source_path TEXT, frontmatter_json TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS test_review_problems(
+  id INTEGER PRIMARY KEY, review_id TEXT REFERENCES test_reviews(id) ON DELETE CASCADE,
+  idx INT, description TEXT, attribution_json TEXT, objects_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS test_artifacts(
+  id INTEGER PRIMARY KEY, owner_type TEXT, owner_id TEXT,
+  path TEXT, kind TEXT, size INT
+);
+CREATE INDEX IF NOT EXISTS idx_runs_case ON test_runs(case_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_run ON test_reviews(run_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_owner ON test_artifacts(owner_type, owner_id);
+"""
+
+
+def get_db(path: Path = None) -> sqlite3.Connection:
+    """打开/创建 SQLite 连接（WAL + foreign_keys + Row 工厂）。"""
+    conn = sqlite3.connect(str(path or DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    """建表（IF NOT EXISTS）+ 记录 schema_version。幂等。"""
+    conn.executescript(_SCHEMA)
+    # v2 迁移：users.can_assets（资产目录权限）。旧库补列 + admin 回填
+    # （check_perm 对 is_admin 短路全权，回填使 DB 位与实际效力一致）。幂等。
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "can_assets" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN can_assets INT DEFAULT 0")
+    conn.execute("UPDATE users SET can_assets=1 WHERE is_admin=1 AND can_assets=0")
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+        (SCHEMA_VERSION,),
+    )
+    conn.commit()
+
+
+_shared: "sqlite3.Connection | None" = None
+
+
+def get_shared_db() -> sqlite3.Connection:
+    """全局共享连接单例（service / users / store / telemetry 共用，避免多连接写冲突）。
+
+    首次调用打开 ``DB_PATH`` 并 ``init_schema``；之后复用。测试通过 ``monkeypatch``
+    把 ``db._shared`` 指向 tmp 连接来隔离。
+    """
+    global _shared
+    if _shared is None:
+        _shared = get_db()
+        init_schema(_shared)
+    return _shared

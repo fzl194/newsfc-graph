@@ -1,0 +1,39 @@
+# ===== 产品文档原料（含华为版权文档，绝不上传）=====
+output/
+三层图谱资产/
+
+# ===== 汇报材料（对外可见性单独评审，不随代码仓发布）=====
+云核心网配置知识图谱与Agent配置生成汇报.md
+
+# ===== Python =====
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# ===== Node =====
+node_modules/
+graph-asset-platform/frontend/dist/
+.vite/
+
+# ===== 运行时数据（真实图谱索引/用户明文KEY/打点/测试运行，全部本地）=====
+graph-asset-platform/platform-data/
+graph-asset-platform/e2e-data/
+*.db
+*.db-shm
+*.db-wal
+
+# ===== Playwright 产物 =====
+graph-asset-platform/frontend/test-results/
+graph-asset-platform/frontend/playwright-report/
+graph-asset-platform/frontend/blob-report/
+graph-asset-platform/frontend/.playwright/
+
+# ===== 归档与杂项 =====
+*.tar
+graph-asset-platform/gap.tar
+*.log
+_imports.log
+.DS_Store
+Thumbs.db

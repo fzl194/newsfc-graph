@@ -1,0 +1,22 @@
+# 数据走 bind mount，不进镜像；且体量大，排除以保持构建上下文精简
+platform-data
+
+# 前端依赖与已构建产物（镜像内重新 npm ci + build）
+**/node_modules
+frontend/dist
+
+# Python 缓存与本地调试脚本
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+backend/_dbg_dump.py
+
+# 仓库元数据 / 文档（镜像不需要）
+.git
+.gitignore
+docs
+*.md
+
+# 本地环境
+.env
+.env.*

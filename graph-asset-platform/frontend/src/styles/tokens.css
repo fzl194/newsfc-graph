@@ -1,0 +1,382 @@
+/* 设计令牌 —— 技术数据工作站 (Obsidian × Linear × GitHub code-browser)
+   浅色工程风：暖中性底 + 单一 indigo 强调色。内容优先、精密、克制。 */
+
+:root {
+  /* 背景层 */
+  --bg: #fafaf9;            /* stone-50 暖中性底 */
+  --bg-elev: #ffffff;       /* 卡片面 */
+  --bg-sunken: #f5f5f4;     /* 凹陷区(树/侧栏) stone-100 */
+  --bg-hover: #f7f7f5;
+
+  /* 边框 */
+  --border: #e7e5e4;        /* stone-200 */
+  --border-strong: #d6d3d1; /* stone-300 */
+  --border-faint: #efeeec;
+  --tree-line: #e7e5e4;     /* 树引导线：与 border 同色，可独立调淡 */
+
+  /* 文字 */
+  --text: #1c1917;          /* stone-900 标题 */
+  --text-muted: #57534e;    /* stone-600 正文 */
+  --text-faint: #a8a29e;    /* stone-400 辅助 */
+
+  /* 强调色（唯一） */
+  --accent: #4f46e5;        /* indigo-600 */
+  --accent-soft: #eef2ff;   /* indigo-50 */
+  --accent-hover: #4338ca;
+  --accent-ring: rgba(79, 70, 229, 0.18);
+
+  /* 语义色 */
+  --success: #059669;
+  --warn: #d97706;
+  --danger: #dc2626;
+
+  /* 圆角 */
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 14px;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgba(28, 25, 23, 0.05);
+  --shadow-md: 0 6px 24px rgba(28, 25, 23, 0.07);
+  --shadow-lg: 0 18px 48px rgba(28, 25, 23, 0.09);
+
+  /* 字体族 */
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, monospace;
+  --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --display: 'Space Grotesk', 'Inter', system-ui, sans-serif;
+
+  /* 间距节奏 4/8 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* 动效 */
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 150ms;
+  --dur: 200ms;
+}
+
+/* ---- 全局 reset ---- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  /* 极淡的氛围层：右上 indigo 微光，叠在暖中性底上 */
+  background-image: radial-gradient(1200px 600px at 85% -8%, #eef2ff 0%, transparent 58%);
+  background-attachment: fixed;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- 滚动条美化（精密工具感） ---- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #b8b3ad;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* ---- 文本选中 ---- */
+::selection {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+/* ---- 等宽上下文：id / 路径 / 文件名一律 mono ---- */
+.mono {
+  font-family: var(--mono);
+  font-feature-settings: 'liga' 0;
+}
+
+/* ---- 视图挂载交错淡入（克制：仅一次） ---- */
+.stagger-in {
+  animation: fade-rise var(--dur) var(--ease) both;
+}
+
+.stagger-in:nth-child(1) { animation-delay: 0ms; }
+.stagger-in:nth-child(2) { animation-delay: 60ms; }
+.stagger-in:nth-child(3) { animation-delay: 120ms; }
+
+@keyframes fade-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- Element Plus 克制覆盖（去默认浓重感，融入工程风） ---- */
+.el-button {
+  --el-button-bg-color: var(--bg-elev);
+  --el-button-border-color: var(--border-strong);
+  --el-button-hover-bg-color: var(--accent-soft);
+  --el-button-hover-border-color: var(--accent);
+  --el-button-hover-text-color: var(--accent);
+  --el-button-active-bg-color: var(--accent-soft);
+  --el-button-active-border-color: var(--accent);
+  --el-button-active-text-color: var(--accent);
+  font-weight: 500;
+}
+
+.el-button--primary {
+  --el-button-bg-color: var(--accent);
+  --el-button-border-color: var(--accent);
+  --el-button-hover-bg-color: var(--accent-hover);
+  --el-button-hover-border-color: var(--accent-hover);
+  --el-button-hover-text-color: #fff;
+  --el-button-active-bg-color: var(--accent-hover);
+  --el-button-active-border-color: var(--accent-hover);
+  --el-button-active-text-color: #fff;
+}
+
+.el-input__wrapper,
+.el-textarea__inner {
+  background-color: var(--bg-elev) !important;
+  box-shadow: 0 0 0 1px var(--border-strong) inset !important;
+  border-radius: var(--radius-sm) !important;
+  transition: box-shadow var(--dur-fast) var(--ease) !important;
+}
+
+.el-input__wrapper.is-focus,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--accent) inset, 0 0 0 3px var(--accent-ring) inset !important;
+}
+
+.el-tree {
+  background: transparent;
+  --el-tree-node-hover-bg-color: var(--bg-hover);
+  --el-tree-text-color: var(--text);
+}
+
+.el-loading-mask {
+  background: rgba(250, 250, 249, 0.72);
+  backdrop-filter: blur(2px);
+}
+
+/* ---- markdown 渲染（技术文档气质） ---- */
+.md-body {
+  font-family: var(--sans);
+  color: var(--text);
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  font-family: var(--display);
+  color: var(--text);
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 1.6em 0 0.6em;
+}
+
+.md-body h1 {
+  font-size: 1.7em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+
+.md-body h2 {
+  font-size: 1.35em;
+  border-bottom: 1px solid var(--border-faint);
+  padding-bottom: 0.2em;
+}
+
+.md-body h3 {
+  font-size: 1.12em;
+}
+
+.md-body h4 {
+  font-size: 1em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.md-body p {
+  margin: 0.8em 0;
+}
+
+.md-body a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.md-body a:hover {
+  border-bottom-color: var(--accent);
+}
+
+/* 内联 wikilink（[[id]]）：与普通链接同色，加虚线下划线区分 */
+.md-body a.wiki-link,
+.md-body .wiki-link {
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.md-body a.wiki-link:hover,
+.md-body .wiki-link:hover {
+  background: var(--accent-soft);
+}
+
+.md-body code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: var(--bg-sunken);
+  padding: 0.12em 0.4em;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-faint);
+  color: var(--text);
+}
+
+.md-body pre {
+  background: #2a2724;       /* 深底代码块（技术工作站感） */
+  color: #e7e5e4;
+  border: 1px solid #3a3531;
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  overflow-x: auto;          /* 横向滚动，长命令不换行 */
+  font-size: 0.86em;
+  line-height: 1.6;
+  margin: 1em 0;
+}
+
+.md-body pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: 1em;
+}
+
+.md-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 0.92em;
+  display: block;            /* 窄列时允许横向滚动，不撑破布局 */
+  overflow-x: auto;
+}
+
+.md-body thead {
+  background: var(--bg-sunken);
+  border-bottom: 2px solid var(--border-strong);
+}
+
+.md-body th,
+.md-body td {
+  border: 1px solid var(--border);
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;       /* 长 token/命令串在单元格内换行，不撑爆表格 */
+  word-break: break-word;
+}
+
+.md-body th {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* zebra：偶数行底色更浅 */
+.md-body tbody tr:nth-child(even) {
+  background: var(--bg-sunken);
+}
+
+.md-body tbody tr:hover {
+  background: var(--accent-soft);
+}
+
+.md-body blockquote {
+  margin: 1em 0;
+  padding: var(--space-2) var(--space-4);
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-muted);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.md-body ul,
+.md-body ol {
+  padding-left: 1.4em;
+  margin: 0.8em 0;
+}
+
+.md-body li {
+  margin: 0.3em 0;
+}
+
+.md-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.8em 0;
+}
+
+.md-body img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+}

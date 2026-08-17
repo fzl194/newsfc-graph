@@ -1,0 +1,22 @@
+# 一键起图谱资产管理平台。
+# 数据走 bind mount（服务器目录权威），镜像只装代码；上传/导入落到服务器目录、容器重建不丢。
+#
+# 用法：
+#   1. 改下面 volumes 里的宿主路径为你服务器上想要的数据目录（首次部署前把现有
+#      platform-data/* 拷进去，或留空用前端"上传"页灌数据）。
+#   2. docker compose up -d --build
+#   3. 访问 http://<服务器>:8000
+
+services:
+  platform:
+    build: .
+    image: graph-asset-platform:latest
+    container_name: graph-asset-platform
+    # 宿主机网络：uvicorn 直接听宿主 80（镜像内 --port 80）。
+    # host 模式下 -p 端口映射会被忽略，故不配 ports，靠 uvicorn 监听 80 直通。
+    network_mode: host
+    volumes:
+      # 宿主数据目录 → 容器内 /app/platform-data（后端 config.py 固定读这个路径）。
+      # ← 把左侧改成你服务器的实际路径，例如 /data/graph-asset-platform
+      - ./data:/app/platform-data
+    restart: unless-stopped

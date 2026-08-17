@@ -1,0 +1,60 @@
+object_types:
+  MMLCommand:
+    layer: Command
+    scope: nf
+    id_segments: 3
+    frontmatter_required: [id, type, name, nf, version, source, status]
+  ConfigObject:
+    layer: ConfigObject
+    scope: nf
+    id_segments: 3
+    frontmatter_required: [id, type, name, nf, version, object_kind, source, status]
+  Feature:
+    layer: Feature
+    scope: nf
+    id_segments: 3
+    frontmatter_required: [id, type, nf, version]
+  License:
+    layer: License
+    scope: nf
+    id_segments: 3
+    frontmatter_required: [id, type, nf, version]
+  # Task 层（无版本——引用命令/特性不绑版本，用户用时自选）
+  Task:
+    layer: Task
+    scope: task
+    id_segments: 3
+    frontmatter_required: [id, type, nf]
+  AtomTask:
+    layer: Task
+    scope: task
+    id_segments: 3
+    frontmatter_required: [id, type, nf]
+  CompoundTask:
+    layer: Task
+    scope: task
+    id_segments: 3
+    frontmatter_required: [id, type, nf]
+  FeatureTask:
+    layer: Task
+    scope: task
+    id_segments: 3
+    frontmatter_required: [id, type, nf]
+  BusinessDomain:
+    layer: Business
+    scope: cross
+    id_segments: 2
+    path_fields: [domain]
+    frontmatter_required: [id, type, domain]
+  NetworkScenario:
+    layer: Business
+    scope: cross
+    id_segments: 2
+    path_fields: [domain, scenario]
+    frontmatter_required: [id, type, domain, scenario]
+  ConfigurationSolution:
+    layer: Business
+    scope: cross
+    id_segments: 2
+    path_fields: [domain, scenario]
+    frontmatter_required: [id, type, domain, scenario]

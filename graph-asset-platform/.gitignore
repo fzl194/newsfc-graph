@@ -1,0 +1,10 @@
+platform-data/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.vite/
+gap.tar
+*.tar
+# users.json 含明文 KEY（已被 platform-data/ 覆盖，显式注明）
+platform-data/users.json
