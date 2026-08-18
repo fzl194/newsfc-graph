@@ -254,6 +254,49 @@ def build_feature_codes(storage, nf: str, version: str) -> set[str]:
     return codes
 
 
+def build_license_codes(storage, nf: str, version: str) -> set[str]:
+    """扫 License/{nf}/{version}/{nf}@License@*.md，返回已建 license 码集合。"""
+    codes: set[str] = set()
+    d = Path(storage) / "License" / nf / version
+    if d.is_dir():
+        for f in d.glob(f"{nf}@License@*.md"):
+            codes.add(f.stem.split("@")[-1])
+    return codes
+
+
+def group_feature_codes(feature_dir) -> set[str]:
+    """特性源目录按文件归组口径（路径最深特性码）收集码集——与 build_features 归组一致，
+    供 build_licenses 的「对应特性」存在性校验（源组码 ∪ 已建码）。"""
+    codes: set[str] = set()
+    root = Path(feature_dir)
+    for f in root.rglob("*.md"):
+        last = ""
+        for seg in str(f.relative_to(root)).replace("\\", "/").split("/"):
+            m = FEATURE_CODE_RE.search(seg)
+            if m:
+                last = m.group(0)
+        if last:
+            codes.add(last)
+    return codes
+
+
+def scan_codes(text: str, pattern: "re.Pattern[str]", exclude: str = "") -> set[str]:
+    """全文收集 pattern 命中码（v0.21.0 特性层边锚定扫描）：逐行、代码块/TOC 行排除、
+    exclude（自身码）排除。md 互链的 URL 路径含目标特性码，天然被覆盖。"""
+    out: set[str] = set()
+    in_code = False
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or _TOC_LINE_RE.match(ln):
+            continue
+        for m in pattern.finditer(ln):
+            if m.group(0) != exclude:
+                out.add(m.group(0))
+    return out
+
+
 def extract_cmd_name(text: str) -> str:
     """从全角括号 （CMD） 抽命令名，如 '查询ACL规则组配置（LST ACLGROUP）_00841277.md' → 'LST ACLGROUP'。"""
     if not text:
@@ -326,9 +369,12 @@ def rewrite_doc_refs(md: str, nf: str, cmd_index: set[str], feature_codes: set[s
                      feature_src_to_id: dict | None = None) -> tuple[str, dict]:
     """改写 md 里的 [文字](目标) 文档引用为裸逻辑引用 [[ID]]：
     命令引用→[[{nf}@MMLCommand@{cmd}]]；特性引用→精确到具体子文档（feature_src_to_id 命中）否则退回概述 [[{nf}@Feature@{code}]]；
-    其余/不可解析→剥 URL 留文字。cmd_index/feature_codes 即存在性判定。返回 (新md, {resolved, stripped})。
+    其余/不可解析→剥 URL 留文字。cmd_index/feature_codes 即存在性判定。
+    返回 (新md, {resolved, stripped, cmd_targets})——cmd_targets=本md解析出的命令名去重列表，
+    供「使用命令」边（v0.21.0）在**本文档**的 ## 边 落边（子文档各自建，出处保留文档级）。
     """
     resolved = stripped = 0
+    cmd_targets: list[str] = []
 
     def repl(m: re.Match) -> str:
         nonlocal resolved, stripped
@@ -346,6 +392,8 @@ def rewrite_doc_refs(md: str, nf: str, cmd_index: set[str], feature_codes: set[s
                 cmd = bare
         if cmd and cmd in cmd_index:
             resolved += 1
+            if cmd not in cmd_targets:
+                cmd_targets.append(cmd)
             return f"[[{nf}@MMLCommand@{cmd}]]"
 
         # 特性引用：源文件名精确匹配优先（概述+子文档都能命中；子文档文件名无特性码，必须靠此）；否则按特性码退回概述
@@ -362,5 +410,5 @@ def rewrite_doc_refs(md: str, nf: str, cmd_index: set[str], feature_codes: set[s
         return label
 
     new_md = _LINK_RE.sub(repl, md)
-    return new_md, {"resolved": resolved, "stripped": stripped}
+    return new_md, {"resolved": resolved, "stripped": stripped, "cmd_targets": cmd_targets}
 

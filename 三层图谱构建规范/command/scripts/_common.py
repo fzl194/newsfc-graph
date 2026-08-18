@@ -164,6 +164,15 @@ def build_edges_section(edges: list[Edge]) -> str:
     return "## 边\n" + "\n".join(f"- {rel}: [[{tgt}]]" for rel, tgt in edges)
 
 
+def build_name_matcher(names: set[str]) -> "re.Pattern[str]":
+    """全量命令名 → 最长优先 alternation 正则（存在性校验内建于匹配本身）。
+    边界守卫 (?<![A-Z0-9_]) / (?![A-Z0-9_])：防 `ADD URR` 误配 `ADD URRINFO` 的前缀、
+    也防被更长 token 吞掉（`LST ACLGROUP6` 存在时优先整体命中）。"""
+    ordered = sorted((n for n in names if n), key=len, reverse=True)
+    pat = "(?<![A-Z0-9_])(?:" + "|".join(re.escape(n) for n in ordered) + ")(?![A-Z0-9_])"
+    return re.compile(pat)
+
+
 # ---------- 逻辑ID ----------
 def split_logical_id(logical_id: str) -> dict:
     """`UDG@MMLCommand@ADD URR` → {nf, type, local}。"""

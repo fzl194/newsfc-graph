@@ -9,6 +9,12 @@ ID 机制（v0.10.0）：
 - 子文档：{nf}@Feature@{feature_code}-{slug}（slug=源文件名净化；doc_type 只进 YAML 不进 ID）
 - 同特性内 slug 撞名 → 前面补一层父目录消歧。
 
+边机制（v0.21.0，CR-20260818-001）：
+- 依赖特性/所需License：概述+全部子文档**全文锚定扫描**聚合到概述（替代旧"仅概述限定章节"，
+  实测 UDG 丢 12%/UNC 丢 37%）；存在性校验（已建码集），悬空丢弃（跨 NF/跨产品码）。
+- 使用命令：各 md 解析出的命令引用落在**本文档** ## 边（子文档各自建，出处保留文档级）。
+  前置：build_all 已改为 licenses 先于 features（所需License 校验需 License 已建）。
+
 纯标准库。
 
 用法:
@@ -26,7 +32,7 @@ from pathlib import Path
 
 import _common
 
-SOP_VERSION = "0.12.0"
+SOP_VERSION = "0.21.0"
 VERBOSE = False
 
 
@@ -115,24 +121,20 @@ def assign_slugs(docs: list[tuple[Path, list[str]]], overview_idx: int | None) -
     return slugs
 
 
-def build_overview_edges(md_text: str, nf: str, code: str, sibling_ids: list[str]) -> list[_common.Edge]:
-    """概述边：所需License + 依赖特性 + 包含子文档。全部限定章节，不扫全文（避免互斥/交互表里
-    别人的 license/特性被误挂）。"""
-    edges: list[_common.Edge] = []
-    # 所需License：只在「可获得性」章节扫（产品文档在此声明特性自己的 License控制项）。
-    avail = (_common.get_section(md_text, "可获得性")
-             or _common.get_section(md_text, "License支持")
-             or _common.get_section(md_text, "License控制项"))
-    for lc in _common.parse_license_codes(avail):
-        edges.append(("所需License", f"{nf}@License@{lc}"))
-    # 依赖特性：只在「与其他特性的交互」章节扫。
-    inter = (_common.get_section(md_text, "与其他特性的交互")
-             or _common.get_section(md_text, "特性交互"))
-    for fc in set(_common.FEATURE_CODE_RE.findall(inter)):
-        if fc != code:
-            edges.append(("依赖特性", f"{nf}@Feature@{fc}"))
-    for sid in sibling_ids:
-        edges.append(("包含子文档", sid))
+def build_overview_edges(nf: str, code: str, sibling_ids: list[str],
+                         dep_codes: set[str], lic_codes: set[str]) -> list[_common.Edge]:
+    """概述边：依赖特性 + 所需License + 包含子文档。
+
+    v0.21.0 重写（CR-20260818-001，对齐命令层参见边 v0.20.0 模式）：
+    - 依赖特性/所需License = **概述+全部子文档全文锚定扫描**后聚合到概述（特性级关系），
+      替代旧的"仅概述限定章节正则"（实测 UDG 丢 12% / UNC 丢 37%，且 md 互链全漏）；
+    - 存在性校验：dep_codes/lic_codes 均为**已过滤后的合法目标集**（悬空丢弃——跨 NF/
+      跨产品码不建边，调用方统计 dropped）；
+    - md 互链（[GWFD-x …](../GWFD-x …/….md)）URL 路径含目标码，全文扫描天然覆盖。
+    """
+    edges: list[_common.Edge] = [("依赖特性", f"{nf}@Feature@{fc}") for fc in sorted(dep_codes)]
+    edges += [("所需License", f"{nf}@License@{lc}") for lc in sorted(lic_codes)]
+    edges += [("包含子文档", sid) for sid in sibling_ids]
     return _common.dedup_edges(edges)
 
 
@@ -173,11 +175,16 @@ def main() -> int:
     images_copied = 0
     refs_resolved = 0
     refs_stripped = 0
+    use_cmd_edges = 0        # 「使用命令」边（v0.21.0，子文档各自建）
+    dep_dangling_dropped = 0  # 依赖特性悬空丢弃（指向未建特性）
+    lic_dangling_dropped = 0  # 所需License悬空丢弃
 
-    # 资产索引：命令引用解析需命令资产已存在；特性引用含本次在建的 code（自洽）
+    # 资产索引：命令引用解析需命令资产已存在；特性引用含本次在建的 code（自洽）；
+    # License 校验集需 License 已建（build_all 编排：licenses 先于 features，v0.21.0）
     cmd_index = _common.build_command_index(storage, args.nf, args.version)
     feature_codes = set(groups.keys()) | _common.build_feature_codes(storage, args.nf, args.version)
-    log(f"资产索引：命令 {len(cmd_index)} 个；特性码 {len(feature_codes)} 个")
+    license_codes = _common.build_license_codes(storage, args.nf, args.version)
+    log(f"资产索引：命令 {len(cmd_index)} 个；特性码 {len(feature_codes)} 个；License 码 {len(license_codes)} 个")
     hash_cache: dict = {}  # 全局 {源png路径: hash}，同一源图全构建只读盘一次
 
     # 预算 源文件名→目标文档ID：特性引用精确到具体子文档（概述=bare code；子文档=code-slug），命不中才退回概述
@@ -216,15 +223,28 @@ def main() -> int:
                 doc_ids[i] = f"{args.nf}@Feature@{code}-{slugs[i]}"
         sibling_ids = [doc_ids[i] for i in range(len(docs)) if i != ovi]
 
+        # v0.21.0：概述+全部子文档全文锚定聚合 → 依赖特性/所需License（特性级，落概述）；
+        # 候选 ∩ 合法集，悬空丢弃并计数（跨 NF/跨产品码不建边）
+        texts = [f.read_text(encoding="utf-8", errors="replace") for f, _ in docs]
+        dep_cand: set[str] = set()
+        lic_cand: set[str] = set()
+        for t in texts:
+            dep_cand |= _common.scan_codes(t, _common.FEATURE_CODE_RE, exclude=code)
+            lic_cand |= _common.scan_codes(t, _common.LICENSE_CODE_RE)
+        dep_codes = dep_cand & feature_codes
+        lic_codes = lic_cand & license_codes
+        dep_dangling_dropped += len(dep_cand - feature_codes)
+        lic_dangling_dropped += len(lic_cand - license_codes)
+
         for i, (f, parts) in enumerate(docs):
-            md_text = f.read_text(encoding="utf-8", errors="replace")
+            md_text = texts[i]
             dt = _common.derive_doc_type(f.name, parts)
             is_ov = (i == ovi)
             logical_id = doc_ids[i]
             # name 取原文首个 H1（最忠实）；无 H1 才退回 folder名/slug
             h1 = first_h1(md_text)
             if is_ov:
-                edges = build_overview_edges(md_text, args.nf, code, sibling_ids)
+                edges = build_overview_edges(args.nf, code, sibling_ids, dep_codes, lic_codes)
                 doc_name = h1 or name
                 out_file = "概述.md"
             else:
@@ -247,6 +267,12 @@ def main() -> int:
             cleaned, ref_stats = _common.rewrite_doc_refs(cleaned, args.nf, cmd_index, feature_codes, src_to_id)
             refs_resolved += ref_stats["resolved"]
             refs_stripped += ref_stats["stripped"]
+            # 「使用命令」边（v0.21.0）：本 md 解析出的命令引用落在**本文档**的 ## 边
+            # （概述/子文档各自建，出处保留文档级；cmd_targets 已由 cmd_index 校验过存在性）
+            if ref_stats["cmd_targets"]:
+                edges = _common.dedup_edges(
+                    edges + [("使用命令", f"{args.nf}@MMLCommand@{c}") for c in ref_stats["cmd_targets"]])
+                use_cmd_edges += len(ref_stats["cmd_targets"])
             body = f"{fm}\n\n{cleaned}\n\n{_common.build_edges_section(edges)}\n"
             (out_folder / out_file).write_text(body, encoding="utf-8")
             built.append(logical_id)
@@ -264,6 +290,9 @@ def main() -> int:
         "images_copied": images_copied,
         "doc_refs_resolved": refs_resolved,
         "doc_refs_stripped": refs_stripped,
+        "use_command_edges": use_cmd_edges,
+        "dep_dangling_dropped": dep_dangling_dropped,
+        "lic_dangling_dropped": lic_dangling_dropped,
     }
     (out_root / "_build_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -273,6 +302,7 @@ def main() -> int:
     if multi_overview:
         print(f"  多概述候选 {len(multi_overview)} 个(已取第一个)：{multi_overview[:20]}")
     print(f"  图片拷贝 {images_copied} 张；文档引用解析 {refs_resolved} / 剥死链 {refs_stripped}")
+    print(f"  使用命令边 {use_cmd_edges} 条；依赖特性悬空丢弃 {dep_dangling_dropped} / License 悬空丢弃 {lic_dangling_dropped}")
     return 0
 
 

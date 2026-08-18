@@ -30,7 +30,8 @@
 | 原文完整 | 原始 md/段内容原样保留（清洗 TOC/anchor，不删正文）；**单 H1**（不 prepend，保留原文自带 H1，对齐命令层）；**图片纳入**：每特性文件夹 `assets/`（hash 去重），引用改写为本地相对路径 |
 | 图片闭环 | `![](assets/x.png)` 引用的 png 实存于同文件夹 `assets/`；**无残留 `{旧名}.assets/` 旧路径**；外链/缺图原样保留可接受 |
 | 引用闭环 | 命令引用→`[[{nf}@MMLCommand@{cmd}]]`、特性引用→`[[{nf}@Feature@{code}]]` 或 `[[…@Feature@{code}-{slug}]]`（精确到具体子文档）；死链已**剥 URL 留文字**；**无残留相对路径 / output 路径**；核查用独立正则抽样复核（不复用构建同一条正则） |
-| 边闭环 | Feature(概述)↔License（所需License↔对应特性）；概述↔子文档（包含→各 slug-id、子文档属于特性）；Feature→Feature（依赖/冲突）|
+| 边闭环 | Feature(概述)↔License（所需License↔对应特性）；概述↔子文档（包含→各 slug-id、子文档属于特性）；Feature→Feature（依赖特性）；Feature→命令（使用命令，v0.21.0）|
+| 边校验 | 依赖特性/所需License/对应特性/使用命令目标**全部存在**（悬空=0；manifest `*_dangling_dropped` 记丢弃量）；回归 `scripts/test_build_features_edges.py` |
 | manifest | build manifest 完整（sop_version + model + 特性数/license数 + nf/version + 无概述/多概述清单） |
 
 ## 交接

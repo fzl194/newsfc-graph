@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SOP_VERSION = "0.10.0"
+SOP_VERSION = "0.21.0"
 
 
 def run(cmd: list[str]) -> None:
@@ -35,14 +35,15 @@ def main() -> int:
     args = ap.parse_args()
     py = sys.executable
 
-    # 1. 特性（文件夹模型）
+    # 1. license（切段模型）——先建：特性侧「所需License」存在性校验需 License 已建（v0.21.0）
+    run([py, str(HERE / "build_licenses.py"),
+         "--nf", args.nf, "--version", args.version,
+         "--license-dir", args.license_dir,
+         "--feature-dir", args.feature_dir, "--storage", args.storage])
+    # 2. 特性（文件夹模型）
     run([py, str(HERE / "build_features.py"),
          "--nf", args.nf, "--version", args.version,
          "--feature-dir", args.feature_dir, "--storage", args.storage])
-    # 2. license（切段模型）
-    run([py, str(HERE / "build_licenses.py"),
-         "--nf", args.nf, "--version", args.version,
-         "--license-dir", args.license_dir, "--storage", args.storage])
 
     print(f"\n特性层端到端完成 → {args.storage}/{{Feature,License}}/{args.nf}/{args.version}/")
     return 0

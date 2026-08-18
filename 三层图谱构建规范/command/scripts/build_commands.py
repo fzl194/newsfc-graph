@@ -4,11 +4,12 @@
 原始命令 md → 命令资产 md（顶 YAML + 清洗后原文 + 底"边"章节）
 纯标准库。
 
-要点（v0.8.2 修复）:
+要点（v0.8.2 修复 / v0.20.0 参见边重写）:
   - 只收真正的命令 md（H1 = `中文（ENGLISH 命令）`，如 `增加URR（ADD URR）`）；
     概念页/目录页（如"集中配置概念"）跳过。
   - 清洗原文：去 TOC 链接行、去标题 anchor `(#xxx)`。
-  - 边校验：命令↔命令"参见"边只引真实存在的命令（2 趟：先收命令名集，再校验）。
+  - 参见边 = 全文锚定扫描（v0.20.0）：第 1 趟命令名集 → 最长优先正则扫全文，
+    命中真实命令名即建边（触发词/顿号串/md互链/裸文本全覆盖；代码块/TOC 排除）。
 
 用法:
   python build_commands.py --nf UDG --version 20.15.2 \
@@ -25,7 +26,7 @@ from pathlib import Path
 
 import _common
 
-SOP_VERSION = "0.13.0"
+SOP_VERSION = "0.20.0"
 VERBOSE = False
 
 
@@ -139,19 +140,32 @@ def edge_configobject(md: str, name: str, nf: str, ctx: dict) -> list[Edge]:
     return []
 
 
-# 命令↔命令：正文 "参见/参考/通过 + VERB OBJECT"；object token ≥2 字符
-_CMDREF_RE = re.compile(
-    r"(?:参见|参考信息|参考|通过)\s*[：:]?\s*([A-Z]{2,}(?:\s+[A-Z0-9]{2,}[A-Z0-9_]*){0,3})"
-)
+# 命令↔命令：全文锚定扫描。第 1 趟收的全量命令名集 → 最长优先正则，正文任意位置
+# 命中的真实命令名即建"参见"边（存在性校验内建于匹配）。替代 v0.8.2 的触发词正则
+# （2026-08-18 实测两域 72% 引用丢失）。覆盖：
+#   - 触发词：参见/参考/通过 XX（旧逻辑唯一来源）
+#   - 顿号命令串：依次执行SET A、GEN B、EXC C
+#   - md 互链：**[DSP X](查询…（DSP X）_id.md)**（链接文字/URL 含命令名）
+#   - 无触发词裸文本：参数说明"该参数使用ADD X命令配置生成"、注意事项前置命令等
+# 代码块（使用实例自示例）与 TOC 行排除，防噪音。
 
 
 def edge_cmdref_body(md: str, name: str, nf: str, ctx: dict) -> list[Edge]:
-    names = ctx.get("command_names") or set()  # 真实命令名集（校验用）
+    matcher = ctx.get("name_matcher")
+    if matcher is None:  # 兜底：单测/单独调用未预编译时现场构建
+        matcher = _common.build_name_matcher(ctx.get("command_names") or set())
     out: list[Edge] = []
-    for m in _CMDREF_RE.finditer(md):
-        ref = re.sub(r"\s+", " ", m.group(1)).strip().rstrip("。，；,;。")
-        if ref and ref != name and ref in names:  # 只引真实存在的命令
-            out.append(("参见", f"{nf}@MMLCommand@{ref}"))
+    in_code = False
+    for ln in md.splitlines():
+        if ln.lstrip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or _TOC_LINE_RE.match(ln):
+            continue
+        for m in matcher.finditer(ln):
+            ref = m.group(0)
+            if ref != name:
+                out.append(("参见", f"{nf}@MMLCommand@{ref}"))
     return _dedup(out)
 
 
@@ -288,6 +302,7 @@ def main() -> int:
         else:
             skipped_noncmd += 1
     ctx["command_names"] = name_set
+    ctx["name_matcher"] = _common.build_name_matcher(name_set)  # 参见边全文锚定用（预编译一次）
     ctx["cfg_objects"] = cfg_objects
     ctx["assets_dir"] = out_dir / "assets"
     ctx["hash_cache"] = {}

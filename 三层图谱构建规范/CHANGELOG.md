@@ -28,6 +28,46 @@
 
 ---
 
+## [0.22.0] - 2026-08-18
+
+### 变更（License 段图片改写防御性补丁）
+
+- `feature/scripts/build_licenses.py`：段正文 `rewrite_images`（图片拷入 `License/{nf}/{ver}/assets/` + 引用改写），对齐命令/配置对象/特性三类资产。实测控制项段无图（含图的是 `License控制原理/` 概念文档，不进切段模型），双域重建图片 0 张——补丁为防御性正确。
+- 背景：graph-asset-platform「上传产品文档」pipeline 集成本层脚本（用户需求），拷贝时同步此版本。
+
+---
+
+## [0.21.0] - 2026-08-18
+
+### 变更（特性层边全文锚定重写 + 新增「使用命令」边 + 全图层边定义权威文档）
+
+采纳 [CR-20260818-001](feature/change-requests/CR-20260818-001-特性层边覆盖不足与悬空.md)。用户决策：① 依赖特性全文锚定+悬空丢弃；② 新增「使用命令」边（子文档各自建）；③ License 双侧全文+校验。
+
+- **问题**（output/_scan_featurerefs.py 实测）：依赖特性只扫概述交互章节丢 28%（UDG 12%/UNC 37%，md 互链全漏）；788 条中 35 条悬空无校验；License 双向口径不一（552 vs 804）；特性→命令 25677 处正文引用不是边。
+- **修复**（`feature/scripts/`）：`build_features.py` 依赖特性/所需License＝概述+全部子文档全文码锚定聚合到概述，候选∩合法集悬空丢弃（manifest 计数）；`rewrite_doc_refs` 新返回 `cmd_targets`→「使用命令」边落本文档（概述/子文档各自建）；`build_licenses.py` 加 `--feature-dir` 校验对应特性；`build_all.py` 改 **licenses 先于 features**。`_common.py` 新增 `scan_codes`/`build_license_codes`/`group_feature_codes`。
+- **实测**（UDG/UNC）：依赖特性 788→**1008**（悬空丢弃 81）；所需License 552→**751**（丢弃 33）；对应特性 804→**620**（悬空清零，丢弃 184 跨产品码）；**使用命令 0→10789**（2806/7983）；全图层悬空残留 **0**。
+- **新增权威文档**：根级《[图谱边定义](图谱边定义.md)》——全图层关系的方向/规则/校验/基线（后续边的唯一权威，层 SKILL 引用之）。
+- **Feature→FeatureTask 反向边不落盘**（用户决策）：FT「对应特性」边已覆盖正向，反查由平台 `in_edges()` 派生；历史 83 条人工回填的「对应特性task」边随本次重建清除且不再回填（源文档不含、重建必掉）。
+- **回归测试**：新增 `feature/scripts/test_build_features_edges.py`（13 用例）。
+- **文档**：`feature/SKILL.md` 边表+构建顺序更新并升 sop_version 0.21.0；`feature/check.md` 边闭环/边校验项。
+- **对已建资产的影响**：**需重建**特性层（Feature+License 双域已重建）；命令层/ConfigObject/Task 层不受影响；平台零代码改动、重索引待执行。
+
+---
+
+## [0.20.0] - 2026-08-18
+
+### 变更（命令层「参见」边重写为全文锚定扫描）
+
+采纳 [CR-20260818-001](command/change-requests/CR-20260818-001-参见边提取大量丢失.md)。用户决策：提取策略选**全文锚定扫描**、边类型统一「参见」不拆分。
+
+- **问题**：`edge_cmdref_body`（v0.8.2 触发词正则）实测两域丢失 72% 命令引用（UDG 2641/4108 对、UNC 6790/8935 对）。参数说明（丢失 11396 次）与注意事项（3628 次）是大头；无触发词裸文本、顿号命令串、md 互链（2244 对仅接住 14）、「参考信息」章节四种模式全部漏提。
+- **修复**（`command/scripts/build_commands.py`）：第 1 趟命令名集 → 最长优先 alternation 正则（边界守卫防前缀误切），扫正文任意行命中真实命令名即建「参见」边；代码块/TOC/自身排除。存在性校验内建于匹配。`_common.py` 新增 `build_name_matcher()`；manifest `edge_modules` 不变。
+- **回归测试**：新增 `command/scripts/test_build_commands_edges.py`（13 用例：4 种引用模式 + 代码块/TOC/自身排除 + 最长匹配/边界守卫）。
+- **文档**：`command/SKILL.md` 边表更新并升 sop_version 0.20.0；`command/check.md` 边合理项补充扫描方式。
+- **对已建资产的影响**：**需重建**命令层（UDG 4577 + UNC 8498）——参见边预计 3612 → 约 13043 条；配置对象/特性层/Task 层不受影响；图谱平台重索引（mtime 自动感知）。
+
+---
+
 ## [0.19.0] - 2026-08-17
 
 ### 变更（Task 层去版本 + UNC/UDG 计划状态刷新 + 中间态清理）
