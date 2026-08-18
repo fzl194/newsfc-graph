@@ -418,6 +418,14 @@ export const uploadProductDoc = (
 export const getImportJob = (id: string): Promise<ImportJob> =>
   _req<ImportJob>(`${BASE}/import/jobs/${id}`)
 
+/** 历史导入任务（后端持久化，跨重启；含 processing）。 */
+export const listImportJobs = (): Promise<ImportJob[]> =>
+  _req<ImportJob[]>(`${BASE}/import/jobs`)
+
+/** 删除历史任务（解析进行中后端 400 拒绝）。 */
+export const deleteImportJob = (id: string): Promise<{ ok: boolean; job_id: string }> =>
+  _req(`${BASE}/import/jobs/${id}`, { method: 'DELETE' })
+
 export const listDocsChildren = (path: string = ''): Promise<FsEntry[]> =>
   _req<FsEntry[]>(`${BASE}/docs/children${qs({ path })}`)
 

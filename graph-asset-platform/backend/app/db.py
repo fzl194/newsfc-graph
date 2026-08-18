@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS meta(
   key TEXT PRIMARY KEY, value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS import_jobs(
+  job_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+  nf TEXT DEFAULT '', version TEXT DEFAULT '',
+  status TEXT NOT NULL, added INTEGER DEFAULT 0,
+  steps TEXT DEFAULT '[]', result TEXT DEFAULT '{}', warnings TEXT DEFAULT '[]',
+  error TEXT DEFAULT '', started_at REAL NOT NULL, finished_at REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_started ON import_jobs(started_at);
+
 CREATE TABLE IF NOT EXISTS users(
   username TEXT PRIMARY KEY, key TEXT,
   can_frontend INT, can_assets INT, can_upload INT, can_test INT, can_skill INT, is_admin INT,

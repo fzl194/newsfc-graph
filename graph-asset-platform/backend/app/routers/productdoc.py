@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 
-from .. import jobs
+from .. import config, jobs
 from ..pipeline.runner import existing_layer_counts, run_product_doc_import
 from ..users.service import check_perm
 from ..telemetry.recorder import record
@@ -51,6 +51,14 @@ async def upload_product_doc(
 
     _require_assets(request)
 
+    # 单任务互斥（用户决策 2026-08-18）：构建跑完前不接收新任务
+    running = jobs.has_processing("product_doc")
+    if running is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"已有构建任务在跑（{running.nf} {running.version} · {running.job_id}），完成后再试",
+                    "job_id": running.job_id})
+
     # 重复上传：默认拒 + 可选覆盖（用户决策 2026-08-18）
     existing = existing_layer_counts(nf, version)
     if existing and not force:
@@ -59,9 +67,12 @@ async def upload_product_doc(
             detail={"message": f"网元 {nf} 版本 {version} 已有图谱资产，勾选「覆盖重建」后重试",
                     "existing": existing})
 
-    # 上传落临时文件（runner 结束（成败皆）负责清理）
+    # 上传落临时文件（runner 结束（成败皆）负责清理）。放 DATA_DIR 同盘：
+    # 与工作目录之间的 move 是同盘 rename（瞬时）；且避免 exporter 跨盘 relpath 问题
     data = await file.read()
-    fd, tmp = tempfile.mkstemp(prefix="pdoc_up_", suffix=suffix or ".hwics")
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".pdoc_up_", suffix=suffix or ".hwics",
+                               dir=str(config.DATA_DIR))
     os.close(fd)
     try:
         Path(tmp).write_bytes(data)
@@ -79,6 +90,7 @@ async def upload_product_doc(
 
 @router.get("/import/jobs")
 def list_jobs():
+    """历史任务（DB 持久化，跨重启；按 started_at 倒序，默认 100 条）。"""
     return [j.summary() for j in jobs.list_jobs()]
 
 
@@ -88,3 +100,20 @@ def get_job(job_id: str):
     if j is None:
         raise HTTPException(status_code=404, detail=f"job 不存在: {job_id}")
     return j.summary()
+
+
+@router.delete("/import/jobs/{job_id}")
+def delete_job(job_id: str, request: Request):
+    """删除历史任务（用户决策 2026-08-18：上传完成的记录可删；**解析进行中不可删**）。"""
+    _require_assets(request)
+    j = jobs.get_job(job_id)
+    if j is None:
+        raise HTTPException(status_code=404, detail=f"job 不存在: {job_id}")
+    if j.status == "processing":
+        raise HTTPException(status_code=400, detail="任务解析进行中，不允许删除")
+    if not jobs.delete_job(job_id):
+        raise HTTPException(status_code=500, detail="删除失败")
+    record("/import/jobs/delete", job_id, "", user=request.state.user,
+           caller=request.state.caller, level="object",
+           operator=getattr(request.state, "operator", ""))
+    return {"ok": True, "job_id": job_id}

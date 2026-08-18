@@ -167,9 +167,10 @@
         </label>
 
         <div class="actions">
-          <button class="primary-btn big" :disabled="!pdCanSubmit || pdBusy" @click="doPdUpload">
-            {{ pdBusy ? '构建中…' : '开始导入' }}
+          <button class="primary-btn big" :disabled="!pdCanSubmit || pdBusy || hasRunning" @click="doPdUpload">
+            {{ pdBusy || hasRunning ? '构建中…' : '开始导入' }}
           </button>
+          <span v-if="hasRunning" class="pd-mutex-hint">同时只允许一个构建任务（完成后自动解锁）</span>
         </div>
 
         <div v-if="pdErrorMsg" class="error-banner mono">{{ pdErrorMsg }}</div>
@@ -207,6 +208,38 @@
           </div>
           <div v-if="pdJob.status === 'failed'" class="error-banner mono pd-err">{{ pdJob.error }}</div>
         </div>
+
+        <!-- 历史任务（后端持久化，跨刷新/重启；进行中不可删，完成后可删） -->
+        <div v-if="pdHistory.length" class="pd-history">
+          <div class="pd-history-head">
+            <span class="pd-job-title">历史任务</span>
+            <span class="hint">点击查看详情；完成/失败可删除，进行中不可</span>
+          </div>
+          <ul class="pd-hlist">
+            <li
+              v-for="j in pdHistory"
+              :key="j.job_id"
+              class="pd-hrow"
+              :class="{ cur: pdJob?.job_id === j.job_id }"
+              @click="viewJob(j)"
+            >
+              <span class="pd-status" :class="`pd-${j.status}`">
+                {{ j.status === 'processing' ? '进行中' : j.status === 'done' ? '完成' : '失败' }}
+              </span>
+              <span class="pd-hnf mono">{{ j.nf }} {{ j.version }}</span>
+              <span class="pd-htime">{{ fmtJobTime(j.started_at) }}</span>
+              <span class="pd-hsteps mono">
+                {{ j.steps.filter((s) => s.status === 'done').length }}/{{ j.steps.length || '—' }} 步
+              </span>
+              <button
+                v-if="j.status !== 'processing'"
+                class="link-btn pd-del"
+                @click.stop="removeJob(j)"
+              >删除</button>
+              <span v-else class="pd-running-tag mono">构建中…</span>
+            </li>
+          </ul>
+        </div>
       </section>
     </div>
   </div>
@@ -221,6 +254,8 @@ import {
   uploadToDir,
   uploadProductDoc,
   getImportJob,
+  listImportJobs,
+  deleteImportJob,
   type FsUploadResult,
   type ImportJob,
   type Stats,
@@ -261,6 +296,14 @@ onMounted(async () => {
   if (q.version) version.value = String(q.version)
   if (q.domain) domain.value = String(q.domain)
   if (q.scenario) scenario.value = String(q.scenario)
+  // 产品文档：拉历史任务；有进行中的 → 恢复进度面板并续接轮询（刷新不丢）
+  await loadPdHistory()
+  const running = pdHistory.value.find((j) => j.kind === 'product_doc' && j.status === 'processing')
+  if (running) {
+    pdJob.value = running
+    pdBusy.value = true
+    pollJob(running.job_id)
+  }
 })
 
 // 现有值提示（仅提示，不限输入——支持新网元/新版本）
@@ -373,6 +416,47 @@ const pdCanSubmit = computed(
   () => !!pdNf.value.trim() && !!pdVersion.value.trim() && !!pdFile.value,
 )
 
+// ---- 历史任务（后端持久化；刷新/重开页面自动恢复进行中的轮询） ----
+const pdHistory = ref<ImportJob[]>([])
+
+const hasRunning = computed(
+  () =>
+    pdJob.value?.status === 'processing' ||
+    pdHistory.value.some((j) => j.kind === 'product_doc' && j.status === 'processing'),
+)
+
+async function loadPdHistory(): Promise<void> {
+  try {
+    pdHistory.value = (await listImportJobs()).filter((j) => j.kind === 'product_doc')
+  } catch {
+    pdHistory.value = []
+  }
+}
+
+function viewJob(j: ImportJob): void {
+  pdJob.value = j
+  pdErrorMsg.value = ''
+  if (j.status === 'processing') {
+    pdBusy.value = true
+    pollJob(j.job_id)
+  }
+}
+
+async function removeJob(j: ImportJob): Promise<void> {
+  try {
+    await deleteImportJob(j.job_id)
+    ElMessage.success(`已删除任务 ${j.job_id}`)
+    await loadPdHistory()
+    if (pdJob.value?.job_id === j.job_id) pdJob.value = null
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+function fmtJobTime(ts: number): string {
+  return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : ''
+}
+
 const RESULT_LABELS: Array<[string, string]> = [
   ['commands', '命令'],
   ['config_objects', '配置对象'],
@@ -417,6 +501,7 @@ async function pollJob(jobId: string) {
       if (j.status !== 'processing') {
         stopPolling()
         pdBusy.value = false
+        void loadPdHistory() // 终态 → 刷新历史列表
         if (j.status === 'done') {
           ElMessage.success('产品文档构建完成')
           ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
@@ -442,8 +527,9 @@ async function doPdUpload() {
     )
     pdFile.value = null
     if (pdFileInput.value) pdFileInput.value.value = ''
-    // 立即拉一次，然后轮询
+    // 立即拉一次，然后轮询；历史列表同步刷新
     pdJob.value = await getImportJob(r.job_id)
+    void loadPdHistory()
     pollJob(r.job_id)
   } catch (e: unknown) {
     pdBusy.value = false
@@ -493,6 +579,21 @@ async function doPdUpload() {
 .pd-stats { padding: 0; }
 .pd-done-hint { font-size: 12px; color: var(--text-muted); background: var(--bg-sunken); border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); }
 .pd-err { white-space: pre-wrap; word-break: break-all; }
+
+.pd-mutex-hint { font-size: 11.5px; color: var(--text-faint); align-self: center; }
+
+.pd-history { border-top: 1px solid var(--border-faint); padding-top: var(--space-4); display: flex; flex-direction: column; gap: var(--space-2); }
+.pd-history-head { display: flex; align-items: baseline; gap: var(--space-3); }
+.pd-history-head .hint { font-size: 11px; color: var(--text-faint); }
+.pd-hlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.pd-hrow { display: flex; align-items: center; gap: var(--space-3); padding: 7px 10px; border-bottom: 1px solid var(--border-faint); cursor: pointer; font-size: 12px; transition: background var(--dur-fast) var(--ease); }
+.pd-hrow:hover { background: var(--bg-hover); }
+.pd-hrow.cur { background: var(--accent-soft); }
+.pd-hnf { color: var(--text); min-width: 110px; }
+.pd-htime { color: var(--text-faint); font-size: 11px; flex: 1; }
+.pd-hsteps { color: var(--text-faint); font-size: 11px; }
+.pd-running-tag { color: var(--accent); font-size: 11px; }
+.pd-del { flex-shrink: 0; }
 .page-title { font-family: var(--display); font-size: 24px; font-weight: 700; color: var(--text); margin: 0; letter-spacing: -0.02em; }
 .page-sub { margin: 0; color: var(--text-muted); font-size: 12.5px; line-height: 1.55; max-width: 600px; }
 

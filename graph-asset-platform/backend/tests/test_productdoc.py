@@ -35,27 +35,45 @@ def _make_tree(base: Path, style: str) -> Path:
 
 
 class TestLocateDirs:
-    def test_udg_layout(self, tmp_path):
+    def test_udg_layout_strict(self, tmp_path):
         root = _make_tree(tmp_path, "udg")
-        dirs = pl.locate_dirs(root, "UDG")
+        dirs, warns = pl.locate_dirs(root, "UDG")
         assert dirs["mml"].name == "UDG MML命令"
         assert dirs["feature"].name == "UDG特性指南"
         assert dirs["license"].name == "UDG License描述"
+        assert warns == []
 
-    def test_unc_layout(self, tmp_path):
+    def test_unc_layout_strict(self, tmp_path):
         root = _make_tree(tmp_path, "unc")
-        dirs = pl.locate_dirs(root, "UNC")
+        dirs, warns = pl.locate_dirs(root, "UNC")
         assert dirs["mml"].name == "UNC MML命令"
         assert dirs["feature"].name == "UNC特性指南"
+        assert warns == []
+
+    def test_renamed_dir_unique_fallback(self, tmp_path):
+        """目录名不带 nf（命名变化）→ 泛匹配唯一候选可用 + 警告。"""
+        root = tmp_path / "export"
+        (root / "P" / "OM参考" / "命令" / "云核心网MML命令").mkdir(parents=True)
+        (root / "P" / "特性指南目录A").mkdir(parents=True)
+        (root / "P" / "License描述目录B").mkdir(parents=True)
+        dirs, warns = pl.locate_dirs(root, "UDG")
+        assert dirs["mml"].name == "云核心网MML命令"
+        assert len(warns) == 3  # 三类都走了兜底
+
+    def test_multiple_candidates_raises(self, tmp_path):
+        """同关键词多目录且都不含 nf → 无法判定，报错列出候选。"""
+        root = tmp_path / "export"
+        (root / "A" / "甲MML命令").mkdir(parents=True)
+        (root / "B" / "乙MML命令").mkdir(parents=True)
+        (root / "C" / "UDG特性指南").mkdir(parents=True)
+        (root / "C" / "UDG License描述").mkdir(parents=True)
+        with pytest.raises(ValueError, match="候选"):
+            pl.locate_dirs(root, "UDG")
 
     def test_missing_raises(self, tmp_path):
-        # 严格 nf 匹配：UDG 树上找 UNC → 必报错（防跨网元错标）
-        root = _make_tree(tmp_path, "udg")
-        with pytest.raises(ValueError, match="严格匹配"):
-            pl.locate_dirs(root, "UNC")
         empty = tmp_path / "empty"
         empty.mkdir()
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="定位失败"):
             pl.locate_dirs(empty, "UDG")
 
 
@@ -224,3 +242,79 @@ class TestFsRaw:
     def test_traversal_rejected(self):
         r = client.get("/api/v1/fs/raw", params={"path": "../../platform.db"})
         assert r.status_code in (400, 404)
+
+
+# ---------- job 持久化 / 单任务互斥 / 删除 / 重启清账 ----------
+
+class TestJobPersistenceAndMutex:
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        """jobs._registry 是模块级单例，跨测试残留会误触发互斥——逐测清空。"""
+        from app import jobs as jobs_mod
+        jobs_mod._registry.clear()
+        yield
+        jobs_mod._registry.clear()
+
+    def _post(self, **kw):
+        return client.post(
+            "/api/v1/import/product-doc",
+            data={"nf": kw.get("nf", "UDG"), "version": kw.get("version", "20.15.2"),
+                  **({"force": "true"} if kw.get("force") else {})},
+            files={"file": ("doc.hwics", b"PK")})
+
+    def test_mutex_rejects_new_while_processing(self):
+        from app import jobs as jobs_mod
+        j = jobs_mod.create_job(kind="product_doc", nf="UDG", version="20.15.2")
+        r = self._post()
+        assert r.status_code == 409
+        assert "已有构建任务在跑" in r.text
+        jobs_mod.update_job(j.job_id, status="done")
+        # 完成后放行（runner 打桩避免真跑）
+        import app.routers.productdoc as pd
+        orig = pd.run_product_doc_import
+        pd.run_product_doc_import = lambda *a, **k: None
+        try:
+            r2 = self._post()
+            assert r2.status_code == 200
+        finally:
+            pd.run_product_doc_import = orig
+
+    def test_delete_rejected_while_processing(self):
+        from app import jobs as jobs_mod
+        j = jobs_mod.create_job(kind="product_doc", nf="UDG", version="20.15.2")
+        r = client.delete(f"/api/v1/import/jobs/{j.job_id}")
+        assert r.status_code == 400
+        assert "进行中" in r.text
+
+    def test_delete_done_ok(self):
+        from app import jobs as jobs_mod
+        j = jobs_mod.create_job(kind="product_doc", nf="UDG", version="20.15.2")
+        jobs_mod.update_job(j.job_id, status="done", result={"commands": 5})
+        r = client.delete(f"/api/v1/import/jobs/{j.job_id}")
+        assert r.status_code == 200
+        assert client.get(f"/api/v1/import/jobs/{j.job_id}").status_code == 404
+
+    def test_history_survives_restart(self):
+        """registry 清空（模拟重启后缓存丢失）→ 历史从 DB 读回。"""
+        from app import jobs as jobs_mod
+        j = jobs_mod.create_job(kind="product_doc", nf="UNC", version="20.15.2")
+        jobs_mod.update_job(j.job_id, status="done",
+                            steps=[{"name": "解压导出", "status": "done", "detail": "md 1 篇"}],
+                            result={"commands": 13073})
+        jobs_mod._registry.clear()
+        got = jobs_mod.get_job(j.job_id)
+        assert got is not None and got.status == "done"
+        assert got.result["commands"] == 13073
+        assert got.steps[0]["name"] == "解压导出"
+        listed = {x.job_id for x in jobs_mod.list_jobs()}
+        assert j.job_id in listed
+
+    def test_sweep_interrupted_marks_failed(self):
+        from app import jobs as jobs_mod
+        j = jobs_mod.create_job(kind="product_doc", nf="UDG", version="20.15.2")
+        jobs_mod._registry.clear()  # 模拟：DB 留 processing，进程已死
+        n = jobs_mod.sweep_interrupted()
+        assert n >= 1
+        got = jobs_mod.get_job(j.job_id)
+        assert got.status == "failed"
+        assert "重启" in got.error

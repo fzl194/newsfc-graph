@@ -38,28 +38,41 @@ def existing_layer_counts(nf: str, version: str) -> dict[str, int]:
     return out
 
 
-def locate_dirs(export_root: Path, nf: str) -> dict[str, Path]:
-    """导出树中定位 mml/feature/license 源目录。**严格 nf 匹配**（不做通配兜底——
-    通配会把 UDG 归档错标成 UNC 等跨网元错位）。找不到 → ValueError。"""
+def locate_dirs(export_root: Path, nf: str) -> tuple[dict[str, Path], list[str]]:
+    """导出树中定位 mml/feature/license 源目录（**层级无关**——rglob 全树按目录名找，
+    UDG/UNC 目录层级不同均适用）。
 
-    def find(*patterns: str) -> Path | None:
-        for pat in patterns:
-            cands = [p for p in export_root.rglob(pat) if p.is_dir()]
-            if cands:
-                return cands[0]
-        return None
+    匹配顺序（防跨网元错标优先，兼容命名变化兜底）：
+    1. 严格：目录名同时含 `{nf}` 与关键词（`{nf}…{kw}` 任意组合）
+    2. 泛匹配兜底：目录名**含关键词**（`*{kw}*`，关键词在任意位置）——**唯一候选**
+       才采用（记 warning），多候选报错列出供人工核对。
 
-    found = {
-        "mml": find(f"{nf} MML命令"),
-        "feature": find(f"{nf}特性指南"),
-        "license": find(f"{nf} License描述"),
-    }
-    missing = [k for k, v in found.items() if v is None]
-    if missing:
-        raise ValueError(
-            f"导出目录中未找到 {','.join(missing)} 源目录（按 {nf} 严格匹配）——"
-            f"请确认 .hwics 是 {nf} 的产品文档归档，且网元/版本填写正确")
-    return found  # type: ignore[return-value]
+    返回 (dirs, warnings)；找不到/多义 → ValueError（信息含候选清单）。
+    """
+    kinds = {"mml": "MML命令", "feature": "特性指南", "license": "License描述"}
+    found: dict[str, Path] = {}
+    warnings: list[str] = []
+    problems: list[str] = []
+
+    for key, kw in kinds.items():
+        strict = [p for p in export_root.rglob(f"*{kw}*") if p.is_dir() and nf in p.name]
+        if strict:
+            found[key] = sorted(strict)[0]
+            continue
+        loose = sorted(p for p in export_root.rglob(f"*{kw}*") if p.is_dir())
+        if len(loose) == 1:
+            found[key] = loose[0]
+            warnings.append(f"{key} 目录未按「{nf}…{kw}」命名，已按唯一候选定位：{loose[0].relative_to(export_root)}")
+        elif len(loose) > 1:
+            cands = "、".join(str(p.relative_to(export_root)) for p in loose[:5])
+            problems.append(f"{key}：找到 {len(loose)} 个候选（{cands}…），无法自动判定，请确认归档内容")
+        else:
+            problems.append(f"{key}：未找到「*{kw}」目录")
+
+    if problems:
+        raise ValueError("源目录定位失败——" + "；".join(problems)
+                         + f"（按 {nf} 严格匹配优先；请核对 .hwics 与网元/版本填写）")
+    return found, warnings
 
 
 def _load_exporter():
@@ -122,7 +135,10 @@ def run_product_doc_import(job_id: str, hwics_path: Path, nf: str,
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         try:
             exp = _load_exporter()
-            with tempfile.TemporaryDirectory(prefix="pdoc_") as td:
+            # 工作目录放 DATA_DIR 同盘：exporter 内部 relpath(extracted→output) 在
+            # Windows 跨盘符（TEMP 在 C:、数据在 D:）会 ValueError "path is on mount"。
+            # .pdoc_ 前缀 = 隐藏目录（docs 浏览/资产索引都不扫）
+            with tempfile.TemporaryDirectory(prefix=".pdoc_", dir=str(config.DATA_DIR)) as td:
                 up = Path(td) / hwics_path.name
                 shutil.move(str(hwics_path), str(up))
                 extracted = exp.extract_hdx_file(str(up))  # 解到 td 内 → 随 td 删除
@@ -138,11 +154,15 @@ def run_product_doc_import(job_id: str, hwics_path: Path, nf: str,
         if prod_dirs and version not in " ".join(prod_dirs):
             warnings.append(f"导出目录名 {prod_dirs} 未含版本 {version}，请核对")
 
-        # 2. 定位源目录
+        # 2. 定位源目录（层级无关按名搜索；命名不标准时唯一候选兜底 + 警告）
         step("定位源目录")
-        dirs = locate_dirs(export_target, nf)
+        dirs, loc_warns = locate_dirs(export_target, nf)
+        if loc_warns:
+            warnings.extend(loc_warns)
+            jobs.update_job(job_id, warnings=list(warnings))
         step("定位源目录", "done",
-             f"mml/feature/license 已定位（{dirs['mml'].name} 等）")
+             f"mml/feature/license 已定位（{dirs['mml'].name} 等）"
+             + ("；⚠ 命名不标准，见警告" if loc_warns else ""))
 
         # 3. 覆盖清理（force）
         if force:

@@ -38,6 +38,11 @@ async def lifespan(app: FastAPI):
         f"耗时 {time.time() - t0:.1f}s → http://127.0.0.1:80/",
         flush=True,
     )
+    # 导入任务清账：上个进程遗留的 processing（后台线程已消亡）标记 failed
+    from . import jobs as jobs_mod
+    swept = jobs_mod.sweep_interrupted()
+    if swept:
+        print(f"[startup] 已将 {swept} 个中断的导入任务标记为 failed（可覆盖重建续跑）", flush=True)
     # 测试子系统索引（独立于图谱，隔离）
     t_svc = get_test_service()
     print(
