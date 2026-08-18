@@ -2,7 +2,8 @@
 name = "graph-asset-platform-backend"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn[standard]", "pyyaml", "python-multipart"]
+dependencies = ["fastapi", "uvicorn[standard]", "pyyaml", "python-multipart",
+                "chardet", "beautifulsoup4"]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]

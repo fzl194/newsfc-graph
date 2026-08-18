@@ -49,9 +49,14 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
-import { readFsFile, writeFsFile } from '../../api'
+import { readFsFile, readDocsFile, writeFsFile, resolveImgUrls } from '../../api'
 
-const props = defineProps<{ path: string; canManage: boolean }>()
+const props = defineProps<{
+  path: string
+  canManage: boolean
+  /** 数据源：assets = 图谱资产库；docs = 原始产品文档 output/（只读预览） */
+  root?: 'assets' | 'docs'
+}>()
 const emit = defineEmits<{
   (e: 'back'): void
   (e: 'action', a: { type: string; path?: string }): void
@@ -66,6 +71,8 @@ const editText = ref('')
 const saving = ref(false)
 const editError = ref('')
 
+const isDocs = computed(() => props.root === 'docs')
+
 async function load(): Promise<void> {
   if (!props.path) {
     fileContent.value = ''
@@ -75,7 +82,9 @@ async function load(): Promise<void> {
   editing.value = false
   editError.value = ''
   try {
-    fileContent.value = await readFsFile(props.path)
+    fileContent.value = isDocs.value
+      ? await readDocsFile(props.path)
+      : await readFsFile(props.path)
   } catch {
     fileContent.value = ''
   } finally {
@@ -83,13 +92,16 @@ async function load(): Promise<void> {
   }
 }
 
-watch(() => props.path, load, { immediate: true })
+watch(() => [props.path, props.root], () => void load(), { immediate: true })
 
 const renderedHtml = computed(() => {
   if (!fileContent.value) return ''
   // 脱掉 frontmatter 段再渲染（预览只看正文）
   const body = fileContent.value.replace(/^---\n[\s\S]*?\n---\n/, '')
-  return DOMPurify.sanitize(md.render(body))
+  // 图片相对引用（assets/x.png、x.assets/y.png）→ 对应根的 raw 端点
+  const dir = props.path.split('/').slice(0, -1).join('/')
+  const resolved = resolveImgUrls(body, dir, isDocs.value ? 'docs' : 'fs')
+  return DOMPurify.sanitize(md.render(resolved))
 })
 
 function startEdit(): void {

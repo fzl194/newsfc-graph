@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from ..frontmatter_rw import rewrite_frontmatter, validate_md
@@ -92,6 +92,25 @@ def read_file(path: str):
     if not svc.store.exists(path):
         raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
     return PlainTextResponse(svc.store.read(path), media_type="text/markdown; charset=utf-8")
+
+
+# 二进制白名单：资产 md 里 ![](assets/x.png) 的图片经此端点展示
+_RAW_SUFFIX_WHITELIST = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico"}
+
+
+@router.get("/fs/raw")
+def read_raw(path: str):
+    """资产内二进制文件（图片白名单）。路径经 store.abspath 防逃逸；读权限同 /fs/file。"""
+    svc = get_service()
+    try:
+        p = svc.store.abspath(path)  # _resolve 同款防穿越（越界抛 ValueError → 400）
+    except ValueError as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+    if p.suffix.lower() not in _RAW_SUFFIX_WHITELIST:
+        raise HTTPException(status_code=400, detail=f"仅支持图片文件: {p.suffix}")
+    return FileResponse(p)
 
 
 # ---------- PUT：在线编辑（写回原路径）----------

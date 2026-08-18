@@ -8,7 +8,7 @@
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"
               stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
           </svg>
-          全部资产
+          {{ root === 'docs' ? '原始产品文档' : '全部资产' }}
         </span>
         <template v-for="(seg, i) in segments" :key="i">
           <span class="sep">/</span>
@@ -28,7 +28,7 @@
     </div>
 
     <!-- 批量操作条 -->
-    <div v-if="selectedCount > 0" class="batch-bar">
+    <div v-if="!readonly && selectedCount > 0" class="batch-bar">
       <span class="batch-count">已选 <b>{{ selectedCount }}</b> 项</span>
       <div class="batch-actions">
         <button class="ghost-btn" @click="emit('batch', { type: 'move', paths: selectedPaths })">批量移动</button>
@@ -45,7 +45,7 @@
       </div>
       <div v-else class="ftable" role="table">
         <div class="fthead" role="row">
-          <div class="th th-check">
+          <div v-if="!readonly" class="th th-check">
             <input
               v-if="sorted.length"
               type="checkbox"
@@ -72,7 +72,7 @@
           @click="onRowClick(e)"
           @contextmenu.prevent.stop="onRowMenu($event, e)"
         >
-          <div class="td td-check" @click.stop>
+          <div v-if="!readonly" class="td td-check" @click.stop>
             <input
               type="checkbox"
               class="fcheck"
@@ -113,7 +113,7 @@
  * 动作 emit 给编排器：enter-dir/open-file（导航）、menu（右键）、action（工具栏）、batch（批量）。
  */
 import { computed, ref, watch } from 'vue'
-import { listFsChildren, type FsEntry } from '../../api'
+import { listFsChildren, listDocsChildren, type FsEntry } from '../../api'
 
 const PAGE = 200
 
@@ -121,6 +121,8 @@ const props = defineProps<{
   cwd: string
   canManage: boolean
   refreshTick: number
+  /** 数据源：assets = 图谱资产库（可管理）；docs = 原始产品文档 output/（只读） */
+  root?: 'assets' | 'docs'
 }>()
 const emit = defineEmits<{
   (e: 'enter-dir', path: string): void
@@ -137,10 +139,15 @@ const selected = ref<Set<string>>(new Set())
 const renderCount = ref(PAGE)
 const bodyRef = ref<HTMLElement | null>(null)
 
+/** docs（原始产品文档）只读：无批量/复选/写操作 */
+const readonly = computed(() => props.root === 'docs')
+
 async function load(): Promise<void> {
   loading.value = true
   try {
-    entries.value = await listFsChildren(props.cwd)
+    entries.value = readonly.value
+      ? await listDocsChildren(props.cwd)
+      : await listFsChildren(props.cwd)
   } catch {
     entries.value = []
   } finally {
@@ -149,7 +156,7 @@ async function load(): Promise<void> {
 }
 
 watch(
-  () => [props.cwd, props.refreshTick],
+  () => [props.cwd, props.refreshTick, props.root],
   () => {
     selected.value = new Set()
     renderCount.value = PAGE

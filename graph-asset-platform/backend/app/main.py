@@ -14,8 +14,10 @@ from fastapi.staticfiles import StaticFiles
 from .middleware.auth import AuthMiddleware
 from .routers import admin as admin_router
 from .routers import assets as assets_router
+from .routers import docs as docs_router
 from .routers import fs as fs_router
 from .routers import objects as objects_router
+from .routers import productdoc as productdoc_router
 from .routers import telemetry as telemetry_router
 from .routers import tests as tests_router
 from .routers import users as users_router
@@ -67,8 +69,10 @@ app.add_middleware(
 )
 app.include_router(assets_router.router, prefix="/api/v1")
 app.include_router(admin_router.router, prefix="/api/v1")
+app.include_router(docs_router.router, prefix="/api/v1")
 app.include_router(fs_router.router, prefix="/api/v1")
 app.include_router(objects_router.router, prefix="/api/v1")
+app.include_router(productdoc_router.router, prefix="/api/v1")
 app.include_router(telemetry_router.router, prefix="/api/v1")
 app.include_router(tests_router.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")

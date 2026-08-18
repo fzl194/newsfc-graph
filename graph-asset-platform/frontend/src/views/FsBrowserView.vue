@@ -1,24 +1,39 @@
 <template>
   <div class="fs-view">
-    <FsDirView
-      v-if="mode === 'dir'"
-      :cwd="cwd"
-      :can-manage="canAssets"
-      :refresh-tick="refreshTick"
-      @enter-dir="cwd = $event"
-      @open-file="openFile"
-      @menu="onMenu"
-      @action="(a) => runAction(a.type, a.target, a.isDir)"
-      @batch="onBatch"
-      @open-trash="openTrash"
-    />
-    <FsFileDetail
-      v-else
-      :path="activeFile"
-      :can-manage="canAssets"
-      @back="mode = 'dir'"
-      @action="onDetailAction"
-    />
+    <!-- 数据源切换：图谱资产（可管理） / 原始产品文档（output/，只读不进图谱） -->
+    <div class="source-bar">
+      <div class="source-switch">
+        <button class="src-btn" :class="{ active: source === 'assets' }" @click="switchSource('assets')">图谱资产</button>
+        <button class="src-btn" :class="{ active: source === 'docs' }" @click="switchSource('docs')">原始产品文档</button>
+      </div>
+      <span v-if="source === 'docs'" class="src-hint">
+        产品文档导出的原始 md（output/）· 只读 · 不进图谱索引
+      </span>
+    </div>
+
+    <div class="fs-body">
+      <FsDirView
+        v-if="mode === 'dir'"
+        :cwd="cwd"
+        :can-manage="source === 'assets' && canAssets"
+        :refresh-tick="refreshTick"
+        :root="source"
+        @enter-dir="cwd = $event"
+        @open-file="openFile"
+        @menu="onMenu"
+        @action="(a) => runAction(a.type, a.target, a.isDir)"
+        @batch="onBatch"
+        @open-trash="openTrash"
+      />
+      <FsFileDetail
+        v-else
+        :path="activeFile"
+        :can-manage="source === 'assets' && canAssets"
+        :root="source"
+        @back="mode = 'dir'"
+        @action="onDetailAction"
+      />
+    </div>
 
     <!-- 右键浮层（无可用项时不渲染，如无 upload 权限右键空白区） -->
     <FsContextMenu
@@ -185,6 +200,16 @@ const cwd = ref('')
 const mode = ref<'dir' | 'file'>('dir')
 const activeFile = ref('')
 const refreshTick = ref(0)
+const source = ref<'assets' | 'docs'>('assets')
+
+function switchSource(s: 'assets' | 'docs'): void {
+  if (source.value === s) return
+  source.value = s
+  // 切根即重置导航（两棵树路径互不相通）
+  cwd.value = ''
+  activeFile.value = ''
+  mode.value = 'dir'
+}
 
 function openFile(p: string): void {
   activeFile.value = p
@@ -599,6 +624,54 @@ function fmtTs(iso: string): string {
 .fs-view {
   height: 100%;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 数据源切换条 */
+.source-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border-faint);
+  background: var(--bg-elev);
+  flex-shrink: 0;
+}
+.source-switch {
+  display: inline-flex;
+  gap: 4px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px;
+}
+.src-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 4px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.src-btn.active {
+  background: var(--bg-elev);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+.src-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.fs-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .dialog-body {

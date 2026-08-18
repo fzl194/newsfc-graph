@@ -2,12 +2,29 @@
   <div class="upload-view">
     <div class="upload-container">
       <header class="page-head">
-        <h1 class="page-title">指定层上传</h1>
-        <p class="page-sub">
-          选层 + 网元/版本（Task 层无版本；命令/特性层有版本；业务层为 域/场景）。网元/版本/域/场景
-          均可自由输入新值。拖入 md 或 zip，系统自动建目录、以指定位置覆盖 frontmatter 后写入。
-        </p>
+        <div class="mode-switch">
+          <button class="mode-btn" :class="{ active: mode === 'layer' }" @click="mode = 'layer'">指定层上传</button>
+          <button class="mode-btn" :class="{ active: mode === 'pdoc' }" @click="mode = 'pdoc'">产品文档导入</button>
+        </div>
+        <template v-if="mode === 'layer'">
+          <h1 class="page-title">指定层上传</h1>
+          <p class="page-sub">
+            选层 + 网元/版本（Task 层无版本；命令/特性层有版本；业务层为 域/场景）。网元/版本/域/场景
+            均可自由输入新值。拖入 md 或 zip，系统自动建目录、以指定位置覆盖 frontmatter 后写入。
+          </p>
+        </template>
+        <template v-else>
+          <h1 class="page-title">产品文档导入</h1>
+          <p class="page-sub">
+            上传产品文档归档（.hwics/.hdx），后台自动解压导出并构建 命令 / 配置对象 / License / 特性
+            四类图谱资产；导出的原始 md 留存于「原始产品文档」可浏览，html 中间态自动清理。
+            全程异步，提交后看分步进度。
+          </p>
+        </template>
       </header>
+
+      <!-- ============ 模式一：指定层上传（md/zip） ============ -->
+      <template v-if="mode === 'layer'">
 
       <!-- 目标位置 -->
       <section class="card target-card">
@@ -111,15 +128,103 @@
           {{ uploading ? '上传中…' : `上传到 ${targetPath || '...'}` }}
         </button>
       </div>
+      </template>
+
+      <!-- ============ 模式二：产品文档导入（.hwics 异步构建） ============ -->
+      <section v-else class="card pdoc-card">
+        <div class="pdoc-grid">
+          <div class="field">
+            <label>网元 nf <span class="req">*</span></label>
+            <el-input v-model="pdNf" placeholder="如 UDG / UNC" class="full" :disabled="pdBusy" />
+            <span v-if="nfHints.length" class="hint mono">现有：{{ nfHints.join(', ') }}</span>
+          </div>
+          <div class="field">
+            <label>版本 version <span class="req">*</span></label>
+            <el-input v-model="pdVersion" placeholder="如 20.15.2" class="full" :disabled="pdBusy" />
+          </div>
+        </div>
+
+        <div
+          class="dropzone pdoc-drop"
+          :class="{ 'is-drag': pdIsDrag }"
+          @dragenter.prevent="pdIsDrag = true"
+          @dragover.prevent="pdIsDrag = true"
+          @dragleave.prevent="pdIsDrag = false"
+          @drop.prevent="onPdDrop"
+        >
+          <input ref="pdFileInput" type="file" accept=".hwics,.hdx,.zip" class="file-input" @change="onPdFileChange" />
+          <div class="dz-content">
+            <div class="dz-title">拖拽产品文档归档到此处</div>
+            <div class="dz-sub">.hwics / .hdx / .zip，单个文件</div>
+            <el-button type="primary" @click="pdFileInput?.click()">选择文件</el-button>
+            <div v-if="pdFile" class="dz-file mono">{{ pdFile.name }} · {{ pdSize }}</div>
+          </div>
+        </div>
+
+        <label class="pd-force">
+          <input v-model="pdForce" type="checkbox" :disabled="pdBusy" />
+          覆盖重建（同网元+版本已有资产时先清理再全量重建；默认拒绝重复导入）
+        </label>
+
+        <div class="actions">
+          <button class="primary-btn big" :disabled="!pdCanSubmit || pdBusy" @click="doPdUpload">
+            {{ pdBusy ? '构建中…' : '开始导入' }}
+          </button>
+        </div>
+
+        <div v-if="pdErrorMsg" class="error-banner mono">{{ pdErrorMsg }}</div>
+
+        <!-- 分步进度 + 结果 -->
+        <div v-if="pdJob" class="pd-job">
+          <div class="pd-job-head">
+            <span class="pd-job-title">构建任务</span>
+            <span class="mono pd-job-id">{{ pdJob.job_id }}</span>
+            <span class="pd-status" :class="`pd-${pdJob.status}`">
+              {{ pdJob.status === 'processing' ? '进行中' : pdJob.status === 'done' ? '完成' : '失败' }}
+            </span>
+          </div>
+          <ol class="pd-steps">
+            <li v-for="s in pdJob.steps" :key="s.name" class="pd-step" :class="`pd-${s.status}`">
+              <span class="pd-step-dot">{{ s.status === 'done' ? '✓' : s.status === 'processing' ? '…' : '·' }}</span>
+              <span class="pd-step-name">{{ s.name }}</span>
+              <span v-if="s.detail" class="pd-step-detail">{{ s.detail }}</span>
+            </li>
+          </ol>
+          <div v-if="pdJob.status === 'done' && resultRows.length" class="stat-grid pd-stats">
+            <div v-for="r in resultRows" :key="r.k" class="stat">
+              <div class="stat-val">{{ r.v }}</div>
+              <div class="stat-label">{{ r.k }}</div>
+            </div>
+          </div>
+          <div v-if="pdJob.status === 'done'" class="pd-done-hint">
+            图谱资产已入库 →「图谱资产」浏览；原始 md →「图谱资产」tab 切换「原始产品文档」查看。
+          </div>
+          <div v-if="pdJob.warnings.length" class="warnings">
+            <div class="warn-head">警告 ({{ pdJob.warnings.length }})</div>
+            <ul class="warn-list">
+              <li v-for="(w, i) in pdJob.warnings" :key="i" class="warn-item mono">{{ w }}</li>
+            </ul>
+          </div>
+          <div v-if="pdJob.status === 'failed'" class="error-banner mono pd-err">{{ pdJob.error }}</div>
+        </div>
+      </section>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElButton, ElInput, ElSelect, ElOption, ElMessage } from 'element-plus'
-import { stats, uploadToDir, type FsUploadResult, type Stats } from '../api'
+import {
+  stats,
+  uploadToDir,
+  uploadProductDoc,
+  getImportJob,
+  type FsUploadResult,
+  type ImportJob,
+  type Stats,
+} from '../api'
 
 const route = useRoute()
 
@@ -244,12 +349,150 @@ async function doUpload() {
     uploading.value = false
   }
 }
+
+// ============ 模式二：产品文档导入（.hwics 异步构建） ============
+
+const mode = ref<'layer' | 'pdoc'>('layer')
+
+const pdNf = ref('')
+const pdVersion = ref('')
+const pdForce = ref(false)
+const pdFile = ref<File | null>(null)
+const pdIsDrag = ref(false)
+const pdFileInput = ref<HTMLInputElement | null>(null)
+const pdBusy = ref(false)
+const pdJob = ref<ImportJob | null>(null)
+const pdErrorMsg = ref('')
+let pdTimer: ReturnType<typeof setInterval> | null = null
+
+const pdSize = computed(() =>
+  pdFile.value ? `${(pdFile.value.size / 1024 / 1024).toFixed(1)} MB` : '',
+)
+
+const pdCanSubmit = computed(
+  () => !!pdNf.value.trim() && !!pdVersion.value.trim() && !!pdFile.value,
+)
+
+const RESULT_LABELS: Array<[string, string]> = [
+  ['commands', '命令'],
+  ['config_objects', '配置对象'],
+  ['licenses', 'License'],
+  ['features', '特性'],
+  ['feature_docs', '特性文档'],
+  ['export_md', '原始 md'],
+]
+
+const resultRows = computed(() => {
+  const r = pdJob.value?.result ?? {}
+  return RESULT_LABELS.filter(([k]) => r[k] != null).map(([k, label]) => ({
+    k: label,
+    v: r[k] as number,
+  }))
+})
+
+function onPdFileChange(e: Event) {
+  const f = (e.target as HTMLInputElement).files?.[0]
+  if (f) pdFile.value = f
+}
+function onPdDrop(e: DragEvent) {
+  pdIsDrag.value = false
+  const f = e.dataTransfer?.files?.[0]
+  if (f) pdFile.value = f
+}
+
+function stopPolling() {
+  if (pdTimer) {
+    clearInterval(pdTimer)
+    pdTimer = null
+  }
+}
+onBeforeUnmount(stopPolling)
+
+async function pollJob(jobId: string) {
+  stopPolling()
+  pdTimer = setInterval(async () => {
+    try {
+      const j = await getImportJob(jobId)
+      pdJob.value = j
+      if (j.status !== 'processing') {
+        stopPolling()
+        pdBusy.value = false
+        if (j.status === 'done') {
+          ElMessage.success('产品文档构建完成')
+          ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
+        }
+      }
+    } catch {
+      /* 轮询失败容忍一次网络抖动，下轮再试 */
+    }
+  }, 2000)
+}
+
+async function doPdUpload() {
+  if (!pdCanSubmit.value || !pdFile.value) return
+  pdBusy.value = true
+  pdJob.value = null
+  pdErrorMsg.value = ''
+  try {
+    const r = await uploadProductDoc(
+      pdNf.value.trim(),
+      pdVersion.value.trim(),
+      pdForce.value,
+      pdFile.value,
+    )
+    pdFile.value = null
+    if (pdFileInput.value) pdFileInput.value.value = ''
+    // 立即拉一次，然后轮询
+    pdJob.value = await getImportJob(r.job_id)
+    pollJob(r.job_id)
+  } catch (e: unknown) {
+    pdBusy.value = false
+    // 409：已有资产（后端 detail = {message, existing}）
+    const detail = (e as { detail?: unknown }).detail
+    if (detail && typeof detail === 'object' && 'message' in detail) {
+      pdErrorMsg.value = String((detail as { message: unknown }).message)
+    } else {
+      pdErrorMsg.value = e instanceof Error ? e.message : String(e)
+    }
+  }
+}
 </script>
 
 <style scoped>
 .upload-view { height: 100%; overflow: auto; padding: var(--space-8) var(--space-6); }
 .upload-container { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--space-5); }
 .page-head { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.mode-switch { display: inline-flex; gap: 4px; background: var(--bg-sunken); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 3px; width: fit-content; }
+.mode-btn { border: none; background: transparent; color: var(--text-muted); font-size: 12.5px; font-weight: 500; padding: 5px 14px; border-radius: var(--radius-sm); cursor: pointer; transition: all var(--dur-fast) var(--ease); }
+.mode-btn.active { background: var(--bg-elev); color: var(--accent); box-shadow: var(--shadow-sm); }
+
+.pdoc-card { display: flex; flex-direction: column; gap: var(--space-4); }
+.pdoc-grid { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-4); }
+.pdoc-drop { padding: var(--space-6); }
+.dz-file { font-size: 12px; color: var(--accent); margin-top: 4px; }
+.pd-force { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); cursor: pointer; }
+.pd-force input { accent-color: var(--accent); }
+
+.pd-job { border-top: 1px solid var(--border-faint); padding-top: var(--space-4); display: flex; flex-direction: column; gap: var(--space-3); }
+.pd-job-head { display: flex; align-items: center; gap: var(--space-3); }
+.pd-job-title { font-family: var(--display); font-weight: 600; font-size: 13.5px; }
+.pd-job-id { font-size: 11px; color: var(--text-faint); }
+.pd-status { font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 999px; }
+.pd-processing { background: var(--accent-soft); color: var(--accent); }
+.pd-done { background: rgba(16, 185, 129, 0.12); color: var(--success); }
+.pd-failed { background: #fef2f2; color: var(--danger); }
+.pd-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.pd-step { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
+.pd-step.pd-done { color: var(--text); }
+.pd-step.pd-processing { color: var(--accent); }
+.pd-step-dot { width: 16px; text-align: center; flex-shrink: 0; color: var(--text-faint); }
+.pd-step.pd-done .pd-step-dot { color: var(--success); }
+.pd-step.pd-processing .pd-step-dot { color: var(--accent); }
+.pd-step-detail { font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pd-stats { padding: 0; }
+.pd-done-hint { font-size: 12px; color: var(--text-muted); background: var(--bg-sunken); border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); }
+.pd-err { white-space: pre-wrap; word-break: break-all; }
 .page-title { font-family: var(--display); font-size: 24px; font-weight: 700; color: var(--text); margin: 0; letter-spacing: -0.02em; }
 .page-sub { margin: 0; color: var(--text-muted); font-size: 12.5px; line-height: 1.55; max-width: 600px; }
 

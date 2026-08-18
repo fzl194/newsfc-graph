@@ -378,6 +378,78 @@ export const uploadToDir = (
   return _req<FsUploadResult>(`${BASE}/fs/upload`, { method: 'POST', body: fd })
 }
 
+// ---------- 产品文档导入（.hwics 异步构建）+ 原始文档浏览 ----------
+
+export interface ImportJobStep {
+  name: string
+  status: string
+  detail: string
+}
+
+export interface ImportJob {
+  job_id: string
+  kind: string
+  status: string // processing | done | failed
+  nf: string
+  version: string
+  steps: ImportJobStep[]
+  result: Record<string, number | null>
+  warnings: string[]
+  error: string
+  added: number
+  started_at: number
+  finished_at: number
+}
+
+export const uploadProductDoc = (
+  nf: string,
+  version: string,
+  force: boolean,
+  file: File,
+): Promise<{ job_id: string; force: boolean; existing: Record<string, number> }> => {
+  const fd = new FormData()
+  fd.append('nf', nf)
+  fd.append('version', version)
+  if (force) fd.append('force', 'true')
+  fd.append('file', file)
+  return _req(`${BASE}/import/product-doc`, { method: 'POST', body: fd })
+}
+
+export const getImportJob = (id: string): Promise<ImportJob> =>
+  _req<ImportJob>(`${BASE}/import/jobs/${id}`)
+
+export const listDocsChildren = (path: string = ''): Promise<FsEntry[]> =>
+  _req<FsEntry[]>(`${BASE}/docs/children${qs({ path })}`)
+
+export const readDocsFile = (path: string): Promise<string> =>
+  _req<string>(`${BASE}/docs/file${qs({ path })}`)
+
+// ---------- md 正文图片相对引用 → raw 端点 URL（预览渲染用） ----------
+
+export const rawFsUrl = (path: string): string =>
+  `${BASE}/fs/raw?path=${encodeURIComponent(path)}`
+
+export const rawDocsUrl = (path: string): string =>
+  `${BASE}/docs/raw?path=${encodeURIComponent(path)}`
+
+/**
+ * 把 md 正文里的 `![alt](相对路径)` 图片引用改写为后端 raw 端点 URL。
+ * dir = 该 md 所在目录（相对 assets/docs 根的正斜杠路径）；外链 / data URI 原样保留。
+ */
+export const resolveImgUrls = (
+  body: string,
+  dir: string,
+  base: 'fs' | 'docs' = 'fs',
+): string => {
+  const toUrl = base === 'fs' ? rawFsUrl : rawDocsUrl
+  return body.replace(/(!\[[^\]]*\])\(([^)\s]+)\)/g, (m, alt: string, url: string) => {
+    if (/^(https?:|\/\/|data:|mailto:|#)/i.test(url)) return m
+    const clean = url.split('#')[0]
+    if (!clean) return m
+    return `${alt}(${toUrl(dir ? `${dir}/${clean}` : clean)})`
+  })
+}
+
 // ---------- 回收站（软删除）----------
 
 export interface TrashItem {

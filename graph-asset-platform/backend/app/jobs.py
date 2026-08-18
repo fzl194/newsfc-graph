@@ -24,6 +24,12 @@ class ImportJob:
     error: str = ""
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
+    # 产品文档导入（v0.22 平台）扩展字段；旧 import job 无这些字段，summary() 向后兼容
+    kind: str = "import"            # import | product_doc
+    nf: str = ""
+    version: str = ""
+    steps: list = field(default_factory=list)    # [{name, status, detail}]
+    result: dict = field(default_factory=dict)   # 构建产物计数（命名避开 summary() 方法）
 
     def summary(self) -> dict:
         return asdict(self)
@@ -33,9 +39,9 @@ _registry: dict[str, ImportJob] = {}
 _lock = threading.Lock()
 
 
-def create_job() -> ImportJob:
-    """新建一个 processing 状态的 job 并登记。"""
-    j = ImportJob(job_id=uuid.uuid4().hex[:12])
+def create_job(kind: str = "import", nf: str = "", version: str = "") -> ImportJob:
+    """新建一个 processing 状态的 job 并登记（kind: import | product_doc）。"""
+    j = ImportJob(job_id=uuid.uuid4().hex[:12], kind=kind, nf=nf, version=version)
     with _lock:
         _registry[j.job_id] = j
     return j
