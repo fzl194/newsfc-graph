@@ -63,11 +63,18 @@ def locate_dirs(export_root: Path, nf: str) -> dict[str, Path]:
 
 
 def _load_exporter():
-    """按路径加载拷贝版 exporter（不污染 sys.path；依赖 chardet/bs4）。"""
+    """按路径加载拷贝版 exporter（不污染 sys.path；依赖 chardet/bs4）。
+    **必须注册进 sys.modules**：exporter 顶部的 @dataclass 按 __module__ 名查
+    sys.modules 解析字符串注解，未注册会 AttributeError: NoneType.__dict__。"""
     spec = importlib.util.spec_from_file_location("pipeline_exporter", HERE / "exporter.py")
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     return mod
 
 
@@ -198,7 +205,9 @@ def run_product_doc_import(job_id: str, hwics_path: Path, nf: str,
         jobs.update_job(job_id, status="done", result=summary,
                         added=summary["commands"] or 0, warnings=warnings)
     except Exception as e:  # noqa: BLE001 —— job 终态必须覆盖一切异常
+        import traceback
         if hwics_path.exists():
             hwics_path.unlink(missing_ok=True)
         jobs.update_job(job_id, status="failed",
-                        error=f"{type(e).__name__}: {e}", warnings=warnings)
+                        error=f"{type(e).__name__}: {e}\n{traceback.format_exc()[-3000:]}",
+                        warnings=warnings)
