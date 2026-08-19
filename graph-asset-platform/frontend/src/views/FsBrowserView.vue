@@ -236,6 +236,11 @@ const ICON = {
 
 const menuItems = computed<CtxItem[]>(() => {
   const t = menu.value?.target ?? null
+  // docs 根（原始产品文档）只读：只留「打开」，绝不让写操作入口出现
+  // （评审清单 D8：曾把 docs 树 path 传给 assets 写 API）
+  if (source.value === 'docs') {
+    return t ? [{ key: 'open', label: '打开', icon: ICON.open }] : []
+  }
   if (!t) {
     // 空白区
     return canAssets

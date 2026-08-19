@@ -61,6 +61,15 @@ def file_sha256(p: Path, chunk: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def _assets_flags(nf: str, version: str) -> dict:
+    """该 nf+version 四层图谱资产是否已存在（前端「依赖强制锁定」UI 数据源）。"""
+    out: dict[str, bool] = {}
+    for layer in ("Command", "ConfigObject", "Feature", "License"):
+        d = config.ASSETS_DIR / layer / nf / version
+        out[layer] = d.is_dir() and next(d.rglob("*.md"), None) is not None
+    return out
+
+
 def list_bundles() -> list:
     """包列表（抽取页数据源）：output/ 下每目录 → 元信息（无 meta 视为 legacy done）。"""
     root = config.OUTPUT_DIR
@@ -73,9 +82,11 @@ def list_bundles() -> list:
         meta = read_meta(d)
         name = d.name
         nf_ver = name.split("_", 1)
+        nf = meta.get("nf") if meta else nf_ver[0]
+        version = meta.get("version") if meta else (nf_ver[1] if len(nf_ver) > 1 else "")
         out.append({
-            "nf": meta.get("nf") if meta else nf_ver[0],
-            "version": meta.get("version") if meta else (nf_ver[1] if len(nf_ver) > 1 else ""),
+            "nf": nf,
+            "version": version,
             "dir": name,
             "status": (meta or {}).get("status", "done"),
             "legacy": meta is None,          # 旧格式（仅 md，无元信息）仍可挖掘
@@ -85,6 +96,7 @@ def list_bundles() -> list:
             "md_count": (meta or {}).get("md_count"),
             "convert_failed": (meta or {}).get("convert_failed", 0),
             "mode_id": (meta or {}).get("mode_id", ""),   # 最近一次挖掘用的模式
+            "assets": _assets_flags(nf, version),          # 依赖锁定 UI 数据源
         })
     return out
 

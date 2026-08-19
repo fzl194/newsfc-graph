@@ -378,7 +378,7 @@ export const uploadToDir = (
   return _req<FsUploadResult>(`${BASE}/fs/upload`, { method: 'POST', body: fd })
 }
 
-// ---------- 产品文档导入（.hwics 异步构建）+ 原始文档浏览 ----------
+// ---------- 产品文档两步流水线（解压留存 / 图谱挖掘）+ 原始文档浏览 ----------
 
 export interface ImportJobStep {
   name: string
@@ -388,12 +388,12 @@ export interface ImportJobStep {
 
 export interface ImportJob {
   job_id: string
-  kind: string
+  kind: string // import | product_doc_extract | product_doc_mine
   status: string // processing | done | failed
   nf: string
   version: string
   steps: ImportJobStep[]
-  result: Record<string, number | null>
+  result: Record<string, number | null | Record<string, number>>
   warnings: string[]
   error: string
   added: number
@@ -401,19 +401,73 @@ export interface ImportJob {
   finished_at: number
 }
 
+/** 步骤①：上传解压（只解压转换留存，不构建；同 nf+version 自动覆盖旧包）。 */
 export const uploadProductDoc = (
   nf: string,
   version: string,
-  force: boolean,
   file: File,
-): Promise<{ job_id: string; force: boolean; existing: Record<string, number> }> => {
+): Promise<{ job_id: string; nf: string; version: string; size: number }> => {
   const fd = new FormData()
   fd.append('nf', nf)
   fd.append('version', version)
-  if (force) fd.append('force', 'true')
   fd.append('file', file)
   return _req(`${BASE}/import/product-doc`, { method: 'POST', body: fd })
 }
+
+/** 已解压产品文档包（抽取页数据源）。assets=该 nf+version 四层资产是否已存在。 */
+export interface DocBundle {
+  nf: string
+  version: string
+  dir: string
+  status: string
+  legacy: boolean
+  uploaded_at: string
+  uploaded_by: string
+  source_name: string
+  md_count: number | null
+  convert_failed: number
+  mode_id: string
+  assets: Record<string, boolean>
+}
+
+export const listBundles = (): Promise<DocBundle[]> =>
+  _req<DocBundle[]>(`${BASE}/import/bundles`)
+
+export interface ModeOption {
+  id: string
+  name: string
+}
+
+export const listModes = (): Promise<ModeOption[]> =>
+  _req<ModeOption[]>(`${BASE}/import/modes`)
+
+export interface LocateRole {
+  recommended: string | null
+  candidates: string[]
+  note: string
+}
+
+export type LocateResult = Record<string, LocateRole>
+
+export const locateBundle = (nf: string, version: string, mode: string): Promise<LocateResult> =>
+  _req<LocateResult>(
+    `${BASE}/import/bundles/${encodeURIComponent(nf)}/${encodeURIComponent(version)}/locate${qs({ mode })}`,
+  )
+
+/** 步骤②：图谱挖掘（响应 scope=依赖强制后的最终范围，notes=补选说明）。 */
+export const startMine = (b: {
+  nf: string
+  version: string
+  mode: string
+  dirs: Record<string, string>
+  scope: string[]
+  force: boolean
+}): Promise<{ job_id: string; scope: string[]; notes: string[]; force: boolean }> =>
+  _req(`${BASE}/import/mine`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(b),
+  })
 
 export const getImportJob = (id: string): Promise<ImportJob> =>
   _req<ImportJob>(`${BASE}/import/jobs/${id}`)
