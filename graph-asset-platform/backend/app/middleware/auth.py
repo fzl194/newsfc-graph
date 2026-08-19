@@ -45,6 +45,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         key = request.headers.get("X-API-Key", "")
+        # 图片端点例外：`<img src>` 由浏览器发起带不了自定义头——接受 ?key= 查询参数
+        # （评审清单 D2；仅限 raw 两端点，缩小 key 入 URL 的日志面）
+        if not key and (path.startswith("/api/v1/fs/raw") or path.startswith("/api/v1/docs/raw")):
+            key = request.query_params.get("key", "")
         user = authenticate(key)
         if user is None:
             return JSONResponse(status_code=401, content={"detail": "missing or invalid api key"})

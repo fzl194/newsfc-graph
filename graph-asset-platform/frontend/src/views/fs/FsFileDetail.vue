@@ -49,7 +49,7 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
-import { readFsFile, readDocsFile, writeFsFile, resolveImgUrls } from '../../api'
+import { readFsFile, readDocsFile, writeFsFile, fixImgSrcs } from '../../api'
 
 const props = defineProps<{
   path: string
@@ -62,7 +62,8 @@ const emit = defineEmits<{
   (e: 'action', a: { type: string; path?: string }): void
 }>()
 
-const md = new MarkdownIt({ html: false, linkify: true })
+// html:true 与 MdPreview 统一（命令文档表格大量 <br>；渲染结果经 DOMPurify 消毒）
+const md = new MarkdownIt({ html: true, linkify: true })
 
 const fileContent = ref('')
 const loading = ref(false)
@@ -98,10 +99,10 @@ const renderedHtml = computed(() => {
   if (!fileContent.value) return ''
   // 脱掉 frontmatter 段再渲染（预览只看正文）
   const body = fileContent.value.replace(/^---\n[\s\S]*?\n---\n/, '')
-  // 图片相对引用（assets/x.png、x.assets/y.png）→ 对应根的 raw 端点
+  // D3：图片在渲染后 HTML 上改写为对应根的 raw 端点（含空格/中文括号路径也稳）
   const dir = props.path.split('/').slice(0, -1).join('/')
-  const resolved = resolveImgUrls(body, dir, isDocs.value ? 'docs' : 'fs')
-  return DOMPurify.sanitize(md.render(resolved))
+  const html = fixImgSrcs(md.render(body), dir, isDocs.value ? 'docs' : 'fs')
+  return DOMPurify.sanitize(html)
 })
 
 function startEdit(): void {

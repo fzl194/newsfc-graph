@@ -486,29 +486,30 @@ export const listDocsChildren = (path: string = ''): Promise<FsEntry[]> =>
 export const readDocsFile = (path: string): Promise<string> =>
   _req<string>(`${BASE}/docs/file${qs({ path })}`)
 
-// ---------- md 正文图片相对引用 → raw 端点 URL（预览渲染用） ----------
+// ---------- md 图片相对引用 → raw 端点 URL（预览渲染用） ----------
 
+/** raw URL 自动带 key（D2：`<img src>` 带不了 X-API-Key 头，后端 raw 端点接受 ?key=）。 */
 export const rawFsUrl = (path: string): string =>
-  `${BASE}/fs/raw?path=${encodeURIComponent(path)}`
+  `${BASE}/fs/raw?path=${encodeURIComponent(path)}&key=${encodeURIComponent(getKey() || '')}`
 
 export const rawDocsUrl = (path: string): string =>
-  `${BASE}/docs/raw?path=${encodeURIComponent(path)}`
+  `${BASE}/docs/raw?path=${encodeURIComponent(path)}&key=${encodeURIComponent(getKey() || '')}`
 
 /**
- * 把 md 正文里的 `![alt](相对路径)` 图片引用改写为后端 raw 端点 URL。
- * dir = 该 md 所在目录（相对 assets/docs 根的正斜杠路径）；外链 / data URI 原样保留。
+ * D3：在**渲染后的 HTML** 上改写 `<img src="相对路径">` 为 raw 端点 URL。
+ * 不在 md 源上做——真实资产里 258+ 处图片路径含空格/中文括号，md 源正则必漏；
+ * HTML 属性引号内的 src 无此问题。外链 / data URI / 已改写的跳过。
+ * dir = 该 md 所在目录（相对 assets/docs 根的正斜杠路径）。
  */
-export const resolveImgUrls = (
-  body: string,
+export const fixImgSrcs = (
+  renderedHtml: string,
   dir: string,
   base: 'fs' | 'docs' = 'fs',
 ): string => {
   const toUrl = base === 'fs' ? rawFsUrl : rawDocsUrl
-  return body.replace(/(!\[[^\]]*\])\(([^)\s]+)\)/g, (m, alt: string, url: string) => {
-    if (/^(https?:|\/\/|data:|mailto:|#)/i.test(url)) return m
-    const clean = url.split('#')[0]
-    if (!clean) return m
-    return `${alt}(${toUrl(dir ? `${dir}/${clean}` : clean)})`
+  return renderedHtml.replace(/<img\s+([^>]*?)src="([^"]*)"/g, (m, pre: string, src: string) => {
+    if (!src || /^(https?:|\/\/|data:|#)/i.test(src) || src.startsWith('/api/')) return m
+    return `<img ${pre}src="${toUrl(dir ? `${dir}/${src}` : src)}"`
   })
 }
 

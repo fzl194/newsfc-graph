@@ -117,7 +117,7 @@
 import { computed, ref, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import DOMPurify from 'dompurify'
-import { getObject, getNameMap, availableVersionsFromError, resolveImgUrls, type Edge, type ObjectDetail } from '../api'
+import { getObject, getNameMap, availableVersionsFromError, fixImgSrcs, type Edge, type ObjectDetail } from '../api'
 import { useNav } from '../composables/useNav'
 
 const { viewVersion } = useNav()
@@ -238,12 +238,13 @@ async function load(id: string, ver?: string): Promise<void> {
     selectedVersion.value = obj.version ?? ver ?? ''
     // body_md 已由后端 md_parser 归一化换行 + 折叠表格内部空行（纯正文，干净 LF）。
     const body = (obj.body_md || '').replace(/\r/g, '')
-    // ![](assets/x.png) 相对引用 → /fs/raw 端点（dir = 本 md 在资产库中的所在目录）
-    const dir = (obj.source_path || '').split('/').slice(0, -1).join('/')
-    const rendered = md.render(resolveImgUrls(body, dir))
+    const rendered = md.render(body)
     // 正文 [[ID]] 替换为可点击 a，显示文本查目标 name（无则显 ID）
     const names = await getNameMap()
-    const finalHtml = inlineLinksIntoHtml(rendered, names)
+    let finalHtml = inlineLinksIntoHtml(rendered, names)
+    // D3：图片相对引用在渲染后 HTML 上改写（src = raw 端点 + key；dir=md 所在目录）
+    const dir = (obj.source_path || '').split('/').slice(0, -1).join('/')
+    if (dir) finalHtml = fixImgSrcs(finalHtml, dir)
     html.value = DOMPurify.sanitize(finalHtml, {
       ADD_ATTR: ['data-wiki-id', 'target', 'rel'],
     })
