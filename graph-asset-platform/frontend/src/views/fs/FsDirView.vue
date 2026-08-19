@@ -352,7 +352,7 @@ function fmtSize(n?: number): string {
   top: 0;
   z-index: 1;
   display: grid;
-  grid-template-columns: 40px 1fr 130px 90px;
+  grid-template-columns: 36px 1fr 84px 64px;
   align-items: center;
   height: 32px;
   padding: 0 var(--space-3);
@@ -379,7 +379,7 @@ function fmtSize(n?: number): string {
 
 .frow {
   display: grid;
-  grid-template-columns: 40px 1fr 90px 70px;
+  grid-template-columns: 36px 1fr 84px 64px;
   align-items: center;
   min-height: 32px;
   padding: 3px var(--space-3);
