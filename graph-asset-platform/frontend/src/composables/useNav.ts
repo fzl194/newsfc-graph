@@ -167,12 +167,15 @@ function invalidateCache(): void {
 /**
  * 跨栏跳转：根据对象 type 反推 UI 层，设对应选择器后 loadList + 高亮。
  *
- * - 业务层对象：用 domain/scenario 定位（无版本维度）。
- * - 其余层对象：用 nf/version 定位；version 优先取 ``forceVersion``（URL ?version= 恢复），
- *   否则取对象当前版本，若空则取其最新现存版本。
+ * **跳转版本决策（用户决策 2026-08-19）**：
+ * - 起点有版本、终点有版本（命令/配置对象/特性/License 间）→ **同版本优先**；
+ * - 起点无版本（任务层/业务层出发）、终点有版本 → 最新现存版本；
+ * - 终点无版本（任务/业务对象）→ 不带版本（落它唯一节点），版本上下文清空。
+ * 另：``forceVersion``（URL ?version= 恢复）显式指定时优先于上述规则。
  */
 async function syncTo(id: string, forceVersion?: string): Promise<void> {
   loadError.value = ''
+  const srcVersion = viewVersion.value || '' // 起点版本上下文（跳转时机捕获）
   try {
     const obj = await getObject(id)
     const layer = TYPE_TO_UI[obj.type] ?? '命令层'
@@ -186,13 +189,28 @@ async function syncTo(id: string, forceVersion?: string): Promise<void> {
       sel.version = ''
       viewVersion.value = ''
     } else {
-      sel.nf = obj.nf ?? ''
-      // 优先 URL ?version=（forceVersion）→ 对象当前版本 → 最新现存版本（versions 升序取末位）
-      const vs = obj.versions ?? []
-      sel.version = forceVersion || obj.version || (vs.length ? (vs[vs.length - 1] ?? '') : '')
+      // 目标版本决策：无版本对象（Task 层 versions=[null]）→ 空；否则同版本优先，缺失落最新
+      const vs = (obj.versions ?? []).filter((v): v is string => !!v)
+      let targetVersion = ''
+      if (vs.length > 0) {
+        if (forceVersion && vs.includes(forceVersion)) {
+          targetVersion = forceVersion
+        } else if (srcVersion && vs.includes(srcVersion)) {
+          targetVersion = srcVersion // 同版本跳转（版本内闭环）
+        } else {
+          targetVersion = vs[vs.length - 1] // 起点无版本/同版本缺失 → 最新现存
+        }
+      }
+      // 首次取回的是最新版节点；同版本命中且不同 → 二次取该版本
+      let node = obj
+      if (targetVersion && obj.version !== targetVersion) {
+        node = await getObject(id, targetVersion)
+      }
+      sel.nf = node.nf ?? ''
+      sel.version = targetVersion // 决策结果（''=无版本对象，列表不过滤）
       sel.domain = ''
       sel.scenario = ''
-      viewVersion.value = sel.version
+      viewVersion.value = targetVersion
     }
     sel.type = ''
     sel.q = ''
