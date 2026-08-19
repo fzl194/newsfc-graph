@@ -43,7 +43,7 @@
       <div v-else-if="!sorted.length" class="hint empty">
         <span>空目录{{ canManage ? '（右键空白处可新建 / 上传）' : '' }}</span>
       </div>
-      <div v-else class="ftable" role="table">
+      <div v-else class="ftable" :class="{ 'ftable-ro': readonly }" role="table">
         <div class="fthead" role="row">
           <div v-if="!readonly" class="th th-check">
             <input
@@ -347,6 +347,13 @@ function fmtSize(n?: number): string {
 .ftable {
   width: 100%;
 }
+/* 只读模式（原始产品文档）无复选框列：格子只有 3 个，grid 轨道必须同步减为 3 条
+   ——此前轨道仍 4 条，名称掉进 36px 复选框轨道（窄）、类型占满 1fr（用户实测报告） */
+.ftable-ro .fthead,
+.ftable-ro .frow {
+  grid-template-columns: 1fr 84px 64px;
+}
+
 .fthead {
   position: sticky;
   top: 0;
