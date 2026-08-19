@@ -488,12 +488,25 @@ export const readDocsFile = (path: string): Promise<string> =>
 
 // ---------- md 图片相对引用 → raw 端点 URL（预览渲染用） ----------
 
+/**
+ * 归一化：markdown-it 渲染出的 src 已被整体百分号编码（中文/空格/全角括号），
+ * encodeLinkSpaces 的 %20 同理——拼 raw URL 前先解码一次，避免双重编码
+ * （%20→%2520 后端 404，即"文档图片看不了"的根因之二）。含非法 % 序列时原样返回。
+ */
+const _normPath = (s: string): string => {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return s
+  }
+}
+
 /** raw URL 自动带 key（D2：`<img src>` 带不了 X-API-Key 头，后端 raw 端点接受 ?key=）。 */
 export const rawFsUrl = (path: string): string =>
-  `${BASE}/fs/raw?path=${encodeURIComponent(path)}&key=${encodeURIComponent(getKey() || '')}`
+  `${BASE}/fs/raw?path=${encodeURIComponent(_normPath(path))}&key=${encodeURIComponent(getKey() || '')}`
 
 export const rawDocsUrl = (path: string): string =>
-  `${BASE}/docs/raw?path=${encodeURIComponent(path)}&key=${encodeURIComponent(getKey() || '')}`
+  `${BASE}/docs/raw?path=${encodeURIComponent(_normPath(path))}&key=${encodeURIComponent(getKey() || '')}`
 
 /**
  * 渲染**前**的 md 源预处理：把 `](目标)` 目标里的空格/制表符编码为 %20。
