@@ -94,8 +94,9 @@ def read_file(path: str):
     return PlainTextResponse(svc.store.read(path), media_type="text/markdown; charset=utf-8")
 
 
-# 二进制白名单：资产 md 里 ![](assets/x.png) 的图片经此端点展示
-_RAW_SUFFIX_WHITELIST = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico"}
+# 二进制白名单：资产 md 里 ![](assets/x.png) 的图片经此端点展示。
+# 不含 .svg——可嵌脚本的同源 XSS 面（评审清单 D9，2026-08-19 批准剔除）
+_RAW_SUFFIX_WHITELIST = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"}
 
 
 @router.get("/fs/raw")

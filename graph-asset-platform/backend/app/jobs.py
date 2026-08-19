@@ -1,25 +1,29 @@
-"""ImportJob：异步导入后台任务的状态载体（内存缓存 + platform.db 持久化）。
+"""ImportJob：异步导入任务的状态载体（内存缓存 + platform.db 持久化）。
 
-v2（2026-08-18，产品文档导入需求）：
-- **历史持久化**：job 全量写 ``import_jobs`` 表（create/update 落库），后端重启后
-  ``GET /import/jobs`` 仍能列出全部历史，前端刷新/重开页面不丢任务。
-- **单任务互斥**：产品文档构建同时只允许一个在跑——router 层用
-  ``has_processing('product_doc')`` 拒新（409）。
-- **重启清账**：``sweep_interrupted()``（lifespan 启动时调）把上个进程遗留的
-  processing 标记 failed——后台线程随进程消亡，不能装作还在跑；已写入的半成品
-  资产保留，覆盖重建可续。
-- 内存 ``_registry`` 仅是**活动缓存**（processing 实时读，避免每步查询）；
-  终态与历史以 DB 为准。``delete_job`` 仅允许非 processing（解析进行中不可删）。
+v3（2026-08-19，两步流水线）：
+- kind：``product_doc_extract``（解压转换）/ ``product_doc_mine``（图谱挖掘）；
+  两类各自全局单任务互斥、允许并行（用户决策）。
+- ``child_pids``：构建子进程 PID 记录——后端被硬杀后孤儿进程继续写资产目录，
+  ``sweep_interrupted()`` 启动时按 PID 树终止（评审清单 D16）。
+- **独立 SQLite 连接**（评审清单 D7）：后台线程高频落库不再与共享连接跨线程混写；
+  WAL 多连接 + busy_timeout。测试通过 monkeypatch ``jobs._conn`` 注入 tmp 连接。
+- 历史持久化 / 删除（非 processing）/ 重启清账语义见 v2 注释，不变。
 """
 import json
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from .db import get_shared_db
+from .db import DB_PATH
+
+_KINDS = ("import", "product_doc_extract", "product_doc_mine")
 
 
 @dataclass
@@ -33,12 +37,12 @@ class ImportJob:
     error: str = ""
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
-    # 产品文档导入扩展字段（v2）；旧 import job 无这些字段，summary() 向后兼容
-    kind: str = "import"            # import | product_doc
+    kind: str = "import"
     nf: str = ""
     version: str = ""
-    steps: list = field(default_factory=list)    # [{name, status, detail}]
-    result: dict = field(default_factory=dict)   # 构建产物计数（命名避开 summary() 方法）
+    steps: list = field(default_factory=list)      # [{name, status, detail}]
+    result: dict = field(default_factory=dict)     # 产物计数（命名避开 summary() 方法）
+    child_pids: list = field(default_factory=list)  # 运行中子进程 PID（D16 sweep 终止用）
 
     def summary(self) -> dict:
         return asdict(self)
@@ -47,23 +51,57 @@ class ImportJob:
 _registry: dict[str, ImportJob] = {}
 _lock = threading.Lock()
 
+# 各类任务的全局互斥锁（检查→登记 原子化，修 TOCTOU；评审清单 D6）
+_mutex_locks = {k: threading.Lock() for k in _KINDS}
+
+
+# ---------- 独立连接（D7） ----------
+
+_conn: "sqlite3.Connection | None" = None
+
+_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS import_jobs(
+  job_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+  nf TEXT DEFAULT '', version TEXT DEFAULT '',
+  status TEXT NOT NULL, added INTEGER DEFAULT 0,
+  steps TEXT DEFAULT '[]', result TEXT DEFAULT '{}', warnings TEXT DEFAULT '[]',
+  error TEXT DEFAULT '', started_at REAL NOT NULL, finished_at REAL DEFAULT 0,
+  child_pids TEXT DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_started ON import_jobs(started_at);
+"""
+
+
+def _db() -> sqlite3.Connection:
+    """jobs 专用连接（与 service/telemetry 共享连接隔离）；测试注入 ``jobs._conn``。"""
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA busy_timeout=5000")
+        _conn.executescript(_TABLE_SQL)
+        _conn.commit()
+    return _conn
+
 
 def _persist(j: ImportJob) -> None:
-    """落库（UPSERT）。持久化失败不阻断任务推进——内存态仍在，仅历史缺失。"""
+    """落库（UPSERT）。持久化失败记 stderr 不抛——内存态仍在，仅历史缺失。"""
     try:
-        db = get_shared_db()
+        db = _db()
         db.execute(
             "INSERT OR REPLACE INTO import_jobs(job_id,kind,nf,version,status,added,"
-            "steps,result,warnings,error,started_at,finished_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "steps,result,warnings,error,started_at,finished_at,child_pids) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (j.job_id, j.kind, j.nf, j.version, j.status, j.added,
              json.dumps(j.steps, ensure_ascii=False),
              json.dumps(j.result, ensure_ascii=False),
              json.dumps(j.warnings, ensure_ascii=False),
-             j.error, j.started_at, j.finished_at))
+             j.error, j.started_at, j.finished_at,
+             json.dumps(j.child_pids)))
         db.commit()
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as e:
+        print(f"[jobs] 持久化失败 {j.job_id}: {e}", file=sys.stderr)
 
 
 def _from_row(r: sqlite3.Row) -> ImportJob:
@@ -74,11 +112,27 @@ def _from_row(r: sqlite3.Row) -> ImportJob:
         result=json.loads(r["result"] or "{}"),
         warnings=json.loads(r["warnings"] or "[]"),
         error=r["error"] or "", started_at=r["started_at"], finished_at=r["finished_at"] or 0.0,
+        child_pids=json.loads(r["child_pids"] or "[]"),
     )
 
 
+def acquire_mutex(kind: str) -> bool:
+    """取该类任务的全局锁（检查→登记 原子段入口）。取不到立即返回 False。"""
+    lk = _mutex_locks.get(kind)
+    return lk.acquire(blocking=False) if lk else True
+
+
+def release_mutex(kind: str) -> None:
+    lk = _mutex_locks.get(kind)
+    if lk:
+        try:
+            lk.release()
+        except RuntimeError:
+            pass
+
+
 def create_job(kind: str = "import", nf: str = "", version: str = "") -> ImportJob:
-    """新建一个 processing 状态的 job 并登记（内存 + DB）。"""
+    """新建 processing 状态的 job（内存 + DB）。调用方应已持有该 kind 的互斥锁。"""
     j = ImportJob(job_id=uuid.uuid4().hex[:12], kind=kind, nf=nf, version=version)
     with _lock:
         _registry[j.job_id] = j
@@ -87,7 +141,6 @@ def create_job(kind: str = "import", nf: str = "", version: str = "") -> ImportJ
 
 
 def update_job(jid: str, **kw) -> None:
-    """增量更新 job 字段（内存 + 落库）；status 转为 done/failed 时记录 finished_at。"""
     with _lock:
         j = _registry.get(jid)
         if j is None:
@@ -97,7 +150,6 @@ def update_job(jid: str, **kw) -> None:
         if kw.get("status") in ("done", "failed"):
             j.finished_at = time.time()
         snapshot = asdict(j)
-    # 快照后落库（锁外执行 DB IO；registry 是唯一写方，快照一致性够用）
     _persist(ImportJob(**snapshot))
 
 
@@ -107,7 +159,7 @@ def get_job(jid: str) -> Optional[ImportJob]:
     if j is not None:
         return j
     try:
-        row = get_shared_db().execute(
+        row = _db().execute(
             "SELECT * FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
     except sqlite3.Error:
         return None
@@ -115,10 +167,8 @@ def get_job(jid: str) -> Optional[ImportJob]:
 
 
 def list_jobs(limit: int = 100) -> list:
-    """按 started_at 倒序的历史任务（DB 为准；registry 内的活动对象覆盖同 id 行，
-    保证 processing 步骤实时）。"""
     try:
-        rows = get_shared_db().execute(
+        rows = _db().execute(
             "SELECT * FROM import_jobs ORDER BY started_at DESC LIMIT ?", (limit,)
         ).fetchall()
     except sqlite3.Error:
@@ -129,7 +179,6 @@ def list_jobs(limit: int = 100) -> list:
     for r in rows:
         j = reg.get(r["job_id"])
         out.append(j if j is not None else _from_row(r))
-    # registry 里可能有未落库成功的（持久化失败容忍）——补上，保持倒序
     seen = {r["job_id"] for r in rows}
     extra = [j for jid, j in reg.items() if jid not in seen]
     out.extend(sorted(extra, key=lambda j: j.started_at, reverse=True))
@@ -137,15 +186,15 @@ def list_jobs(limit: int = 100) -> list:
 
 
 def delete_job(jid: str) -> bool:
-    """删除历史任务（**仅非 processing**——解析进行中不可删）。不存在 → False；
-    processing → False（调用方据此 400）。"""
+    """删除历史任务（**仅非 processing**——解析进行中不可删，用户决策）。"""
     with _lock:
         j = _registry.get(jid)
     if j is not None and j.status == "processing":
         return False
     try:
-        cur = get_shared_db().execute("DELETE FROM import_jobs WHERE job_id=?", (jid,))
-        get_shared_db().commit()
+        db = _db()
+        cur = db.execute("DELETE FROM import_jobs WHERE job_id=?", (jid,))
+        db.commit()
     except sqlite3.Error:
         return False
     if cur.rowcount == 0 and j is None:
@@ -156,13 +205,12 @@ def delete_job(jid: str) -> bool:
 
 
 def has_processing(kind: str) -> Optional[ImportJob]:
-    """指定 kind 是否有 processing 任务（单任务互斥用）。registry 优先，DB 兜底。"""
     with _lock:
         for j in _registry.values():
             if j.kind == kind and j.status == "processing":
                 return j
     try:
-        row = get_shared_db().execute(
+        row = _db().execute(
             "SELECT * FROM import_jobs WHERE kind=? AND status='processing' "
             "ORDER BY started_at DESC LIMIT 1", (kind,)).fetchone()
     except sqlite3.Error:
@@ -170,17 +218,44 @@ def has_processing(kind: str) -> Optional[ImportJob]:
     return _from_row(row) if row else None
 
 
-def sweep_interrupted() -> int:
-    """启动清账：上个进程遗留的 processing → failed（后台线程已随进程消亡）。
-    幂等；返回清账条数。"""
+def _kill_pid_tree(pid: int) -> None:
+    """尽力终止进程树（Windows taskkill /T；POSIX SIGKILL）。"""
+    if not isinstance(pid, int) or pid <= 0:
+        return
     try:
-        db = get_shared_db()
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001 —— 尽力而为，失败不阻断清账
+        pass
+
+
+def sweep_interrupted() -> int:
+    """启动清账：①终止上个进程遗留的子进程树（D16）→ ②processing 标记 failed。
+    幂等；返回清账条数。"""
+    n = 0
+    try:
+        db = _db()
+        rows = db.execute(
+            "SELECT job_id, child_pids FROM import_jobs WHERE status='processing'").fetchall()
+        for r in rows:
+            for pid in json.loads(r["child_pids"] or "[]"):
+                _kill_pid_tree(int(pid))
         cur = db.execute(
-            "UPDATE import_jobs SET status='failed', finished_at=?, "
+            "UPDATE import_jobs SET status='failed', finished_at=?, child_pids='[]', "
             "error=COALESCE(NULLIF(error,''), '后端重启，任务中断：后台线程已消亡；"
             "已写入的资产保留，可覆盖重建续跑') WHERE status='processing'",
             (time.time(),))
         db.commit()
+        n = cur.rowcount
     except sqlite3.Error:
         return 0
-    return cur.rowcount
+    if n:
+        with _lock:
+            for j in list(_registry.values()):
+                if j.status == "processing":
+                    j.status = "failed"
+                    j.finished_at = time.time()
+    return n

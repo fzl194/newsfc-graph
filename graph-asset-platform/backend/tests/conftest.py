@@ -53,6 +53,9 @@ def _empty_service_to_avoid_real_index(tmp_data_dir, monkeypatch):
     monkeypatch.setattr(dbmod, "_shared", s.db, raising=False)  # users/store 共用此连接
     s.index = Index.load_from_db(s.db, s.registry)
     monkeypatch.setattr(svc, "_service", s)
+    # jobs 独立连接（生产并发隔离）→ 测试注入同一 tmp 连接
+    import app.jobs as jobs_mod
+    monkeypatch.setattr(jobs_mod, "_conn", s.db, raising=False)
 
 
 @pytest.fixture(autouse=True)

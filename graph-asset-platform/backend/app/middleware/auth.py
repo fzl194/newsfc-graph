@@ -24,6 +24,8 @@ def _need_perm(path: str) -> str:
         return "admin"
     if path.startswith("/api/v1/fs"):  # 资产目录（/fs 文件管理 + /fs/upload 上传）
         return "assets"
+    if path.startswith("/api/v1/docs"):  # 原始产品文档（资产页签内，D15 用户决策：页签级权限）
+        return "assets"
     if path in ("/api/v1/domains", "/api/v1/md"):
         return "skill"
     if path.startswith("/api/v1/import") or path.startswith("/api/v1/export"):

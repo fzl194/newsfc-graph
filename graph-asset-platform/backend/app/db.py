@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS import_jobs(
   nf TEXT DEFAULT '', version TEXT DEFAULT '',
   status TEXT NOT NULL, added INTEGER DEFAULT 0,
   steps TEXT DEFAULT '[]', result TEXT DEFAULT '{}', warnings TEXT DEFAULT '[]',
-  error TEXT DEFAULT '', started_at REAL NOT NULL, finished_at REAL DEFAULT 0
+  error TEXT DEFAULT '', started_at REAL NOT NULL, finished_at REAL DEFAULT 0,
+  child_pids TEXT DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_import_jobs_started ON import_jobs(started_at);
 
@@ -112,6 +113,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if "can_assets" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN can_assets INT DEFAULT 0")
     conn.execute("UPDATE users SET can_assets=1 WHERE is_admin=1 AND can_assets=0")
+    # v3 迁移：import_jobs.child_pids（jobs 独立连接记子进程 PID，sweep 终止孤儿用）。幂等。
+    jcols = {r[1] for r in conn.execute("PRAGMA table_info(import_jobs)")}
+    if jcols and "child_pids" not in jcols:
+        conn.execute("ALTER TABLE import_jobs ADD COLUMN child_pids TEXT DEFAULT '[]'")
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
         (SCHEMA_VERSION,),
