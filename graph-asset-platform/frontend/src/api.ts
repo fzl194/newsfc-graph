@@ -496,6 +496,25 @@ export const rawDocsUrl = (path: string): string =>
   `${BASE}/docs/raw?path=${encodeURIComponent(path)}&key=${encodeURIComponent(getKey() || '')}`
 
 /**
+ * 渲染**前**的 md 源预处理：把 `](目标)` 目标里的空格/制表符编码为 %20。
+ * CommonMark 内联目标遇到空格即截断（markdown-it 亦然）——原始产品文档里大量
+ * `![](设置升级观察期(SET UPGRADEWATCH)_xxx.assets/a.png)` 目标含空格，不编码则
+ * 渲染出的 <img src> 本身就是断的（用户反馈"文档图片看不了"的根因）。
+ * ` "title"` 标题部分在其后的空格保留不编码；外链/data URI 不动。
+ */
+export const encodeLinkSpaces = (body: string): string =>
+  body.replace(/(\]\()([^)\n]*[ \t][^)\n]*)(\))/g, (m, pre: string, dest: string, post: string) => {
+    if (/^(https?:|\/\/|data:|mailto:)/i.test(dest)) return m
+    const qi = dest.indexOf('"')
+    let url = qi === -1 ? dest : dest.slice(0, qi)
+    const title = qi === -1 ? '' : dest.slice(qi)
+    url = url.replace(/[ \t]+$/, '') // url 与 "title" 间的分隔空格不编码
+    if (!/[ \t]/.test(url)) return m
+    // 编码后 url 已无空格，与 "title" 间保留一个明文空格作分隔（CommonMark 要求）
+    return `${pre}${url.replace(/[ \t]/g, '%20')}${title ? ' ' : ''}${title}${post}`
+  })
+
+/**
  * D3：在**渲染后的 HTML** 上改写 `<img src="相对路径">` 为 raw 端点 URL。
  * 不在 md 源上做——真实资产里 258+ 处图片路径含空格/中文括号，md 源正则必漏；
  * HTML 属性引号内的 src 无此问题。外链 / data URI / 已改写的跳过。

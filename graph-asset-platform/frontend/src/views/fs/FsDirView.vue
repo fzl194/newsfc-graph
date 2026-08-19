@@ -379,10 +379,10 @@ function fmtSize(n?: number): string {
 
 .frow {
   display: grid;
-  grid-template-columns: 40px 1fr 130px 90px;
+  grid-template-columns: 40px 1fr 90px 70px;
   align-items: center;
-  height: 32px;
-  padding: 0 var(--space-3);
+  min-height: 32px;
+  padding: 3px var(--space-3);
   border-bottom: 1px solid var(--border-faint);
   cursor: pointer;
   color: var(--text);
@@ -415,9 +415,14 @@ function fmtSize(n?: number): string {
 }
 .fname {
   font-size: 12.5px;
+  /* 长文件名（产品文档中文长名）两行换行展示，不再单行截断成"看不见" */
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.35;
+  word-break: break-all;
+  padding: 2px 0;
 }
 .td-type,
 .td-size {

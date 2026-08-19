@@ -234,19 +234,23 @@
                 {{ ROLE_LABEL[key as string] || key }} 源目录 <span class="req">*</span>
                 <span v-if="role.note" class="loc-note">⚠ {{ role.note }}</span>
               </label>
-              <el-select
-                v-model="dirs[key as string]"
-                filterable
-                placeholder="选择目录"
-                class="full"
-              >
-                <el-option
-                  v-for="c in role.candidates"
-                  :key="c"
-                  :label="c + (c === role.recommended ? '（推荐）' : '')"
-                  :value="c"
-                />
-              </el-select>
+              <div class="loc-row">
+                <el-select
+                  v-model="dirs[key as string]"
+                  filterable
+                  allow-create
+                  placeholder="选择或逐层浏览目录"
+                  class="full"
+                >
+                  <el-option
+                    v-for="c in role.candidates"
+                    :key="c"
+                    :label="c + (c === role.recommended ? '（推荐）' : '')"
+                    :value="c"
+                  />
+                </el-select>
+                <button class="ghost-btn2" @click="openPicker(key as string)">逐层浏览</button>
+              </div>
             </div>
           </template>
 
@@ -259,26 +263,27 @@
               <span class="hint">模式与网元由你匹配；新脚本注册后此处自动出现</span>
             </div>
             <div class="field">
-              <label>抽取范围（默认全选；⚠ 锁定=依赖层资产缺失，必须抽取）</label>
+              <label>抽取范围（默认全选；勾选特性/配置对象会自动带上其依赖层）</label>
               <div class="scope-row">
-                <label
-                  v-for="l in SCOPE_LAYERS"
-                  :key="l"
-                  class="scope-item"
-                  :class="{ locked: isLocked(l) }"
-                  :title="isLocked(l) ? '被勾选层依赖且该层资产不存在，已自动补选锁定' : ''"
-                >
+                <label v-for="l in SCOPE_LAYERS" :key="l" class="scope-item">
                   <input
                     type="checkbox"
                     :checked="scope[l]"
-                    :disabled="isLocked(l) || mineBusy"
-                    @change="toggleScope(l, ($event.target as HTMLInputElement).checked)"
+                    :disabled="mineBusy"
+                    @change="scope[l] = ($event.target as HTMLInputElement).checked"
                   />
                   {{ l }}
                 </label>
               </div>
             </div>
           </div>
+
+          <DirPickerDialog
+            v-model:visible="pickerVisible"
+            :bundle-dir="sel?.dir ?? ''"
+            :title="pickerRole ? `选择${ROLE_LABEL[pickerRole] || pickerRole}源目录` : '选择目录'"
+            @pick="onPickerPick"
+          />
 
           <label v-if="hasExistingAssets" class="pd-force">
             <input v-model="mineForce" type="checkbox" :disabled="mineBusy" />
@@ -338,6 +343,7 @@ import {
 } from '../api'
 import JobPanel from '../components/JobPanel.vue'
 import JobHistory from '../components/JobHistory.vue'
+import DirPickerDialog from '../components/DirPickerDialog.vue'
 
 const route = useRoute()
 
@@ -674,7 +680,8 @@ async function refreshLocate(): Promise<void> {
   }
 }
 
-// 依赖强制（与后端 expand_scope 同规则）：勾选层依赖的层若资产不存在 → 自动勾上并锁定
+// 依赖默认勾选（用户反馈 2026-08-19：不做锁定高亮，选特性/配置对象时默认带上依赖即可；
+// 后端 expand_scope 仍权威兜底——资产缺失的依赖层强制补选）
 function enforceScope(): void {
   for (const l of SCOPE_LAYERS) {
     if (!scope[l]) continue
@@ -688,20 +695,16 @@ function enforceScope(): void {
 watch(scope, enforceScope, { deep: true })
 watch(() => sel.value, enforceScope)
 
-function isLocked(l: string): boolean {
-  if (!sel.value) return false
-  for (const layer of SCOPE_LAYERS) {
-    if (layer === l || !scope[layer]) continue
-    for (const dep of NEEDS[layer] ?? []) {
-      if (dep === l && !sel.value.assets[l]) return true
-    }
-  }
-  return false
-}
+// 逐层浏览选目录（用户反馈：候选下拉不够，需能逐层进入）
+const pickerVisible = ref(false)
+const pickerRole = ref('')
 
-function toggleScope(l: ScopeLayer, checked: boolean) {
-  if (isLocked(l)) return
-  scope[l] = checked
+function openPicker(role: string): void {
+  pickerRole.value = role
+  pickerVisible.value = true
+}
+function onPickerPick(rel: string): void {
+  if (pickerRole.value) dirs.value[pickerRole.value] = rel
 }
 
 const finalScope = computed(() => SCOPE_LAYERS.filter((l) => scope[l]))
@@ -840,6 +843,8 @@ watch(mode, async (m) => {
 .b-assets .none { color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
 .loc-field { min-width: 100%; }
 .loc-note { color: var(--warn); font-size: 10.5px; font-weight: 400; margin-left: 6px; }
+.loc-row { display: flex; gap: var(--space-2); align-items: center; }
+.loc-row .full { flex: 1; }
 .mine-grid { border-top: 1px solid var(--border-faint); padding-top: var(--space-4); }
 .scope-row { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); padding: 4px 0; }
 .scope-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text); cursor: pointer; }

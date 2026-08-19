@@ -49,7 +49,7 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
-import { readFsFile, readDocsFile, writeFsFile, fixImgSrcs } from '../../api'
+import { readFsFile, readDocsFile, writeFsFile, fixImgSrcs, encodeLinkSpaces } from '../../api'
 
 const props = defineProps<{
   path: string
@@ -97,11 +97,11 @@ watch(() => [props.path, props.root], () => void load(), { immediate: true })
 
 const renderedHtml = computed(() => {
   if (!fileContent.value) return ''
-  // 脱掉 frontmatter 段再渲染（预览只看正文）
+  // 脱掉 frontmatter 段再渲染（预览只看正文）；目标含空格先编码（防 markdown-it 截断）
   const body = fileContent.value.replace(/^---\n[\s\S]*?\n---\n/, '')
   // D3：图片在渲染后 HTML 上改写为对应根的 raw 端点（含空格/中文括号路径也稳）
   const dir = props.path.split('/').slice(0, -1).join('/')
-  const html = fixImgSrcs(md.render(body), dir, isDocs.value ? 'docs' : 'fs')
+  const html = fixImgSrcs(md.render(encodeLinkSpaces(body)), dir, isDocs.value ? 'docs' : 'fs')
   return DOMPurify.sanitize(html)
 })
 

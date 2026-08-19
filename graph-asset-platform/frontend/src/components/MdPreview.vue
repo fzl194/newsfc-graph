@@ -117,7 +117,7 @@
 import { computed, ref, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import DOMPurify from 'dompurify'
-import { getObject, getNameMap, availableVersionsFromError, fixImgSrcs, type Edge, type ObjectDetail } from '../api'
+import { getObject, getNameMap, availableVersionsFromError, fixImgSrcs, encodeLinkSpaces, type Edge, type ObjectDetail } from '../api'
 import { useNav } from '../composables/useNav'
 
 const { viewVersion } = useNav()
@@ -238,7 +238,8 @@ async function load(id: string, ver?: string): Promise<void> {
     selectedVersion.value = obj.version ?? ver ?? ''
     // body_md 已由后端 md_parser 归一化换行 + 折叠表格内部空行（纯正文，干净 LF）。
     const body = (obj.body_md || '').replace(/\r/g, '')
-    const rendered = md.render(body)
+    // 目标含空格先编码（否则 markdown-it 截断 URL，图必裂），再渲染
+    const rendered = md.render(encodeLinkSpaces(body))
     // 正文 [[ID]] 替换为可点击 a，显示文本查目标 name（无则显 ID）
     const names = await getNameMap()
     let finalHtml = inlineLinksIntoHtml(rendered, names)
