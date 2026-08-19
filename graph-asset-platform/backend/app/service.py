@@ -141,6 +141,35 @@ class Service:
             edges_repo.delete_for_node(self.db, oid, over)
         self.db.commit()
 
+    def reindex_prefixes(self, prefixes: list) -> dict:
+        """**按前缀增量索引**（与 reindex_path 同一套 DB/锁/解析语义，目录级）。
+
+        挖掘（自动抽取）/批量覆盖共用；替代全量 rebuild——耗时与**变更量**成正比，
+        与库总规模无关（百万级 md 下全量重建不可行）：
+        - 磁盘上这些前缀下的全部 md → 逐个 reindex_path（内容变更 UPSERT）
+        - DB 中前缀下已不在磁盘的 source_path → unindex_path（force 清理/删除）
+        - 最后 reload_index
+
+        prefixes 如 ``["Command/UDG/20.15.2", "Feature/UDG/20.15.2"]``；
+        **调用方须持 import_lock**（与 fs 写端点一致）。返回 {"indexed", "removed"}。
+        """
+        pfx = tuple(p.rstrip("/") + "/" for p in prefixes if p and p.strip("/"))
+        if not pfx:
+            return {"indexed": 0, "removed": 0}
+        disk = [rel for rel in self.store.list_md() if rel.startswith(pfx)]
+        disk_set = set(disk)
+        for rel in disk:
+            self.reindex_path(rel)
+        removed = 0
+        rows = self.db.execute("SELECT DISTINCT source_path FROM objects").fetchall()
+        for r in rows:
+            p = r["source_path"] or ""
+            if p.startswith(pfx) and p not in disk_set:
+                self.unindex_path(p)
+                removed += 1
+        self.reload_index()
+        return {"indexed": len(disk), "removed": removed}
+
     def rebuild(self) -> None:
         """全量 reindex 兜底：扫 md 重建 DB + 内存（手动触发，慢；用于数据不一致时）。"""
         from .migrate import build_index_db

@@ -355,11 +355,15 @@ def run_mine(job_id: str, nf: str, version: str, mode_id: str,
                 if b.layer in ("Command", "ConfigObject") and b.layer in final_scope:
                     run_builder(b, f"第二遍 {b.layer}（补特性引用）")
 
-        step("重建索引")
+        # 增量索引（与 fs 写端点同一套 reindex 语义）：只重索引本次勾选层目录 +
+        # 清理前缀下已消失的旧文件（force 清理产生的空洞）——秒级、规模无关
+        step("增量索引")
         from ..service import get_service, import_lock
         with import_lock:
-            get_service().rebuild()
-        step("重建索引", "done")
+            ix = get_service().reindex_prefixes(
+                [f"{layer}/{nf}/{version}" for layer in final_scope])
+        step("增量索引", "done",
+             f"重索引 {ix['indexed']} / 清理 {ix['removed']}（增量，秒级）")
 
         # 更新包元信息（记录最近挖掘模式）
         meta = bundles.read_meta(bundles.bundle_dir(nf, version)) or {}

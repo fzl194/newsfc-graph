@@ -368,3 +368,130 @@ class TestFsRaw:
     def test_traversal_rejected(self):
         r = client.get("/api/v1/fs/raw", params={"path": "../../platform.db"})
         assert r.status_code in (400, 404)
+
+
+# ---------- 增量索引（reindex_prefixes：挖掘/批量覆盖共用，规模无关） ----------
+
+CMD_MD = (
+    "---\n"
+    "id: {nf}@MMLCommand@{name}\n"
+    "type: MMLCommand\n"
+    "nf: {nf}\n"
+    "version: {ver}\n"
+    "name: {name}\n"
+    "---\n"
+    "# {name}\n\n## 边\n（暂无）\n"
+)
+
+
+def _svc(tmp_data_dir, monkeypatch):
+    """空图谱 service（tmp store + tmp DB + tmp index），同 conftest 模式。"""
+    import app.service as svc
+    import app.db as dbmod
+    from app.store import Store
+    from app.registry import Registry
+    from app.index import Index
+    s = svc.Service.__new__(svc.Service)
+    s.store = Store(tmp_data_dir)
+    s.registry = Registry.load_default()
+    s.db = dbmod.get_db(tmp_data_dir.parent / "test.db")
+    dbmod.init_schema(s.db)
+    s.index = Index.load_from_db(s.db, s.registry)
+    monkeypatch.setattr(svc, "_service", s)
+    return s
+
+
+class TestReindexPrefixes:
+    def test_add_update_remove_scoped(self, tmp_data_dir, monkeypatch):
+        s = _svc(tmp_data_dir, monkeypatch)
+        d1 = tmp_data_dir / "Command" / "X" / "1.0"
+        d2 = tmp_data_dir / "Command" / "Y" / "1.0"
+        d1.mkdir(parents=True)
+        d2.mkdir(parents=True)
+        (d1 / "a.md").write_text(CMD_MD.format(nf="X", ver="1.0", name="ADD A"), encoding="utf-8")
+        (d1 / "b.md").write_text(CMD_MD.format(nf="X", ver="1.0", name="ADD B"), encoding="utf-8")
+        (d2 / "c.md").write_text(CMD_MD.format(nf="Y", ver="1.0", name="ADD C"), encoding="utf-8")
+
+        r1 = s.reindex_prefixes(["Command/X/1.0"])
+        assert r1 == {"indexed": 2, "removed": 0}
+        assert s.index.node("X@MMLCommand@ADD A", "1.0") is not None
+        assert s.index.node("Y@MMLCommand@ADD C", "1.0") is None  # 前缀外未动
+
+        # b 删除 + a 改名（内容变更）→ 增量反映（indexed=前缀下现存文件数）
+        (d1 / "b.md").unlink()
+        (d1 / "a.md").write_text(CMD_MD.format(nf="X", ver="1.0", name="ADD A2"), encoding="utf-8")
+        r2 = s.reindex_prefixes(["Command/X/1.0"])
+        assert r2 == {"indexed": 1, "removed": 1}
+        assert s.index.node("X@MMLCommand@ADD A", "1.0") is None
+        assert s.index.node("X@MMLCommand@ADD A2", "1.0") is not None
+
+    def test_empty_prefix_guard(self, tmp_data_dir, monkeypatch):
+        s = _svc(tmp_data_dir, monkeypatch)
+        assert s.reindex_prefixes(["", " / "]) == {"indexed": 0, "removed": 0}
+
+
+class TestRunMineIncrementalIndex:
+    def test_end_to_end_with_stub_builders(self, tmp_path, tmp_data_dir, monkeypatch):
+        """run_mine 全流程（_run 打桩写真实 md/manifest）→ 增量索引入 DB/内存。
+        force=True 场景验证旧资产（前缀下已消失文件）被清理出索引。"""
+        import app.config as config
+        from app import jobs as jobs_mod
+        out = tmp_path / "pd" / "output"
+        monkeypatch.setattr(config, "OUTPUT_DIR", out)
+        monkeypatch.setattr(config, "DATA_DIR", out.parent)
+        monkeypatch.setattr(config, "ASSETS_DIR", tmp_data_dir)
+        s = _svc(tmp_data_dir, monkeypatch)
+
+        root = _make_md_tree(out)
+        del root  # 包已建（legacy 格式即可）
+
+        # 旧资产（将被 force 清理 → 索引应移除）
+        old_d = tmp_data_dir / "Command" / "UDG" / "20.15.2"
+        old_d.mkdir(parents=True, exist_ok=True)
+        (old_d / "OLD.md").write_text(CMD_MD.format(nf="UDG", ver="20.15.2", name="OLD CMD"), encoding="utf-8")
+        s.reindex_prefixes(["Command/UDG/20.15.2"])
+        assert s.index.node("UDG@MMLCommand@OLD CMD", "20.15.2") is not None
+
+        writes = {"n": 0}
+
+        def fake_run(script, *args, job_id=""):
+            name = Path(str(script)).name
+            base = tmp_data_dir
+            writes["n"] += 1
+            if name == "build_commands.py":
+                d = base / "Command" / "UDG" / "20.15.2"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "UDG@MMLCommand@ADD DEMO.md").write_text(
+                    CMD_MD.format(nf="UDG", ver="20.15.2", name="ADD DEMO"), encoding="utf-8")
+                (d / "_build_manifest.json").write_text('{"command_count": 1}', encoding="utf-8")
+            elif name == "build_configobjects.py":
+                d = base / "ConfigObject" / "UDG" / "20.15.2"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "_build_manifest.json").write_text('{"object_count": 1}', encoding="utf-8")
+            elif name == "build_licenses.py":
+                d = base / "License" / "UDG" / "20.15.2"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "_build_manifest.json").write_text('{"license_count": 1}', encoding="utf-8")
+            elif name == "build_features.py":
+                d = base / "Feature" / "UDG" / "20.15.2"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "_build_manifest.json").write_text('{"feature_count": 1, "doc_count": 1}', encoding="utf-8")
+            return ""
+
+        monkeypatch.setattr(pl, "_run", fake_run)
+        jobs_mod._registry.clear()
+        job = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+        pl.run_mine(job.job_id, "UDG", "20.15.2", "5gc",
+                    {"mml": "Prod_CH_20.15.2/OM参考/命令/UDG MML命令",
+                     "feature": "Prod_CH_20.15.2/特性部署/特性指南/UDG特性指南",
+                     "license": "Prod_CH_20.15.2/特性部署/特性指南/UDG License描述"},
+                    ["Command", "ConfigObject", "License", "Feature"], force=True)
+        j = jobs_mod.get_job(job.job_id)
+        assert j.status == "done", j.error
+        step_names = {st["name"]: st for st in j.steps}
+        assert step_names["增量索引"]["status"] == "done"
+        assert "重索引" in step_names["增量索引"]["detail"]
+        assert j.result["total"] == 4
+        # 索引断言：新命令在（含 two_pass 第二遍后仍在）；旧命令被 force 清理出索引
+        assert s.index.node("UDG@MMLCommand@ADD DEMO", "20.15.2") is not None
+        assert s.index.node("UDG@MMLCommand@OLD CMD", "20.15.2") is None
