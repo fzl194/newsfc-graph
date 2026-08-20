@@ -1,0 +1,17 @@
+# 图谱平台部署（数据全部落宿主机磁盘，容器无状态可随时重建）
+#   cd deploy && docker compose up -d
+# 数据迁移到新服务器：停服 → 打包整个 ./platform-data → 新机解压到同位置 → up -d
+services:
+  gap:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: graph-asset-platform:latest
+    container_name: gap
+    ports:
+      - "8000:8000"
+    environment:
+      - GAP_DATA_DIR=/data          # 平台数据根（DB/资产/原始文档/用户/测试用例）
+    volumes:
+      - ./platform-data:/data       # ← 宿主机磁盘持久化；备份/迁移只动这个目录
+    restart: unless-stopped

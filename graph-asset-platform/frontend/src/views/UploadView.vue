@@ -662,21 +662,28 @@ async function selectBundle(b: DocBundle): Promise<void> {
   await refreshLocate()
 }
 
+// 定位请求序号（竞态防护）：快速切换包时丢弃过期响应，防止"点 PCF 显示 UDM 目录"
+let locateSeq = 0
+
 async function refreshLocate(): Promise<void> {
   if (!sel.value) return
+  const seq = ++locateSeq
+  const bundle = sel.value // 捕获当前包；响应回来时若已切包/过期则丢弃
   locating.value = true
   locate.value = null
   try {
-    locate.value = await locateBundle(sel.value.nf, sel.value.version, modeSel.value)
+    const res = await locateBundle(bundle.nf, bundle.version, modeSel.value)
+    if (seq !== locateSeq || sel.value?.dir !== bundle.dir) return
+    locate.value = res
     const next: Record<string, string> = {}
-    for (const [role, r] of Object.entries(locate.value)) {
+    for (const [role, r] of Object.entries(res)) {
       next[role] = r.recommended ?? r.candidates[0] ?? ''
     }
     dirs.value = next
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : String(e))
+    if (seq === locateSeq) ElMessage.error(e instanceof Error ? e.message : String(e))
   } finally {
-    locating.value = false
+    if (seq === locateSeq) locating.value = false
   }
 }
 
