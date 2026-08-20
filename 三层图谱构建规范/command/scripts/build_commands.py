@@ -14,6 +14,10 @@
 用法:
   python build_commands.py --nf UDG --version 20.15.2 \
       --mml-dir "三层图谱资产/output/UDG MML命令" --storage "三层图谱资产"
+  # v0.23.0 命令拆多目录的产品文档：--mml-dir 可重复传（单次构建传入全部，
+  # 分次跑会因两趟名集不全丢参见边）
+  python build_commands.py --nf PCF --version X \
+      --mml-dir "…/命令分册一" --mml-dir "…/命令分册二" --storage "三层图谱资产"
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from pathlib import Path
 
 import _common
 
-SOP_VERSION = "0.20.0"
+SOP_VERSION = "0.23.0"
 VERBOSE = False
 
 
@@ -264,7 +268,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="命令层构建器")
     ap.add_argument("--nf", required=True)
     ap.add_argument("--version", required=True)
-    ap.add_argument("--mml-dir", required=True)
+    # v0.23.0：可重复传参（action="append"）——新产品文档把命令拆到多个目录。
+    # 必须单次构建传入全部目录：参见边两趟校验依赖全量命令名集，分次跑会丢边。
+    ap.add_argument("--mml-dir", required=True, action="append")
     ap.add_argument("--storage", default="三层图谱资产")
     ap.add_argument("--intranet-edges", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -273,14 +279,23 @@ def main() -> int:
     VERBOSE = args.verbose
 
     storage = Path(args.storage).resolve()
-    mml_dir = Path(args.mml_dir).resolve()
+    mml_dirs = [Path(d).resolve() for d in args.mml_dir]
     ctx: dict = {"intranet": None}
     if args.intranet_edges:
         ctx["intranet"] = json.loads(Path(args.intranet_edges).read_text(encoding="utf-8"))
 
     out_dir = storage / "Command" / args.nf / args.version
     out_dir.mkdir(parents=True, exist_ok=True)
-    files = sorted(mml_dir.rglob("*.md"))
+    # 多目录并集（按 resolved 去重——目录重叠/嵌套时同一文件只建一次）
+    seen: set = set()
+    files: list[Path] = []
+    for d in mml_dirs:
+        for f in d.rglob("*.md"):
+            r = f.resolve()
+            if r not in seen:
+                seen.add(r)
+                files.append(f)
+    files = sorted(files)
 
     # 第 1 趟：收命令名集 + 存在的配置对象集（被配置/查询类命令产生）+ 过滤非命令 md
     name_set: set[str] = set()
@@ -313,14 +328,17 @@ def main() -> int:
     ctx["refs_stripped"] = 0
     log(f"扫描 {len(files)} md → 有效命令 {len(valid)}（跳过非命令 {skipped_noncmd}）")
 
-    # 第 2 趟：构建（边校验用 name_set）
+    # 第 2 趟：构建（边校验用 name_set）；category_path 取"包含该文件的第一个源目录"的相对路径
     built = []
     for f, md in valid:
-        try:
-            rel = f.relative_to(mml_dir)
-            cat = list(rel.parts[:-1])
-        except ValueError:
-            cat = []
+        cat: list[str] = []
+        for d in mml_dirs:
+            try:
+                rel = f.relative_to(d)
+                cat = list(rel.parts[:-1])
+                break
+            except ValueError:
+                continue
         result = build_one(md, args.nf, args.version, cat, ctx, f)
         if not result:
             continue

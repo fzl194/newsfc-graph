@@ -235,11 +235,14 @@
                 <span v-if="role.note" class="loc-note">⚠ {{ role.note }}</span>
               </label>
               <div class="loc-row">
+                <!-- v0.23.0：命令源目录可多选（新产品文档命令拆分多目录）；其余角色单选 -->
                 <el-select
+                  v-if="key === 'mml'"
                   v-model="dirs[key as string]"
+                  multiple
                   filterable
                   allow-create
-                  placeholder="选择或逐层浏览目录"
+                  placeholder="命令源目录（可多选）"
                   class="full"
                 >
                   <el-option
@@ -249,7 +252,25 @@
                     :value="c"
                   />
                 </el-select>
-                <button class="ghost-btn2" @click="openPicker(key as string)">逐层浏览</button>
+                <el-select
+                  v-else
+                  :model-value="dirs[key as string]?.[0] ?? ''"
+                  filterable
+                  allow-create
+                  placeholder="选择或逐层浏览目录"
+                  class="full"
+                  @update:model-value="(v: string) => setSingleDir(key as string, v)"
+                >
+                  <el-option
+                    v-for="c in role.candidates"
+                    :key="c"
+                    :label="c + (c === role.recommended ? '（推荐）' : '')"
+                    :value="c"
+                  />
+                </el-select>
+                <button class="ghost-btn2" @click="openPicker(key as string)">
+                  {{ key === 'mml' ? '逐层加入' : '逐层浏览' }}
+                </button>
               </div>
             </div>
           </template>
@@ -617,7 +638,12 @@ const bundlesLoading = ref(false)
 const sel = ref<DocBundle | null>(null)
 const locating = ref(false)
 const locate = ref<LocateResult | null>(null)
-const dirs = ref<Record<string, string>>({})
+// 角色选目录（统一数组存储）：mml 可多目录（v0.23.0 命令拆分多分册），其余单目录
+const dirs = ref<Record<string, string[]>>({})
+
+function setSingleDir(role: string, v: string): void {
+  dirs.value[role] = v ? [v] : []
+}
 const modeOptions = ref<ModeOption[]>([])
 const modeSel = ref('5gc')
 const scope = reactive<Record<ScopeLayer, boolean>>({
@@ -675,9 +701,10 @@ async function refreshLocate(): Promise<void> {
     const res = await locateBundle(bundle.nf, bundle.version, modeSel.value)
     if (seq !== locateSeq || sel.value?.dir !== bundle.dir) return
     locate.value = res
-    const next: Record<string, string> = {}
+    const next: Record<string, string[]> = {}
     for (const [role, r] of Object.entries(res)) {
-      next[role] = r.recommended ?? r.candidates[0] ?? ''
+      const def = r.recommended ?? r.candidates[0] ?? ''
+      next[role] = def ? [def] : []
     }
     dirs.value = next
   } catch (e) {
@@ -711,7 +738,16 @@ function openPicker(role: string): void {
   pickerVisible.value = true
 }
 function onPickerPick(rel: string): void {
-  if (pickerRole.value) dirs.value[pickerRole.value] = rel
+  const role = pickerRole.value
+  if (!role) return
+  if (role === 'mml') {
+    // 命令多目录：逐层加入（去重），已选的保留
+    if (!dirs.value.mml?.includes(rel)) {
+      dirs.value.mml = [...(dirs.value.mml ?? []), rel]
+    }
+  } else {
+    dirs.value[role] = [rel]
+  }
 }
 
 const finalScope = computed(() => SCOPE_LAYERS.filter((l) => scope[l]))

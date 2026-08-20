@@ -121,7 +121,7 @@ class TestLocateCandidates:
             pl.validate_selected_dirs(root, {"mml": "../../etc"})
         ok = pl.validate_selected_dirs(
             root, {"mml": "Prod_CH_20.15.2/OM参考/命令/UDG MML命令"})
-        assert ok["mml"].is_dir()
+        assert ok["mml"][0].is_dir()
 
 
 # ---------- expand_scope（范围×依赖强制，用户决策） ----------
@@ -495,3 +495,80 @@ class TestRunMineIncrementalIndex:
         # 索引断言：新命令在（含 two_pass 第二遍后仍在）；旧命令被 force 清理出索引
         assert s.index.node("UDG@MMLCommand@ADD DEMO", "20.15.2") is not None
         assert s.index.node("UDG@MMLCommand@OLD CMD", "20.15.2") is None
+
+
+# ---------- v0.23.0 命令多目录 ----------
+
+class TestMultiMmlDirs:
+    MODE = get_mode("5gc")
+
+    def test_validate_normalizes_and_rejects(self, tmp_path):
+        root = _make_md_tree(tmp_path)
+        ok = pl.validate_selected_dirs(root, {
+            "mml": ["Prod_CH_20.15.2/OM参考/命令/UDG MML命令",
+                    "Prod_CH_20.15.2/OM参考/命令/UDG MML命令"],  # 重复 → 去重
+            "feature": "Prod_CH_20.15.2/特性部署/特性指南/UDG特性指南",  # str → 单元素
+        })
+        assert len(ok["mml"]) == 1 and len(ok["feature"]) == 1
+        with pytest.raises(ValueError, match="越界"):
+            pl.validate_selected_dirs(root, {"mml": ["../../x"]})
+
+    def test_mine_rejects_empty_mml_when_command_scope(self, tmp_path, tmp_data_dir, monkeypatch):
+        import app.config as config
+        out = tmp_path / "pd2" / "output"
+        monkeypatch.setattr(config, "OUTPUT_DIR", out)
+        monkeypatch.setattr(config, "DATA_DIR", out.parent)
+        monkeypatch.setattr(config, "ASSETS_DIR", tmp_data_dir)
+        _make_md_tree(out)
+        r = client.post("/api/v1/import/mine", json={
+            "nf": "UDG", "version": "20.15.2", "mode": "5gc",
+            "dirs": {"feature": "Prod_CH_20.15.2/特性部署/特性指南/UDG特性指南"},
+            "scope": ["Feature", "Command"],  # Command 强制在 → mml 必填
+        })
+        assert r.status_code == 400 and "至少选择一个" in r.text
+
+    def test_run_mine_assembles_repeated_mml_dir_flag(self, tmp_path, tmp_data_dir, monkeypatch):
+        """dirs.mml 两个目录 → build_commands 收到两次 --mml-dir（单次构建）。"""
+        import app.config as config
+        out = tmp_path / "pd3" / "output"
+        monkeypatch.setattr(config, "OUTPUT_DIR", out)
+        monkeypatch.setattr(config, "DATA_DIR", out.parent)
+        monkeypatch.setattr(config, "ASSETS_DIR", tmp_data_dir)
+        s = _svc(tmp_data_dir, monkeypatch)
+        root = _make_md_tree(out)
+        extra = out / "UDG_20.15.2" / "分册二"
+        extra.mkdir()
+        captured = {}
+
+        def fake_run(script, *args, job_id=""):
+            name = Path(str(script)).name
+            if name == "build_commands.py":
+                captured["argv"] = [str(a) for a in args]
+                d = tmp_data_dir / "Command" / "UDG" / "20.15.2"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "_build_manifest.json").write_text('{"command_count": 1}', encoding="utf-8")
+            else:
+                layer = {"build_configobjects.py": "ConfigObject",
+                         "build_licenses.py": "License",
+                         "build_features.py": "Feature"}[name]
+                d = tmp_data_dir / layer / "UDG" / "20.15.2"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "_build_manifest.json").write_text("{}", encoding="utf-8")
+            return ""
+
+        monkeypatch.setattr(pl, "_run", fake_run)
+        from app import jobs as jobs_mod
+        jobs_mod._registry.clear()
+        job = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+        pl.run_mine(job.job_id, "UDG", "20.15.2", "5gc",
+                    {"mml": ["Prod_CH_20.15.2/OM参考/命令/UDG MML命令", "分册二"],
+                     "feature": "Prod_CH_20.15.2/特性部署/特性指南/UDG特性指南",
+                     "license": "Prod_CH_20.15.2/特性部署/特性指南/UDG License描述"},
+                    ["Command", "ConfigObject", "License", "Feature"], force=False)
+        j = jobs_mod.get_job(job.job_id)
+        assert j.status == "done", j.error
+        argv = captured["argv"]
+        idx = [i for i, a in enumerate(argv) if a == "--mml-dir"]
+        assert len(idx) == 2, argv  # 两次 --mml-dir，单次构建传入
+        assert any("分册二" in a for a in argv)
+        del root, s

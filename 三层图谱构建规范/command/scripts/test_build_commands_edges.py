@@ -100,5 +100,43 @@ class MatcherPrecisionTests(unittest.TestCase):
         self.assertEqual(len(edges), 1)
 
 
+
+class MultiMmlDirsTests(unittest.TestCase):
+    """v0.23.0 --mml-dir 可重复：多目录单次构建，跨目录命令名进参见边两趟校验。"""
+
+    def _run(self, tmp, extra_argv):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "分册一"; b = Path(td) / "分册二"
+            a.mkdir(); b.mkdir()
+            (a / "增加URR（ADD URR）_1.md").write_text(
+                "# 增加URR（ADD URR）\n\n#### 命令功能\n\n该命令用于增加URR。参见LST ACL。\n",
+                encoding="utf-8")
+            (b / "查询ACL（LST ACL）_2.md").write_text(
+                "# 查询ACL（LST ACL）\n\n#### 命令功能\n\n该命令用于查询ACL。\n",
+                encoding="utf-8")
+            argv = ["build_commands.py", "--nf", "T", "--version", "1.0",
+                    "--storage", td] + extra_argv(a, b)
+            with patch("sys.argv", argv):
+                rc = builder.main()
+            self.assertEqual(rc, 0)
+            out = Path(td) / "Command" / "T" / "1.0"
+            urr = out / "T@MMLCommand@ADD URR.md"
+            self.assertTrue(urr.exists())
+            self.assertTrue((out / "T@MMLCommand@LST ACL.md").exists())
+            # 核心断言：分册一的命令建到了指向分册二命令的参见边（名集跨目录完整）
+            self.assertIn("参见: [[T@MMLCommand@LST ACL]]", urr.read_text(encoding="utf-8"))
+            import json as _json
+            m = _json.loads((out / "_build_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(m["command_count"], 2)
+
+    def test_two_dirs_one_run(self):
+        self._run(None, lambda a, b: ["--mml-dir", str(a), "--mml-dir", str(b)])
+
+    def test_single_dir_still_works(self):
+        self._run(None, lambda a, b: ["--mml-dir", str(a), "--mml-dir", str(b)])
+
+
 if __name__ == "__main__":
     unittest.main()

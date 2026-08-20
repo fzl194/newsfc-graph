@@ -145,7 +145,9 @@ class MineIn(BaseModel):
     nf: str
     version: str
     mode: str = "5gc"
-    dirs: dict[str, str] = {}                 # 角色→包内相对路径（来自 locate 候选）
+    # 角色→包内相对路径（来自 locate 候选/逐层浏览）。v0.23.0：mml 支持 list
+    # （新产品文档命令拆多目录，多选）；其余角色仍单值（str 或单元素 list 均可）
+    dirs: dict[str, "str | list[str]"] = {}
     scope: list[str] = ["Command", "ConfigObject", "License", "Feature"]
     force: bool = False
 
@@ -180,6 +182,14 @@ def mine(req: MineIn, request: Request, background: BackgroundTasks):
 
     # 依赖强制（服务端权威；前端同规则锁 UI）
     final_scope, added_notes = expand_scope(scope, m, nf, version)
+
+    # v0.23.0：命令范围勾选时，命令源目录（可多选）至少一个
+    def _role_vals(role: str) -> list:
+        v = req.dirs.get(role) or []
+        return v if isinstance(v, list) else [v]
+    if "Command" in final_scope and not _role_vals("mml"):
+        raise HTTPException(status_code=400,
+                            detail="勾选命令范围时，命令源目录至少选择一个（可多选）")
 
     if not jobs.acquire_mutex("product_doc_mine"):
         running = jobs.has_processing("product_doc_mine")

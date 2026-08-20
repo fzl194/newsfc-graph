@@ -152,16 +152,25 @@ def locate_candidates(export_root: Path, mode: "modes_reg.ModeDef", nf: str) -> 
 
 
 def validate_selected_dirs(bundle_root: Path, selected: dict) -> dict:
-    """用户提交的目录选择校验：必须在包内且真实存在（防注入；D1 纵深）。"""
+    """用户提交的目录选择校验：必须在包内且真实存在（防注入；D1 纵深）。
+
+    v0.23.0：角色值支持 str | list[str]（命令角色可多目录——新产品文档命令拆分
+    多分册）；返回统一 dict[role, list[Path]]。str 归一化为单元素列表。
+    """
     root = bundle_root.resolve()
-    out: dict[str, Path] = {}
-    for role, rel in selected.items():
-        p = (root / rel).resolve()
-        if p != root and root not in p.parents:
-            raise ValueError(f"目录越界: {role}={rel}")
-        if not p.is_dir():
-            raise ValueError(f"目录不存在: {role}={rel}")
-        out[role] = p
+    out: dict[str, list[Path]] = {}
+    for role, val in selected.items():
+        vals = val if isinstance(val, list) else [val]
+        if role not in out:
+            out[role] = []
+        for rel in vals:
+            p = (root / rel).resolve()
+            if p != root and root not in p.parents:
+                raise ValueError(f"目录越界: {role}={rel}")
+            if not p.is_dir():
+                raise ValueError(f"目录不存在: {role}={rel}")
+            if p not in out[role]:
+                out[role].append(p)
     return out
 
 
@@ -332,9 +341,9 @@ def run_mine(job_id: str, nf: str, version: str, mode_id: str,
             step(label)
             args: list = ["--nf", nf, "--version", version, "--storage", config.ASSETS_DIR]
             for role, flags in (b.src_args or {}).items():
-                if role in dirs:
+                for v in dirs.get(role, []):          # v0.23.0：角色值可为多目录
                     for f in flags:
-                        args += [f, dirs[role]]
+                        args += [f, v]
             _run(HERE / b.script, *args, job_id=job_id)
             m = _manifest(b.layer, nf, version)
             counts[b.layer] = m.get(_COUNT_KEY.get(b.layer, ""), 0) or 0

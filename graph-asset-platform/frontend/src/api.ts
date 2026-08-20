@@ -459,7 +459,7 @@ export const startMine = (b: {
   nf: string
   version: string
   mode: string
-  dirs: Record<string, string>
+  dirs: Record<string, string | string[]>
   scope: string[]
   force: boolean
 }): Promise<{ job_id: string; scope: string[]; notes: string[]; force: boolean }> =>

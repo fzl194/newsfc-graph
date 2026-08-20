@@ -17,7 +17,7 @@ sop_version: 0.20.0
 | `--nf` | 网元，如 `UDG` |
 | `--version` | 版本，如 `20.15.2` |
 | `--storage` | 资产根（默认 `三层图谱资产`） |
-| `--mml-dir` 或 `--product-doc` | MML 命令 md 目录（已解压）/ 原始产品文档归档（自动导出到 `{storage}/output/`） |
+| `--mml-dir` 或 `--product-doc` | MML 命令 md 目录（已解压）/ 原始产品文档归档（自动导出到 `{storage}/output/`）。**v0.23.0：`--mml-dir` 可重复传参**——命令拆多目录（多分册）的产品文档单次构建传入全部目录（分次跑会因两趟名集不全丢参见边） |
 | `--intranet-edges` | 内网命令关联图谱 json（可选，命令↔命令边来源） |
 
 ## 输出（`{storage}/` 下）
