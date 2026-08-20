@@ -21,8 +21,10 @@ deploy/platform-data/          ← docker-compose 卷映射点（宿主机磁盘
 ## 2. 首次部署（内网服务器）
 
 ```bash
-# ① 拷贝仓库到服务器（或只拷 graph-asset-platform/）
-# ② 构建镜像（需要能访问 pip/npm 源；完全离线见 §5）
+# ① 拷贝整个 graph-asset-platform/ 到服务器——必须包含：
+#    backend/（后端源码）+ frontend/dist（前端构建产物：源机先 npm run build）
+#    ⚠ 这两样在服务器磁盘上必须已存在：compose 把它们挂载进容器，空目录挂载会异常
+# ② 构建镜像（需要能访问 pip 源；完全离线见 §5）
 cd graph-asset-platform
 docker build -f deploy/Dockerfile -t graph-asset-platform:latest .
 # ③ 起服务（数据目录自动创建；首次为空库）
@@ -70,8 +72,19 @@ docker load -i gap-image.tar
 # 再按 §2 ③ 起服务（compose 里已指定 image 名，不会重新 build）
 ```
 
-## 6. 说明与边界
+## 6. 源码与数据都落服务器磁盘（用户要求）
 
-- **为什么代码不挂卷**：代码随镜像版本化（回滚=换镜像 tag），数据挂卷才能持久化——两者生命周期不同。若要在服务器上直接改代码调试，可临时加一行卷映射 `- ../backend/app:/gap/backend/app`（仅开发用）。
+compose 挂载三处，**容器内零持久状态**（删容器/重建镜像/重启机器都不丢）：
+
+| 挂载 | 服务器磁盘位置 | 作用与更新方式 |
+|---|---|---|
+| `/data` | `deploy/platform-data/` | 全部数据（DB/资产/原始文档/用户）；迁移备份只动它 |
+| `/gap/backend` | `graph-asset-platform/backend/` | **后端源码**：改 `.py` 后 `docker compose restart` 生效 |
+| `/gap/frontend/dist` | `graph-asset-platform/frontend/dist/` | **前端构建产物**：前端改动在源机 `npm run build` → 拷 dist 到服务器 → 浏览器强刷 |
+
+说明：
+- 镜像内也带了一份代码/产物作兜底（不挂卷裸 `docker run` 也能起），但 compose 部署以**服务器磁盘为准**。
+- 前端源码（frontend/src）随仓库在服务器上留档；容器运行只用 dist（服务器无 node，不在服务器构建）。
+- ⚠ 空目录挂载陷阱：服务器上 backend/ 或 frontend/dist 不存在时，Docker 会创建**空目录**挂入 → 服务异常。务必按 §2 ①先拷完整目录再 up。
 - 平台内「上传产品文档→自动抽取」产生的所有数据都落在 platform-data/，迁移方式同上。
-- 版本升级：拉新代码 → 重建镜像 → `docker compose up -d`（数据卷不动，自动沿用）。
+- 版本升级：更新服务器上的 backend/dist → `docker compose up -d --build`（数据卷不动，自动沿用）。

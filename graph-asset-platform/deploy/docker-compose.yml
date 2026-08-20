@@ -1,6 +1,8 @@
-# 图谱平台部署（数据全部落宿主机磁盘，容器无状态可随时重建）
+# 图谱平台部署（用户要求：数据 + 源码/构建产物 都落服务器磁盘，容器内无状态可随时重建）
 #   cd deploy && docker compose up -d
-# 数据迁移到新服务器：停服 → 打包整个 ./platform-data → 新机解压到同位置 → up -d
+# ⚠ 首次 up 前：服务器上必须已就位 ../backend（源码）与 ../frontend/dist（前端构建产物，
+#   在源机 npm run build 后随仓库拷来）——空目录挂载会导致服务异常（详见 README §2/§6）
+# 数据迁移到新服务器：停服 → pack_data.py 打包 platform-data → 新机解压到 ./platform-data → up -d
 services:
   gap:
     build:
@@ -13,5 +15,7 @@ services:
     environment:
       - GAP_DATA_DIR=/data          # 平台数据根（DB/资产/原始文档/用户/测试用例）
     volumes:
-      - ./platform-data:/data       # ← 宿主机磁盘持久化；备份/迁移只动这个目录
+      - ./platform-data:/data       # ① 数据：DB+资产+原始文档（备份/迁移只动这个目录）
+      - ../backend:/gap/backend     # ② 后端源码：服务器磁盘为准，改后 restart 生效
+      - ../frontend/dist:/gap/frontend/dist   # ③ 前端构建产物：源机 build 后拷贝更新
     restart: unless-stopped
