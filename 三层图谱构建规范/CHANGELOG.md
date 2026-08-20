@@ -28,6 +28,20 @@
 
 ---
 
+## [0.24.0] - 2026-08-20
+
+### 修复（解压整文件乱码：read_text_auto 编码探测重写）
+
+采纳 [CR-20260820-002](scripts/CR-20260820-002-解压乱码-编码探测.md)。内网实测：极少数 md 整文件乱码，源 html 基本为 UTF-8。
+
+- **根因**：`read_text_auto` 让 chardet 统计猜测（置信度 ≥0.7）优先于一切确定性判据——特征模糊的 UTF-8 html 被误判为 GBK 族，且 GBK/Latin 解码几乎不抛异常，误判"成功"→ 整文件乱码以 UTF-8 固化。逐文件确定性，故"概率不大但稳定复现"。
+- **修复**：确定性优先——① BOM → ② **utf-8 严格自校验**（主场景直接命中）→ ③ HTML meta charset（gb2312/gbk 用超集 gb18030 解码防生僻字截断）→ ④ chardet 兜底（阈值 0.9、64KB 采样）→ ⑤ 序贯严格（gb18030 先于 gbk）→ ⑥ ignore 兜底。
+- 回归：`scripts/test_exporter_encoding.py` 5 用例（无 BOM utf-8 主场景/BOM×2/GBK+meta/GBK 无声明）。
+- 存量矫正：平台同步后对受影响包**重新解压**（同 nf+version 覆盖）即重转干净，按需重抽。
+- 平台侧：`pipeline/exporter.py` 字节一致同步；附 `backend/scripts/scan_mojibake.py` 供内网扫描存量乱码文件清单。
+
+---
+
 ## [0.23.0] - 2026-08-20
 
 ### 变更（命令源目录支持多目录输入）

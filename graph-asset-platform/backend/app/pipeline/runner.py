@@ -45,7 +45,7 @@ def _load_exporter():
     """按路径加载拷贝版 exporter（不污染 sys.path；依赖 chardet/bs4）。
     **必须注册进 sys.modules**：exporter 顶部的 @dataclass 按 __module__ 名查
     sys.modules 解析字符串注解，未注册会 AttributeError: NoneType.__dict__。"""
-    spec = importlib.util.spec_from_file_location("pipeline_exporter", HERE / "exporter.py")
+    spec = importlib.util.spec_from_file_location("pipeline_exporter", HERE / "product_doc_md_exporter_optimized.py")
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -265,7 +265,7 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
             "uploaded_by": uploaded_by,
             "source_name": hwics_path.name, "source_sha256": sha,
             "exporter": "product_doc_md_exporter_optimized:" + bundles.file_sha256(
-                HERE / "exporter.py")[:8],
+                HERE / "product_doc_md_exporter_optimized.py")[:8],
             "md_count": md_count, "convert_failed": len(convert_fail),
             "mode_id": "",
         }

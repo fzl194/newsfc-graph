@@ -42,15 +42,46 @@ class TopicRecord:
 # 通用工具函数
 # =========================
 def read_text_auto(file_path: str) -> str:
-    encodings = [
-        "utf-8", "gb18030", "gbk", "gb2312",
-        "utf-16", "big5", "windows-1252", "iso-8859-1", "ascii",
-    ]
+    """自适应解码（v0.24.0 重写：确定性判据优先，chardet 降为兜底）。
+
+    旧实现的坑（整文件乱码根因，CR-20260820-002）：chardet 置信度 ≥0.7 即采用，
+    而 GBK/Latin 解码几乎不抛异常——UTF-8 的 html 被统计猜测误判成 GBK 族时
+    "成功"产出整文件乱码并固化。新顺序（确定性从高到低）：
+      ① BOM（utf-8-sig / utf-16）——文件自声明，最权威
+      ② utf-8 严格解码——utf-8 可自校验，严格通过即确定
+      ③ HTML meta charset 声明（头部 2KB）——文档自声明编码
+      ④ chardet 兜底（阈值 0.9，前 64KB 采样）
+      ⑤ 序贯严格解码（gb18030 超集先于 gbk）
+      ⑥ errors="ignore" 最后兜底
+    """
     raw = Path(file_path).read_bytes()
 
+    # ① BOM
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+
+    # ② utf-8 严格自校验（GBK 文本几乎不可能整段合法 utf-8）
     try:
-        detected = chardet.detect(raw)
-        if detected and detected.get("encoding") and (detected.get("confidence") or 0) >= 0.7:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # ③ HTML meta charset（文档自声明，权威；gb2312/gbk 统一用超集 gb18030 防生僻字截断）
+    m = re.search(rb'charset\s*=\s*["\']?\s*([A-Za-z0-9_\-]+)', raw[:2048], re.IGNORECASE)
+    if m:
+        declared = m.group(1).decode("ascii", errors="ignore").lower()
+        enc = {"gb2312": "gb18030", "gbk": "gb18030"}.get(declared, declared)
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            pass
+
+    # ④ chardet 兜底（高阈值；前 64KB 采样）
+    try:
+        detected = chardet.detect(raw[:65536])
+        if detected and detected.get("encoding") and (detected.get("confidence") or 0) >= 0.9:
             try:
                 return raw.decode(detected["encoding"])
             except Exception:
@@ -58,19 +89,15 @@ def read_text_auto(file_path: str) -> str:
     except Exception:
         pass
 
-    for enc in encodings:
+    # ⑤ 序贯严格解码（超集优先）
+    for enc in ("gb18030", "gbk", "big5", "windows-1252", "iso-8859-1"):
         try:
             return raw.decode(enc)
         except Exception:
             continue
 
-    for enc in ("utf-8", "gb18030", "gbk"):
-        try:
-            return raw.decode(enc, errors="ignore")
-        except Exception:
-            continue
-
-    raise ValueError(f"无法读取文件编码: {file_path}")
+    # ⑥ 最后兜底
+    return raw.decode("gb18030", errors="ignore")
 
 
 def safe_filename(name: str, max_len: int = 80) -> str:

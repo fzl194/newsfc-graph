@@ -6,7 +6,7 @@
 
 | 文件 | 来源（权威：三层图谱构建规范/） | 版本 |
 |---|---|---|
-| `exporter.py` | `scripts/product_doc_md_exporter_optimized.py` | 原样 |
+| `product_doc_md_exporter_optimized.py` | `scripts/product_doc_md_exporter_optimized.py` | **v0.24.0**（read_text_auto 编码探测重写：BOM/UTF-8 自校验/meta 声明优先，chardet 兜底——修整文件乱码） |
 | `command/_common.py` `build_commands.py` `build_configobjects.py` | `command/scripts/` | **v0.20.0**（参见边全文锚定） |
 | `feature/_common.py` `build_features.py` `build_licenses.py` | `feature/scripts/` | **v0.22.0**（依赖特性全文锚定+使用命令边+License校验+图片） |
 | `test_build_*_edges.py` | 同目录脚本配套回归测试（26 用例） | 随脚本 |
