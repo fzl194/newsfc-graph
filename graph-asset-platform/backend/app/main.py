@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .middleware.auth import AuthMiddleware
+from .mcp_server import asgi_app as mcp_asgi_app
 from .routers import admin as admin_router
 from .routers import assets as assets_router
 from .routers import docs as docs_router
@@ -64,7 +65,12 @@ async def lifespan(app: FastAPI):
             print(f"[startup] users.json 为空 → 已自动创建 admin（全权限）。KEY: {u['key']}（请妥善保存，仅显示一次）", flush=True)
     except Exception as e:
         print(f"[startup] WARNING: users.json 读取失败 ({e})", flush=True)
-    yield
+    # MCP 服务（Streamable HTTP，/mcp）：session manager 随应用生命周期启停
+    # （SDK 限制 run() 仅一次/实例 → 每次启动重建；测试多 TestClient 场景可重入）
+    from .mcp_server import rebuild_session_manager
+    async with rebuild_session_manager().run():
+        print("[startup] MCP 服务就绪 → /mcp（鉴权：X-API-Key，需 skill 权限）", flush=True)
+        yield
 
 
 app = FastAPI(title="Graph Asset Platform", version="0.1.0", lifespan=lifespan)
@@ -86,6 +92,12 @@ app.include_router(productdoc_router.router, prefix="/api/v1")
 app.include_router(telemetry_router.router, prefix="/api/v1")
 app.include_router(tests_router.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")
+
+# MCP 服务端点（Streamable HTTP，鉴权：X-API-Key → skill 权限，纯 ASGI 中间件）。
+# 显式 Route 而非 Mount：Mount 对无尾斜杠精确路径匹配不到（子 app 以 / 注册）。
+from starlette.routing import Route
+app.router.routes.insert(0, Route("/mcp", endpoint=mcp_asgi_app,
+                                  methods=["GET", "POST", "DELETE"]))
 
 # 前端静态托管（dist 可能尚未构建，不存在则不挂载）
 _dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"

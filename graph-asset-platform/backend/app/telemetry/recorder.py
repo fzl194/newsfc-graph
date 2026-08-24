@@ -12,10 +12,12 @@ logger = logging.getLogger(__name__)
 
 
 def record(endpoint: str, id_: str = "", type_: str = "", *, user: str = "",
-           caller: str = "", level: str = "request", operator: str = "") -> None:
+           caller: str = "", level: str = "request", operator: str = "",
+           session_id: str = "") -> None:
     """追加一条打点。失败吞掉 + log，不抛。
 
-    level: request/object；operator: SKILL 调用者工号（X-User-Id），前端为空。
+    level: request/object/tool；operator: 调用者工号（MCP 工具参数 AGENT_USERNAME）；
+    session_id: 会话ID（MCP 工具参数 AGENT_SESSION_ID）。
     """
     try:
         db = get_shared_db()
@@ -24,6 +26,7 @@ def record(endpoint: str, id_: str = "", type_: str = "", *, user: str = "",
             ts=datetime.now(timezone.utc).isoformat(),
             level=level, caller=caller, endpoint=endpoint,
             obj_id=id_, obj_type=type_, user=user, operator=operator,
+            session_id=session_id,
         )
         db.commit()
     except Exception as e:  # noqa: BLE001 — 观测用，绝不阻断业务

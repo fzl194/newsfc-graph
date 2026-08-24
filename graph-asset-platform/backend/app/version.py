@@ -23,3 +23,18 @@ def latest_version(versions: list):
     if not versions:
         return None
     return sorted(versions, key=cmp_to_key(_cmp))[-1]
+
+
+def is_newer(a, b) -> bool:
+    """a 是否比 b 新（语义化比较；None 视为最低——跨 NF 类恒 None 不会与 str 混合）。
+
+    原 routers/objects._is_newer 抽出（MCP 服务化 2026-08-24：objects_search /
+    mcp_server 与 router 共用，避免双份漂移）。
+    """
+    if a == b:
+        return False
+    if a is None:
+        return False
+    if b is None:
+        return True
+    return latest_version([a, b]) == a

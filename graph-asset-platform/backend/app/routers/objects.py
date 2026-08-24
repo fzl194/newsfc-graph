@@ -14,6 +14,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from ..models import Edge, Object
+from ..objects_search import list_objects_rows
 from ..service import get_service
 from ..telemetry.recorder import record
 from ..ui_layers import UI_LAYER_TYPES
@@ -25,14 +26,12 @@ router = APIRouter()
 # ---------- 版本比较辅助 ----------
 
 def _is_newer(a: Optional[str], b: Optional[str]) -> bool:
-    """a 是否比 b 新（语义化比较；None 视为最低，跨 NF 类恒 None 不会与 str 混合）。"""
-    if a == b:
-        return False
-    if a is None:
-        return False
-    if b is None:
-        return True
-    return latest_version([a, b]) == a
+    """a 是否比 b 新（语义化比较；None 视为最低，跨 NF 类恒 None 不会与 str 混合）。
+
+    实现已抽至 ``version.is_newer``（MCP 服务化共用），此处保留薄委托。
+    """
+    from ..version import is_newer
+    return is_newer(a, b)
 
 
 # ---------- 序列化辅助 ----------
@@ -108,59 +107,15 @@ def list_objects(type: Optional[str] = None,
     - ``nf/domain/q``：同前。``q`` 匹配 id / name / name_zh（不区分大小写子串）。
 
     响应头 ``X-Total-Count``：过滤后、分页前的总行数（前端"共 N 项"用）。
+
+    过滤/聚合逻辑在 ``objects_search.list_objects_rows``（与 MCP search_tools 共用）。
     """
-    idx = get_service().index
-    # 解析 type 集合：type 优先（更窄的子筛选），否则用 layer 的类型集合
-    types: Optional[set] = None
-    if type:
-        types = {type}
-    elif layer:
-        types = set(UI_LAYER_TYPES.get(layer, []))
-    ql = q.lower().strip() if q else None
-    # 全部条件先过滤到节点级，再按 id 聚合取代表（版本过滤在聚合前——核心修复）
-    matched: dict = {}
-    for (id_, _ver), obj in idx.nodes.items():
-        if types is not None and obj.type not in types:
-            continue
-        if nf and obj.nf != nf:
-            continue
-        if version and obj.version != version:
-            continue
-        if domain and obj.domain != domain:
-            continue
-        if scenario and obj.scenario != scenario:
-            continue
-        if ql and not _match_q(obj, ql):
-            continue
-        cur = matched.get(id_)
-        if cur is None or _is_newer(obj.version, cur.version):
-            matched[id_] = obj
-    rows = [{
-        "id": id_,
-        "type": obj.type,
-        "layer": obj.layer,
-        "nf": obj.nf,
-        "domain": obj.domain,
-        "scenario": obj.scenario,
-        "name": obj.frontmatter.get("name"),
-        "versions": idx.versions_of(id_),
-    } for id_, obj in matched.items()]
-    # 稳定排序：按 type 再按 id
-    rows.sort(key=lambda r: (r["type"] or "", r["id"]))
+    rows, total = list_objects_rows(q=q, layer=layer, type=type, nf=nf, version=version,
+                                    domain=domain, scenario=scenario)
     if response is not None:
-        response.headers["X-Total-Count"] = str(len(rows))
+        response.headers["X-Total-Count"] = str(total)
     start = (page - 1) * size
     return rows[start:start + size]
-
-
-def _match_q(obj: Object, ql: str) -> bool:
-    """搜索匹配：id / name / name_zh（调用方已 lowercase）。"""
-    fm = obj.frontmatter
-    return (
-        ql in obj.id.lower()
-        or ql in str(fm.get("name", "")).lower()
-        or ql in str(fm.get("name_zh", "")).lower()
-    )
 
 
 # ---------- /domains ----------

@@ -139,6 +139,7 @@ def migrate_telemetry(conn: sqlite3.Connection) -> int:
                     caller=rec.get("caller", ""), endpoint=rec.get("endpoint", ""),
                     obj_id=rec.get("id", ""), obj_type=rec.get("type", ""),
                     user=rec.get("user", ""), operator=rec.get("operator", ""),
+                    session_id=rec.get("session_id", ""),
                 )
                 n += 1
             except Exception:  # noqa: BLE001

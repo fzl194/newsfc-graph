@@ -129,7 +129,8 @@ def test_list_skill_usage_filters_to_skill_objects_only(tmp_path, monkeypatch):
     assert len(r["events"]) == 2
     assert {e["endpoint"] for e in r["events"]} == {"/md", "/domains"}
     assert all(e["user"] == "sk" for e in r["events"])
-    assert all(set(e) == {"ts", "endpoint", "obj_id", "obj_type", "user", "operator"} for e in r["events"])  # 不泄露 rowid
+    assert all(set(e) == {"ts", "endpoint", "obj_id", "obj_type", "user", "operator",
+                          "session_id"} for e in r["events"])  # 不泄露 rowid；session_id 为 MCP 服务化新增列
 
 
 def test_list_skill_usage_since_inclusive_and_cursor(tmp_path, monkeypatch):
