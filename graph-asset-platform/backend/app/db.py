@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -61,6 +61,14 @@ CREATE TABLE IF NOT EXISTS telemetry(
 );
 CREATE INDEX IF NOT EXISTS idx_tel_stats ON telemetry(level, caller, endpoint, ts);
 CREATE INDEX IF NOT EXISTS idx_tel_user ON telemetry(user, level, ts);
+
+-- 正文全文索引（MCP search_md，CR：MCP 服务化 2026-08-24）。trigram 分词：
+-- 中英文统一子串语义，且 LIKE/GLOB 可走 trigram 索引（<3 字符查询的回退路径）。
+-- 独立表（objects 是 WITHOUT ROWID，external-content 方案不适用）。
+CREATE VIRTUAL TABLE IF NOT EXISTS md_fts USING fts5(
+  obj_id UNINDEXED, version UNINDEXED, body,
+  tokenize='trigram'
+);
 
 CREATE TABLE IF NOT EXISTS test_cases(
   id TEXT PRIMARY KEY, domain TEXT, scenario TEXT, name TEXT,
@@ -117,8 +125,20 @@ def init_schema(conn: sqlite3.Connection) -> None:
     jcols = {r[1] for r in conn.execute("PRAGMA table_info(import_jobs)")}
     if jcols and "child_pids" not in jcols:
         conn.execute("ALTER TABLE import_jobs ADD COLUMN child_pids TEXT DEFAULT '[]'")
+    # v4 迁移（MCP 服务化 2026-08-24）：① telemetry.session_id（会话ID 打点新列，
+    # 历史行为 ''）② md_fts 存量回填（旧库 objects 有数据而 FTS 空表 → 一次性灌入）。
+    tcols = {r[1] for r in conn.execute("PRAGMA table_info(telemetry)")}
+    if tcols and "session_id" not in tcols:
+        conn.execute("ALTER TABLE telemetry ADD COLUMN session_id TEXT DEFAULT ''")
+    if conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 0:
+        n = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        if n:
+            conn.execute(
+                "INSERT INTO md_fts(obj_id, version, body) "
+                "SELECT id, version, body_md FROM objects"
+            )
     conn.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (SCHEMA_VERSION,),
     )
     conn.commit()

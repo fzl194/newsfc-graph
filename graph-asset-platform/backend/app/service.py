@@ -34,10 +34,30 @@ class Service:
         if first_time:
             migrate_telemetry(self.db)  # jsonl 历史数据一次性导入
         self.index = Index.load_from_db(self.db, self.registry)
+        # FTS 对账状态：True=重建中（search_md 应明确报错而非静默残缺，审查 C3）
+        self.fts_rebuilding = False
         # mtime 校验后台异步（21178 文件 stat 在 Windows ~数十秒，不阻塞启动；完成后 reload）
         if not first_time:
             import threading as _t
+            _t.Thread(target=self._fts_reconcile_async, daemon=True).start()
             _t.Thread(target=self._sync_mtime_async, daemon=True).start()
+
+    def _fts_reconcile_async(self) -> None:
+        """后台对账 md_fts：count + 总字节双校验，不一致 → 持写锁全量重建。"""
+        from .repos import fts_repo
+        try:
+            if fts_repo.integrity_ok(self.db):
+                return
+            self.fts_rebuilding = True
+            try:
+                with import_lock:
+                    n = fts_repo.rebuild_from_objects(self.db)
+                    self.db.commit()
+                print(f"[startup] md_fts 与 objects 不一致，已后台重建 {n} 行", flush=True)
+            finally:
+                self.fts_rebuilding = False
+        except Exception:  # noqa: BLE001 后台线程绝不抛
+            self.fts_rebuilding = False
 
     def _sync_mtime_async(self) -> None:
         """后台 mtime 校验：stat 扫描不取锁（慢但不阻塞写），reindex/reload 取锁（短）。"""
@@ -91,17 +111,20 @@ class Service:
         self.index = Index.load_from_db(self.db, self.registry)
 
     def reindex_path(self, rel: str) -> None:
-        """单文件 parse → UPSERT DB（objects/edges）。不重载内存（调用方 reload_index）。
+        """单文件 parse → UPSERT DB（objects/edges/md_fts）。不重载内存（调用方 reload_index）。
 
-        id/type/version 变了的旧节点按 source_path 清除（``objects_repo.delete_by_source``）。
+        id/type/version 变了的旧节点按 source_path 清除（``objects_repo.delete_by_source``）；
+        FTS 旧 (id,version) 行同源删除（不留幽灵命中，审查 C1）。
         """
         from .edges import parse_edges
         from .logical_id import split_id
         from .md_parser import parse_md
-        from .repos import edges_repo, objects_repo
-        # 删旧节点 + 其边（source_path 维度，稳）
-        for oid, over in objects_repo.delete_by_source(self.db, rel):
+        from .repos import edges_repo, fts_repo, objects_repo
+        # 删旧节点 + 其边 + FTS 旧行（source_path 维度，稳）
+        old_pairs = list(objects_repo.delete_by_source(self.db, rel))
+        for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
+        fts_repo.delete_many(self.db, old_pairs)
         # 重新 parse + 入库
         try:
             text = self.store.read(rel)
@@ -132,13 +155,16 @@ class Service:
             body_md=body, raw_md=text, mtime=mtime,
         )
         edges_repo.replace_for_node(self.db, id_, version, edges)
+        fts_repo.upsert(self.db, obj_id=id_, version=version, body=body)
         self.db.commit()
 
     def unindex_path(self, rel: str) -> None:
-        """删该 source_path 的 DB 节点 + 边（md 被删时）。"""
-        from .repos import edges_repo, objects_repo
-        for oid, over in objects_repo.delete_by_source(self.db, rel):
+        """删该 source_path 的 DB 节点 + 边 + FTS 行（md 被删时）。"""
+        from .repos import edges_repo, fts_repo, objects_repo
+        old_pairs = list(objects_repo.delete_by_source(self.db, rel))
+        for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
+        fts_repo.delete_many(self.db, old_pairs)
         self.db.commit()
 
     def reindex_prefixes(self, prefixes: list) -> dict:
@@ -176,6 +202,81 @@ class Service:
         with import_lock:
             build_index_db(self.db, self.store, self.registry)
             self.index = Index.load_from_db(self.db, self.registry)
+
+    # ---------- 正文全文搜索（MCP search_md 的 service 层实现） ----------
+
+    def search_md(self, q: str, layer=None, type=None, nf=None, version=None,
+                  limit: int = 20, offset: int = 0) -> dict:
+        """FTS5 trigram 正文搜索：相关度排序 + 高亮片段 + 元数据/版本过滤。
+
+        版本语义：不传 version → 只保留每个 id 的**最新现存版本**命中行（最新版
+        不含关键词则该 id 不出现——FTS 按行命中，非"分组后错位取最新"，审查 C6）；
+        传 version → 锁定该版本。q<3 字符走 LIKE 路径（trigram 索引加速，无相关度）。
+
+        返回 {total, hits: [{id, type, name, version, score, snippet}]}；
+        hits 不含正文全文——召回后调 get_md 取完整 md。
+        """
+        from .repos import fts_repo
+        q = (q or "").strip()
+        if not q:
+            raise ValueError("查询词不能为空")
+        if getattr(self, "fts_rebuilding", False):  # __new__ 绕过 __init__ 的测试实例无此属性
+            raise RuntimeError("全文索引重建中，请稍后重试")
+
+        # 命中行（FTS 层，无元数据过滤）→ 内存索引过滤（node 存在 + 元数据 + 版本语义）
+        if len(q) >= 3:
+            rows = fts_repo.search_match(self.db, q)
+            for r in rows:
+                r.pop("body", None)
+        else:
+            raw = fts_repo.search_like(self.db, q)
+            rows = [self._like_row_with_snippet(r, q) for r in raw]
+
+        idx = self.index
+        # layer 语义与 list_objects 一致：UI 层名（中文）→ 类型集合；type 优先（层内收窄）
+        types: Optional[set] = None
+        if type:
+            types = {type}
+        elif layer:
+            from .ui_layers import UI_LAYER_TYPES
+            types = set(UI_LAYER_TYPES.get(layer, []))
+        filtered = []
+        for r in rows:
+            ver = r["version"] or None
+            obj = idx.node(r["obj_id"], ver)
+            if obj is None:
+                continue  # DB 有行内存无节点（刚删除未 reload）——跳过
+            if types is not None and obj.type not in types:
+                continue
+            if nf and obj.nf != nf:
+                continue
+            if version is not None:
+                if ver != version:
+                    continue
+            else:
+                latest = idx.latest_version_of_id(r["obj_id"])
+                if ver != latest:
+                    continue
+            filtered.append({
+                "id": r["obj_id"], "type": obj.type, "name": obj.frontmatter.get("name"),
+                "version": ver, "score": r.get("score"), "snippet": r["snippet"],
+            })
+        total = len(filtered)
+        start = max(0, offset)
+        return {"total": total, "hits": filtered[start:start + max(1, limit)]}
+
+    @staticmethod
+    def _like_row_with_snippet(r: dict, q: str) -> dict:
+        """LIKE 路径手工造 snippet（FTS5 snippet() 仅对 MATCH 有效）：48 字符窗口高亮。"""
+        body = r.get("body") or ""
+        pos = body.find(q)
+        if pos < 0:
+            snip = body[:48]
+        else:
+            half = max(0, pos - 20)
+            seg = body[half:pos + len(q) + 28]
+            snip = ("…" if half > 0 else "") + seg.replace(q, f"【{q}】", 1) + "…"
+        return {"obj_id": r["obj_id"], "version": r["version"], "snippet": snip}
 
 
 _service: Optional[Service] = None
