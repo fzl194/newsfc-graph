@@ -38,6 +38,7 @@ class UserPatchIn(BaseModel):
     can_skill: Optional[bool] = None
     is_admin: Optional[bool] = None
     reset_key: bool = False
+    set_key: Optional[str] = None  # 管理员自定义 KEY（与 reset_key 互斥）
 
 
 def _safe(u: dict) -> dict:
@@ -76,6 +77,13 @@ def update_user(username: str, req: UserPatchIn):
     u = store.find_by_name(username)
     if u is None:
         raise HTTPException(404, "用户不存在")
+    if req.set_key is not None and req.reset_key:
+        raise HTTPException(400, "set_key 与 reset_key 互斥，只能二选一")
+    if req.set_key is not None:
+        try:
+            service.set_key(username, req.set_key)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     if req.reset_key:
         service.reset_key(username)
     if any(v is not None for v in (req.can_frontend, req.can_assets, req.can_upload, req.can_test, req.can_skill, req.is_admin)):

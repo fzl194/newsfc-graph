@@ -79,7 +79,16 @@
         <el-form-item label="测试权限"><el-checkbox v-model="editForm.can_test" /></el-form-item>
         <el-form-item label="SKILL权限"><el-checkbox v-model="editForm.can_skill" /></el-form-item>
         <el-form-item label="管理员"><el-checkbox v-model="editForm.is_admin" /></el-form-item>
-        <el-form-item label="重置 KEY"><el-checkbox v-model="editForm.reset_key" /></el-form-item>
+        <el-form-item label="API KEY">
+          <el-radio-group v-model="editForm.keyMode">
+            <el-radio value="keep">保持不变</el-radio>
+            <el-radio value="random">随机重置</el-radio>
+            <el-radio value="custom">自定义</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="editForm.keyMode === 'custom'" label="新 KEY">
+          <el-input v-model="editForm.setKey" placeholder="≥8 位且不含空格（如 udg-team-2026）" clearable />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="editVisible = false">取消</el-button>
@@ -110,11 +119,12 @@
 import { onMounted, reactive, ref } from 'vue'
 import {
   ElButton, ElTable, ElTableColumn, ElDialog, ElForm, ElFormItem, ElInput,
-  ElCheckbox, ElDrawer, ElMessage, ElMessageBox,
+  ElCheckbox, ElDrawer, ElMessage, ElMessageBox, ElRadio, ElRadioGroup,
 } from 'element-plus'
 import {
   listUsers, createUser, updateUser, deleteUser, userActivity, type UserRow,
 } from '../api'
+import { getSession, setSession } from '../auth'
 
 const users = ref<UserRow[]>([])
 const loading = ref(false)
@@ -140,7 +150,8 @@ const editForm = reactive({
   can_test: false,
   can_skill: false,
   is_admin: false,
-  reset_key: false,
+  keyMode: 'keep' as 'keep' | 'random' | 'custom',
+  setKey: '',
 })
 
 const activityVisible = ref(false)
@@ -204,17 +215,40 @@ function openEdit(row: UserRow): void {
     can_test: row.can_test,
     can_skill: row.can_skill,
     is_admin: row.is_admin,
-    reset_key: false,
+    keyMode: 'keep',
+    setKey: '',
   })
   editVisible.value = true
 }
 
 async function doEdit(): Promise<void> {
   if (!editTarget.value) return
+  const customKey = editForm.setKey.trim()
+  if (editForm.keyMode === 'custom' && (customKey.length < 8 || /\s/.test(customKey))) {
+    ElMessage.error('自定义 KEY 需 ≥8 位且不含空格')
+    return
+  }
   saving.value = true
   try {
-    await updateUser(editTarget.value.username, { ...editForm })
-    ElMessage.success('已保存')
+    const patch: Record<string, unknown> = {
+      can_frontend: editForm.can_frontend,
+      can_assets: editForm.can_assets,
+      can_upload: editForm.can_upload,
+      can_test: editForm.can_test,
+      can_skill: editForm.can_skill,
+      is_admin: editForm.is_admin,
+    }
+    if (editForm.keyMode === 'random') patch.reset_key = true
+    else if (editForm.keyMode === 'custom') patch.set_key = customKey
+    const u = await updateUser(editTarget.value.username, patch)
+    // 改的是当前登录账号自己的 KEY → 同步 sessionStorage，否则下一请求即 401
+    const s = getSession()
+    if (s && s.username === editTarget.value.username && u.key !== s.key) {
+      setSession({ ...s, key: u.key })
+      ElMessage.warning('已修改当前登录账号的 KEY，会话凭证已同步')
+    } else {
+      ElMessage.success('已保存')
+    }
     editVisible.value = false
     await load()
   } catch (e) {

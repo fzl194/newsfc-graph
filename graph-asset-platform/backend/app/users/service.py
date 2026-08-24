@@ -65,6 +65,19 @@ def reset_key(username: str) -> Optional[str]:
     return k if u else None
 
 
+def set_key(username: str, key: str) -> Optional[dict]:
+    """设置指定 KEY（管理员自定义，2026-08-24 用户决策·折中校验）：
+    去首尾空白后 ≥8 位、不含任何空白字符，不强制前缀；全局唯一（撞他人 KEY → 拒）。
+    KEY 即登录凭证等价于用户名，冲突必须显式失败而非静默顶号。"""
+    k = (key or "").strip()
+    if len(k) < 8 or any(c.isspace() for c in k):
+        raise ValueError("KEY 需 ≥8 位且不含空格")
+    hit = store.find_by_key(k)
+    if hit is not None and hit.get("username") != username:
+        raise ValueError(f"KEY 已被用户 {hit['username']} 占用")
+    return store.update_user(username, {"key": k})
+
+
 def set_perms(username: str, *, can_frontend: bool, can_assets: bool = False, can_upload: bool = False, can_test: bool = False, can_skill: bool, is_admin: bool) -> Optional[dict]:
     return store.update_user(username, {
         "can_frontend": can_frontend, "can_assets": can_assets,

@@ -97,3 +97,38 @@ def test_set_perms_roundtrip_all_flags(tmp_path, monkeypatch):
     assert u["can_test"] is False
     assert u["can_skill"] is True
     assert u["is_admin"] is False
+
+
+def test_set_key_valid_strips_and_authenticates(tmp_path, monkeypatch):
+    """自定义 KEY：去首尾空白落库，新 KEY 可认证、旧 KEY 失效。"""
+    _seed(tmp_path, monkeypatch, [{"username": "u", "key": "old-key-0001"}])
+    from app.users.service import set_key, authenticate
+    u = set_key("u", "  udg-team-2026  ")
+    assert u["key"] == "udg-team-2026"
+    assert authenticate("udg-team-2026")["username"] == "u"
+    assert authenticate("old-key-0001") is None
+
+
+def test_set_key_rejects_short_and_whitespace(tmp_path, monkeypatch):
+    _seed(tmp_path, monkeypatch, [{"username": "u", "key": "old-key-0001"}])
+    import pytest
+    from app.users.service import set_key
+    with pytest.raises(ValueError):
+        set_key("u", "short")                    # < 8 位
+    with pytest.raises(ValueError):
+        set_key("u", "has space-inside")         # 含空格
+    with pytest.raises(ValueError):
+        set_key("u", "   ")                      # 空串
+
+
+def test_set_key_rejects_conflict_and_allows_own(tmp_path, monkeypatch):
+    """撞他人 KEY → 拒；设回自己的现有 KEY → 允许（幂等）。"""
+    _seed(tmp_path, monkeypatch, [
+        {"username": "u1", "key": "key-one-0001"},
+        {"username": "u2", "key": "key-two-0002"},
+    ])
+    import pytest
+    from app.users.service import set_key
+    with pytest.raises(ValueError, match="u2"):
+        set_key("u1", "key-two-0002")
+    assert set_key("u1", "key-one-0001")["key"] == "key-one-0001"
