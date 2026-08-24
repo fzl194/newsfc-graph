@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS trash(
 
 CREATE TABLE IF NOT EXISTS telemetry(
   ts TEXT, level TEXT, caller TEXT, endpoint TEXT,
-  obj_id TEXT, obj_type TEXT, user TEXT, operator TEXT
+  obj_id TEXT, obj_type TEXT, user TEXT, operator TEXT,
+  session_id TEXT DEFAULT '', params TEXT DEFAULT '', result TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tel_stats ON telemetry(level, caller, endpoint, ts);
 CREATE INDEX IF NOT EXISTS idx_tel_user ON telemetry(user, level, ts);
@@ -130,6 +131,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     tcols = {r[1] for r in conn.execute("PRAGMA table_info(telemetry)")}
     if tcols and "session_id" not in tcols:
         conn.execute("ALTER TABLE telemetry ADD COLUMN session_id TEXT DEFAULT ''")
+    # v5 迁移（MCP 参数留痕 2026-08-24）：telemetry.params/result（tool 级行的
+    # 入参 JSON + 出参摘要 JSON，截断 2KB；用户要求输入输出都记录）。
+    if tcols and "params" not in tcols:
+        conn.execute("ALTER TABLE telemetry ADD COLUMN params TEXT DEFAULT ''")
+    if tcols and "result" not in tcols:
+        conn.execute("ALTER TABLE telemetry ADD COLUMN result TEXT DEFAULT ''")
     if conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 0:
         n = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
         if n:

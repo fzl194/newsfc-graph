@@ -252,3 +252,39 @@ def test_telemetry_three_levels_and_stats(tmp_data_dir, monkeypatch):
     record("/md", "X@1", "Feature", user="sk", caller="skill", level="object")
     st2 = aggregate_stats(s.db)
     assert st2["total"] == st["total"] + 1
+
+
+def test_tool_rows_record_params_and_result(tmp_data_dir, monkeypatch):
+    """tool 级行记录入参（params）与出参摘要（result）——用户决策：输入输出都记。"""
+    s = _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD,
+                                           "Feature/UDG/20.15.2/f.md": FEATURE})
+    with _client() as c:
+        _call(c, "get_md", {**_CTX, "ids": ["UDG@MMLCommand@ADD URR", "no@such@id"]})
+        _call(c, "search_md", {**_CTX, "q": "计费"}, sid=2)
+    tool_rows = [dict(r) for r in s.db.execute(
+        "SELECT endpoint, params, result FROM telemetry WHERE level='tool' ORDER BY rowid"
+    ).fetchall()]
+    by_ep = {r["endpoint"]: (json.loads(r["params"]), json.loads(r["result"]))
+             for r in tool_rows}
+    p, r = by_ep["mcp:get_md"]
+    assert p == {"ids": ["UDG@MMLCommand@ADD URR", "no@such@id"], "version": None}
+    assert r["ok"] == 1 and r["failed"] == 1
+    assert r["failed_ids"] == ["no@such@id"]
+    assert r["bytes"] > 0
+    p2, r2 = by_ep["mcp:search_md"]
+    assert p2["q"] == "计费"
+    assert r2["total"] == 2 and r2["returned"] == 2
+    assert "UDG@MMLCommand@ADD URR" in r2["top_ids"]
+
+
+def test_tool_row_records_error_result(tmp_data_dir, monkeypatch):
+    """护栏触发（ids 超限）→ tool 行 result 记 error 摘要。"""
+    s = _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
+    with _client() as c:
+        _call_err(c, "get_md", {**_CTX, "ids": [f"x@y@{i}" for i in range(101)]})
+    rows = [dict(r) for r in s.db.execute(
+        "SELECT params, result FROM telemetry WHERE level='tool' AND endpoint='mcp:get_md'"
+    ).fetchall()]
+    assert rows
+    assert "error" in json.loads(rows[0]["result"])
+    assert len(json.loads(rows[0]["params"])["ids"]) == 101

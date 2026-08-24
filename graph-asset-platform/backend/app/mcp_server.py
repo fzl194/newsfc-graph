@@ -16,6 +16,8 @@
 """
 from typing import Annotated, Optional
 
+import json
+
 from pydantic import Field
 
 from fastapi.responses import JSONResponse
@@ -68,9 +70,32 @@ def _identity(ctx: Context) -> str:
         return ""
 
 
-def _record_tool(name: str, *, user: str, operator: str, session_id: str) -> None:
+_PARAMS_MAX = 2048  # 入参/出参摘要截断上限（观测载荷不与业务等量级）
+
+
+def _j(v) -> str:
+    """入参/出参 → JSON 字符串（超长截断；序列化失败返回空串不阻断）。"""
+    try:
+        s = json.dumps(v, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return ""
+    return s if len(s) <= _PARAMS_MAX else s[:_PARAMS_MAX] + "…(截断)"
+
+
+def _record_tool(name: str, *, user: str, operator: str, session_id: str,
+                 params: Optional[dict] = None, result: Optional[dict] = None) -> None:
+    """tool 级打点（2026-08-24 用户决策：输入输出都记录）。
+
+    params=业务入参（上下文参数已有专列不重复）；result=**结构化摘要**而非原始
+    载荷（md 全文本在 objects 表，append-only 打点表不存大字段）。
+    """
     record(f"mcp:{name}", user=user, caller="mcp", level="tool",
-           operator=operator, session_id=session_id)
+           operator=operator, session_id=session_id,
+           params=_j(params or {}), result=_j(result or {}))
+
+
+def _err_summary(e: Exception) -> dict:
+    return {"error": str(e)[:300]}
 
 
 # ---------- 工具 ----------
@@ -88,23 +113,31 @@ def get_domains(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_S
         AGENT_SESSION_ID: 当前会话ID（从环境变量 _AGENT_SESSION_ID 读取传入）
     """
     user = _identity(ctx)
-    _record_tool("get_domains", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
-    idx = get_service().index
-    latest: dict = {}
-    for (id_, _v), obj in idx.nodes.items():
-        if obj.type != "BusinessDomain":
-            continue
-        cur = latest.get(id_)
-        if cur is None or is_newer(obj.version, cur.version):
-            latest[id_] = obj
-    out = [{"id": id_, "name": obj.frontmatter.get("name"), "md": obj.raw_md}
-           for id_, obj in latest.items()]
-    for item in out:  # object 级：每域一行（取用统计口径）
-        record("mcp:get_domains", item["id"], "BusinessDomain", user=user,
-               caller="mcp", level="object", operator=AGENT_USERNAME,
-               session_id=AGENT_SESSION_ID)
-    # 包一层 dict：裸 list 会被 SDK 拆成逐元素 content，形态不稳定
-    return {"domains": out}
+    params: dict = {}
+    try:
+        idx = get_service().index
+        latest: dict = {}
+        for (id_, _v), obj in idx.nodes.items():
+            if obj.type != "BusinessDomain":
+                continue
+            cur = latest.get(id_)
+            if cur is None or is_newer(obj.version, cur.version):
+                latest[id_] = obj
+        out = [{"id": id_, "name": obj.frontmatter.get("name"), "md": obj.raw_md}
+               for id_, obj in latest.items()]
+        for item in out:  # object 级：每域一行（取用统计口径）
+            record("mcp:get_domains", item["id"], "BusinessDomain", user=user,
+                   caller="mcp", level="object", operator=AGENT_USERNAME,
+                   session_id=AGENT_SESSION_ID)
+        _record_tool("get_domains", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params,
+                     result={"domains": len(out), "ids": [d["id"] for d in out[:30]]})
+        # 包一层 dict：裸 list 会被 SDK 拆成逐元素 content，形态不稳定
+        return {"domains": out}
+    except Exception as e:  # noqa: BLE001 失败也留痕后原样抛出（转 MCP isError）
+        _record_tool("get_domains", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params, result=_err_summary(e))
+        raise
 
 
 @mcp.tool()
@@ -125,31 +158,43 @@ def get_md(ids: list[str], AGENT_USERNAME: Annotated[str, Field(description=_CTX
         version: 可选全局版本；不传 = 每个 id 各取最新现存版本
     """
     user = _identity(ctx)
-    _record_tool("get_md", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
     uniq = list(dict.fromkeys(ids))  # 去重保序
-    if not (1 <= len(uniq) <= MAX_IDS_PER_CALL):
-        raise ValueError(f"ids 数量须在 1~{MAX_IDS_PER_CALL}，当前 {len(uniq)}——请分批调用")
-    idx = get_service().index
-    out: dict = {}
-    total = 0
-    for id_ in uniq:
-        available = idx.versions_of(id_)
-        if not available:
-            out[id_] = {"error": "对象不存在", "available_versions": []}
-            continue
-        obj = idx.resolve_node(id_, version)
-        if obj is None:
-            out[id_] = {"error": f"版本不存在: {id_}@{version}", "available_versions": available}
-            continue
-        total += len(obj.raw_md.encode("utf-8"))
-        if total > MAX_TOTAL_BYTES:
-            raise RuntimeError(
-                f"响应总量超 {MAX_TOTAL_BYTES // 1024 // 1024}MB 上限（已处理 "
-                f"{len(out)} 个 id）——请分批调用，每批 ≤50 个 id")
-        out[id_] = {"version": obj.version, "md": obj.raw_md}
-        record("mcp:get_md", id_, obj.type, user=user, caller="mcp", level="object",
-               operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
-    return out
+    params: dict = {"ids": uniq, "version": version}
+    try:
+        if not (1 <= len(uniq) <= MAX_IDS_PER_CALL):
+            raise ValueError(f"ids 数量须在 1~{MAX_IDS_PER_CALL}，当前 {len(uniq)}——请分批调用")
+        idx = get_service().index
+        out: dict = {}
+        total = 0
+        failed_ids: list = []
+        for id_ in uniq:
+            available = idx.versions_of(id_)
+            if not available:
+                out[id_] = {"error": "对象不存在", "available_versions": []}
+                failed_ids.append(id_)
+                continue
+            obj = idx.resolve_node(id_, version)
+            if obj is None:
+                out[id_] = {"error": f"版本不存在: {id_}@{version}", "available_versions": available}
+                failed_ids.append(id_)
+                continue
+            total += len(obj.raw_md.encode("utf-8"))
+            if total > MAX_TOTAL_BYTES:
+                raise RuntimeError(
+                    f"响应总量超 {MAX_TOTAL_BYTES // 1024 // 1024}MB 上限（已处理 "
+                    f"{len(out)} 个 id）——请分批调用，每批 ≤50 个 id")
+            out[id_] = {"version": obj.version, "md": obj.raw_md}
+            record("mcp:get_md", id_, obj.type, user=user, caller="mcp", level="object",
+                   operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
+        _record_tool("get_md", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID,
+                     params=params,
+                     result={"ok": len(uniq) - len(failed_ids), "failed": len(failed_ids),
+                             "failed_ids": failed_ids[:20], "bytes": total})
+        return out
+    except Exception as e:  # noqa: BLE001 失败也留痕后原样抛出
+        _record_tool("get_md", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID,
+                     params=params, result=_err_summary(e))
+        raise
 
 
 @mcp.tool()
@@ -178,11 +223,24 @@ def search_objects(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGEN
         size: 页大小（默认 50）
     """
     user = _identity(ctx)
-    _record_tool("search_objects", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
-    rows, total = list_objects_rows(q=q, layer=layer, type=type, nf=nf, version=version,
-                                    domain=domain, scenario=scenario)
-    start = (page - 1) * size
-    return {"total": total, "rows": rows[start:start + size]}
+    params = {k: v for k, v in {"q": q, "layer": layer, "type": type, "nf": nf,
+                                "version": version, "domain": domain,
+                                "scenario": scenario, "page": page, "size": size}.items()
+              if v is not None}
+    try:
+        rows, total = list_objects_rows(q=q, layer=layer, type=type, nf=nf, version=version,
+                                        domain=domain, scenario=scenario)
+        start = (page - 1) * size
+        page_rows = rows[start:start + size]
+        _record_tool("search_objects", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params,
+                     result={"total": total, "returned": len(page_rows),
+                             "top_ids": [r["id"] for r in page_rows[:10]]})
+        return {"total": total, "rows": page_rows}
+    except Exception as e:  # noqa: BLE001
+        _record_tool("search_objects", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params, result=_err_summary(e))
+        raise
 
 
 @mcp.tool()
@@ -208,9 +266,21 @@ def search_md(q: str, AGENT_USERNAME: Annotated[str, Field(description=_CTX)], A
         offset: 偏移（默认 0）
     """
     user = _identity(ctx)
-    _record_tool("search_md", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
-    return get_service().search_md(q, layer=layer, type=type, nf=nf, version=version,
-                                   limit=limit, offset=offset)
+    params = {k: v for k, v in {"q": q, "layer": layer, "type": type, "nf": nf,
+                                "version": version, "limit": limit,
+                                "offset": offset}.items() if v is not None}
+    try:
+        res = get_service().search_md(q, layer=layer, type=type, nf=nf, version=version,
+                                      limit=limit, offset=offset)
+        _record_tool("search_md", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params,
+                     result={"total": res["total"], "returned": len(res["hits"]),
+                             "top_ids": [h["id"] for h in res["hits"][:10]]})
+        return res
+    except Exception as e:  # noqa: BLE001
+        _record_tool("search_md", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params, result=_err_summary(e))
+        raise
 
 
 @mcp.tool()
@@ -229,14 +299,24 @@ def get_object(id: str, AGENT_USERNAME: Annotated[str, Field(description=_CTX)],
         version: 版本锁定（不传 = 最新现存版本；版本缺失回带可用版本列表）
     """
     user = _identity(ctx)
-    _record_tool("get_object", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
-    obj = _resolve(id, version)
-    idx = get_service().index
-    return {
-        **_dump(obj),
-        "versions": idx.versions_of(obj.id),
-        "out_edges": [_dump_edge(e) for e in idx.out_edges(obj.id, obj.version)],
-    }
+    params = {k: v for k, v in {"id": id, "version": version}.items() if v is not None}
+    try:
+        obj = _resolve(id, version)
+        idx = get_service().index
+        out = {
+            **_dump(obj),
+            "versions": idx.versions_of(obj.id),
+            "out_edges": [_dump_edge(e) for e in idx.out_edges(obj.id, obj.version)],
+        }
+        _record_tool("get_object", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params,
+                     result={"type": obj.type, "version": obj.version,
+                             "out_edges": len(out["out_edges"])})
+        return out
+    except Exception as e:  # noqa: BLE001
+        _record_tool("get_object", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params, result=_err_summary(e))
+        raise
 
 
 # ---------- 纯 ASGI 鉴权（审查 A1：BaseHTTPMiddleware 对 SSE 流有缓冲/挂起风险） ----------

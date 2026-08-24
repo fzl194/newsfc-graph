@@ -14,11 +14,12 @@ _STATS_CALLERS = ("skill", "mcp")
 
 def insert(conn: sqlite3.Connection, *, ts: str, level: str, caller: str,
            endpoint: str, obj_id: str, obj_type: str, user: str, operator: str,
-           session_id: str = "") -> None:
+           session_id: str = "", params: str = "", result: str = "") -> None:
     conn.execute(
         "INSERT INTO telemetry(ts, level, caller, endpoint, obj_id, obj_type, user, "
-        "operator, session_id) VALUES(?,?,?,?,?,?,?,?,?)",
-        (ts, level, caller, endpoint, obj_id, obj_type, user, operator, session_id),
+        "operator, session_id, params, result) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (ts, level, caller, endpoint, obj_id, obj_type, user, operator,
+         session_id, params, result),
     )
 
 
