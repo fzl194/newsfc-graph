@@ -1,10 +1,15 @@
-"""鉴权 + 审计中间件（v2）：KEY 反查用户 → 权限校验 → 请求级打点①。
+"""鉴权 + 审计中间件（v3）：KEY 反查用户 → 权限校验 → 请求级打点①。
 
 - /users/login 豁免（登录前无 user，空 users 也能调）。
 - 其他 /api/*：无 KEY/未知 KEY → 401；权限不符 → 403。
-- 空 users.json → 所有 /api/*（非 login）→ 401（取消旁路）。
+- 空 users → 所有 /api/*（非 login）→ 401（取消旁路）。
 - 打点①：鉴权通过后记一行请求级（排除 /users/login、/telemetry/*）。
-- caller：X-Client:web → web；否则 skill。
+- caller：can_frontend → web；否则 skill（从用户属性派生，不信请求头）。
+
+v3（MCP 服务化 2026-08-24）：Agent 访问迁移至 MCP（/mcp，独立纯 ASGI 鉴权，
+caller=mcp）；原 SKILL 两端点（POST /domains、POST /md）已删，本中间件不再有
+skill 专属 REST 分支；X-User-Id 工号机制整体移除（MCP 打点归因走工具参数
+AGENT_USERNAME / AGENT_SESSION_ID）。
 """
 import logging
 import urllib.parse
@@ -26,8 +31,6 @@ def _need_perm(path: str) -> str:
         return "assets"
     if path.startswith("/api/v1/docs"):  # 原始产品文档（资产页签内，D15 用户决策：页签级权限）
         return "assets"
-    if path in ("/api/v1/domains", "/api/v1/md"):
-        return "skill"
     if path.startswith("/api/v1/import") or path.startswith("/api/v1/export"):
         return "upload"  # 菜单3：上传/导出
     if path.startswith("/api/v1/tests"):
@@ -53,13 +56,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if user is None:
             return JSONResponse(status_code=401, content={"detail": "missing or invalid api key"})
 
-        # caller 从用户属性派生（不信任 X-Client header，防 SKILL 伪装 web 躲统计）
+        # caller 从用户属性派生（不信任请求头，防伪装躲统计）
         caller = "web" if user.get("can_frontend") else "skill"
-        # operator（工号）仅 SKILL 调用记；前端强制空（防前端伪造工号栽赃）
-        operator = request.headers.get("X-User-Id", "") if caller == "skill" else ""
         request.state.user = user["username"]
         request.state.caller = caller
-        request.state.operator = operator
         request.state.user_obj = user  # 整 dict，供 router 内 check_perm 二次校验（如 fs 写操作要 upload）
 
         if not check_perm(user, _need_perm(path)):
@@ -70,7 +70,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # 打点①请求级（排除 telemetry 自身避免自循环；login 已豁免不到这）
         if not path.startswith("/api/v1/telemetry"):
             try:
-                record(path, id_=_extract_id(path), type_="", user=user["username"], caller=caller, level="request", operator=operator)
+                record(path, id_=_extract_id(path), type_="", user=user["username"], caller=caller, level="request")
             except Exception as e:  # 观测用，不阻断
                 logger.warning("audit record failed: %s", e)
         return response

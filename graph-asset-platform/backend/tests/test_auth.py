@@ -46,13 +46,16 @@ def test_empty_users_401_all(tmp_path, monkeypatch, tmp_data_dir):
         assert c.get("/api/v1/names", headers={"X-API-Key": "any"}).status_code == 401
 
 
-def test_skill_user_can_md_but_not_objects(tmp_path, monkeypatch, tmp_data_dir):
+def test_skill_user_rest_denied_frontend_endpoints(tmp_path, monkeypatch, tmp_data_dir):
+    """SKILL 账号（无 can_frontend）在 REST 侧仅剩 MCP 通道——前端接口 403。
+
+    （原 POST /md、POST /domains 已删：Agent 访问统一走 MCP /mcp，
+    鉴权测试见 test_mcp.py。）
+    """
     _seed(tmp_path, monkeypatch, [SK])
     from app.main import app
     with TestClient(app) as c:
         h = {"X-API-Key": "gap_sk"}
-        # /md 允许（id 不存在 → 200 含 error，非 403）
-        assert c.post("/api/v1/md", json={"ids": ["x"]}, headers=h).status_code == 200
         assert c.get("/api/v1/objects", headers=h).status_code == 403
 
 
@@ -115,14 +118,5 @@ def test_skill_user_cannot_write_assets_nor_tests(tmp_path, monkeypatch, tmp_dat
         assert c.get("/api/v1/tests/cases", headers=h).status_code == 403
 
 
-def test_x_user_id_recorded_as_operator(tmp_path, monkeypatch, tmp_data_dir):
-    """SKILL 调用带 X-User-Id → 打点 operator 记工号（request 级 telemetry 表）。"""
-    _seed(tmp_path, monkeypatch, [SK])
-    from app.main import app
-    with TestClient(app) as c:
-        c.post("/api/v1/md", json={"ids": ["x"]}, headers={"X-API-Key": "gap_sk", "X-User-Id": "EMP1024"})
-    import app.db as dbmod
-    reqs = [dict(r) for r in dbmod.get_shared_db().execute(
-        "SELECT * FROM telemetry WHERE level='request' AND endpoint='/api/v1/md'").fetchall()]
-    assert reqs and reqs[0]["operator"] == "EMP1024"
-    assert reqs[0]["user"] == "sk"
+# X-User-Id 机制已随旧两接口删除（MCP 服务化 2026-08-24）：
+# 工号归因迁移至 MCP 工具参数 AGENT_USERNAME（见 test_mcp.py 打点用例）。

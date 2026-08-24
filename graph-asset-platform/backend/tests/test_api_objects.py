@@ -235,82 +235,16 @@ def test_list_objects_filter_by_ui_layer(tmp_data_dir, monkeypatch):
         assert "alpha@ConfigObject@DEMO_OBJ" in ids
 
 
-# ---------------- /md (batch) ----------------
+# ---------------- 旧 SKILL 两接口已删（MCP 服务化 2026-08-24） ----------------
+# POST /domains 与 POST /md 的能力由 MCP 工具 get_domains / get_md 继承
+# （语义测试见 test_mcp.py；版本解析矩阵见 test_e2e_versions.py）。
 
-def test_batch_md_multiple_latest_version(tmp_data_dir, monkeypatch):
-    """批量取多 id,不传 version → 各自最新版本 + 原始 md。"""
-    _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES, "b.md": CFG, "v2.md": CMD_V2})
-    with TestClient(app) as c:
-        r = c.post("/api/v1/md", json={
-            "ids": ["alpha@MMLCommand@ADD DEMO", "alpha@ConfigObject@DEMO_OBJ"],
-        }, headers=H)
-        assert r.status_code == 200
-        body = r.json()
-        # CMD 有 20.15.2+20.16.0,不传 version → 最新 20.16.0
-        cmd = body["alpha@MMLCommand@ADD DEMO"]
-        assert cmd["version"] == "20.16.0"
-        assert "ADD DEMO" in cmd["md"]
-        assert "DEMO_OBJ" in body["alpha@ConfigObject@DEMO_OBJ"]["md"]
-
-
-def test_batch_md_partial_failure(tmp_data_dir, monkeypatch):
-    """部分 id 不存在 → 不整体报错,失败 id 回带 error。"""
+def test_old_skill_endpoints_removed(tmp_data_dir, monkeypatch):
+    """旧两接口删除后 → 404/405（路由不存在；Agent 访问已迁移 MCP /mcp）。"""
     _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES})
     with TestClient(app) as c:
-        r = c.post("/api/v1/md", json={
-            "ids": ["alpha@MMLCommand@ADD DEMO", "alpha@MMLCommand@NOPE"],
-        }, headers=H)
-        assert r.status_code == 200
-        body = r.json()
-        assert "md" in body["alpha@MMLCommand@ADD DEMO"]
-        miss = body["alpha@MMLCommand@NOPE"]
-        assert miss["error"] == "对象不存在"
-        assert miss["available_versions"] == []
-
-
-def test_batch_md_version_mismatch_lists_available(tmp_data_dir, monkeypatch):
-    """指定版本不存在 → 该 id 计错并回带 available_versions(供 Agent 重试)。"""
-    _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES})  # 仅 20.15.2
-    with TestClient(app) as c:
-        r = c.post("/api/v1/md", json={
-            "ids": ["alpha@MMLCommand@ADD DEMO"], "version": "9.9.9",
-        }, headers=H)
-        assert r.status_code == 200
-        item = r.json()["alpha@MMLCommand@ADD DEMO"]
-        assert "error" in item
-        assert "20.15.2" in item["available_versions"]
-
-
-def test_batch_md_explicit_version(tmp_data_dir, monkeypatch):
-    """显式 version → 命中该版本实例(含该版本独有的边声明)。"""
-    _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES, "v2.md": CMD_V2})
-    with TestClient(app) as c:
-        r = c.post("/api/v1/md", json={
-            "ids": ["alpha@MMLCommand@ADD DEMO"], "version": "20.15.2",
-        }, headers=H)
-        item = r.json()["alpha@MMLCommand@ADD DEMO"]
-        assert item["version"] == "20.15.2"
-        assert "## 边" in item["md"]  # v1 才有边,v2 无
-
-
-def test_batch_md_dedup_ids(tmp_data_dir, monkeypatch):
-    """重复 id → 只算一次,结果一致。"""
-    _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES})
-    with TestClient(app) as c:
-        r = c.post("/api/v1/md", json={
-            "ids": ["alpha@MMLCommand@ADD DEMO", "alpha@MMLCommand@ADD DEMO"],
-        }, headers=H)
-        body = r.json()
-        assert len(body) == 1
-        assert "md" in body["alpha@MMLCommand@ADD DEMO"]
-
-
-def test_batch_md_empty_ids_rejected(tmp_data_dir, monkeypatch):
-    """空 ids → 422(Pydantic min_length=1)。"""
-    _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES})
-    with TestClient(app) as c:
-        r = c.post("/api/v1/md", json={"ids": []}, headers=H)
-        assert r.status_code == 422
+        assert c.post("/api/v1/md", json={"ids": ["x"]}, headers=H).status_code in (404, 405)
+        assert c.post("/api/v1/domains", headers=H).status_code in (404, 405)
 
 
 # ---------------- 业务层 scenario / type 过滤 ----------------
@@ -381,44 +315,3 @@ def test_stats_per_domain_scenario(tmp_data_dir, monkeypatch):
         assert s["per_domain_scenario"]["demo"]["demo-scenario"] == 2
         # 业务层计数 = 3
         assert s["per_layer"]["业务层"] == 3
-
-
-def test_domains_endpoint_returns_business_domain_md(tmp_data_dir, monkeypatch):
-    """/domains 一次性返全部 BusinessDomain 的 {id,name,md}（Agent 入口，只含 BD）。POST。"""
-    _setup(tmp_data_dir, monkeypatch, {"bd.md": _BD, "ns.md": _NS, "cs.md": _CS})
-    with TestClient(app) as c:
-        rows = c.post("/api/v1/domains", headers=H).json()
-        ids = {r["id"] for r in rows}
-        # 只含 BusinessDomain，不含 NS/CS
-        assert ids == {"BusinessDomain@demo"}
-        item = rows[0]
-        assert item["name"] is not None
-        assert "demo domain" in item["md"]  # 完整 md（含正文）
-
-
-def test_md_endpoint_records_telemetry(tmp_data_dir, monkeypatch, tmp_path):
-    """/md 调用 → 每个成功 id 追加一条对象级（level=object）打点到 telemetry 表。"""
-    _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES, "b.md": CFG})
-    with TestClient(app) as c:
-        c.post("/api/v1/md", json={"ids": ["alpha@MMLCommand@ADD DEMO", "alpha@ConfigObject@DEMO_OBJ"]}, headers=H)
-    import app.db as dbmod
-    objs = [dict(r) for r in dbmod.get_shared_db().execute(
-        "SELECT * FROM telemetry WHERE level='object'").fetchall()]
-    types = {o["obj_type"] for o in objs}
-    assert types == {"MMLCommand", "ConfigObject"}
-    assert all(o["endpoint"] == "/md" for o in objs)
-
-
-def test_domains_endpoint_records_telemetry(tmp_data_dir, monkeypatch, tmp_path):
-    """/domains 调用 → 每个域 id 追加一条对象级打点到 telemetry 表。"""
-    _setup(tmp_data_dir, monkeypatch, {"bd.md": _BD, "ns.md": _NS})
-    with TestClient(app) as c:
-        c.post("/api/v1/domains", headers=H)
-    import app.db as dbmod
-    objs = [dict(r) for r in dbmod.get_shared_db().execute(
-        "SELECT * FROM telemetry WHERE level='object'").fetchall()]
-    assert len(objs) == 1
-    rec = objs[0]
-    assert rec["obj_id"] == "BusinessDomain@demo"
-    assert rec["obj_type"] == "BusinessDomain"
-    assert rec["endpoint"] == "/domains"

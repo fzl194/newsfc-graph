@@ -173,7 +173,7 @@ cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 
 - 配置生成：[`三层图谱构建规范/skill/SKILL.md`](三层图谱构建规范/skill/SKILL.md)（`config-generation`）
 - 通用查询：[`三层图谱构建规范/graph-query-skill/SKILL.md`](三层图谱构建规范/graph-query-skill/SKILL.md)（`graph-query`）
-- Skill 沿对象 md 的 `[[ID]]` 引用，逐层 `POST /api/v1/md` 取，不全量加载。
+- Skill/Agent 沿对象 md 的 `[[ID]]` 引用，经平台 MCP 服务（`/mcp`，工具 `get_md` 等 5 个）逐层取，不全量加载——详见 [`graph-asset-platform/图谱平台接口文档.md`](graph-asset-platform/图谱平台接口文档.md)。
 
 ### 我想构建 / 补充图谱资产 → 跑 SOP
 
@@ -190,7 +190,7 @@ cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 - 🟡 Task 层 `CompoundTask` / `FeatureTask` 迁移中——**`_index.md` 复用库被 SKILL 反复引用但实际不存在**（Jaccard 复用判定"有规则无载体"），是当前主要卡点。
 - 🟡 业务层完备度低，仅 `apn-domain` + `business-awareness` 两域。
 - ⚠️ 若干**状态同步问题**：各层状态表里的"资产待迁入 / 迁移中"描述偏旧（实际已部分迁入，见上表实测数）；CHANGELOG 存在两个 `0.12.0`（版本号笔误）。
-- ⚠️ 平台 `/objects/{id}/neighbors` **只索引 `## 边` 段**，正文内联 `[[ID]]` 不进边索引（已知硬约束），完备查询需 `POST /md` 扫全文。
+- ⚠️ 平台 `/objects/{id}/neighbors` 与 MCP `get_object` **只索引 `## 边` 段**，正文内联 `[[ID]]` 不进边索引（已知硬约束），完备查询需 `get_md` 取全文扫描。
 
 ---
 
