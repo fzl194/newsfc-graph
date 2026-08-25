@@ -22,6 +22,10 @@ from ..users.service import check_perm
 _MAX_DESC = 2000
 _MAX_INSTRUCTIONS = 10000
 
+# 拿锁等待上限（2026-08-25）：挖掘增量索引/批量上传/启动对账持 import_lock
+# 可达分钟级（旧代码小时级）——UI 保存无限等只表现为转圈，限时失败给提示
+_LOCK_WAIT_SECONDS = 5.0
+
 router = APIRouter()
 
 
@@ -81,8 +85,14 @@ def patch_config(req: ConfigIn, request: Request):
     conn = get_shared_db()
     by = getattr(request.state, "user", "")
     # 多行写 + meta 写共一个事务，持共享写锁（与 fs/jobs 写路径同约定，审查修正）；
-    # 去首尾空白：纯空白描述/说明视同清空（回默认）
-    with import_lock:
+    # 去首尾空白：纯空白描述/说明视同清空（回默认）。
+    # 限时拿锁：批量任务（挖掘/上传/对账）持锁期间不无限等——超时 409 给提示
+    # （复现实测：并发上传 12s 持锁，旧写法 PATCH 被堵满全程 = 前端无限转圈）
+    if not import_lock.acquire(timeout=_LOCK_WAIT_SECONDS):
+        raise HTTPException(
+            status_code=409,
+            detail="图谱索引正被批量任务占用（挖掘/上传/启动对账），请稍后重试")
+    try:
         if req.tools:
             for t in req.tools:
                 mcp_tools_repo.upsert(conn, tool_name=t.name, enabled=t.enabled,
@@ -90,6 +100,8 @@ def patch_config(req: ConfigIn, request: Request):
         if req.instructions is not None:
             mcp_tools_repo.set_instructions(conn, req.instructions.strip())
         conn.commit()
+    finally:
+        import_lock.release()
     # commit 成功后才应用到内存（审查修正：防 DB 写失败时内存与 DB 漂移）
     if req.instructions is not None:
         mcp_server.apply_instructions(req.instructions.strip())

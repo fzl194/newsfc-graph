@@ -213,3 +213,35 @@ def test_patch_unknown_tool_rejected(tmp_data_dir, monkeypatch):
         assert "no_such_tool" in r.json()["detail"]
         # 无效请求不落库
         assert {t["name"] for t in _tools_list(c)} == ALL_TOOLS
+
+
+# ---------------- 批量任务持锁期间：限时失败而非无限等 ----------------
+
+def test_patch_timeout_409_when_lock_held(tmp_data_dir, monkeypatch):
+    """import_lock 被批量任务（挖掘/上传/对账）持有时，PATCH 限时失败 409——
+    不再无限转圈（复现实测：并发上传 12s 持锁，旧写法 PATCH 被堵满全程）。"""
+    import time as _time
+    import app.routers.mcp_tools as rt
+    from app.service import import_lock
+    monkeypatch.setattr(rt, "_LOCK_WAIT_SECONDS", 0.3)
+    _setup(tmp_data_dir, monkeypatch)
+    import threading
+    acquired = import_lock.acquire()
+    assert acquired
+    try:
+        with _client() as c:
+            t0 = _time.time()
+            r = _patch_cfg(c, {"instructions": "不应保存"})
+            dt = _time.time() - t0
+            assert r.status_code == 409
+            assert "批量任务" in r.json()["detail"]
+            assert dt < 5  # 限时返回（0.3s 等待 + 余量），不是分钟级干等
+        # 未落库
+        from app.repos import mcp_tools_repo
+        import app.db as dbmod
+        assert mcp_tools_repo.get_instructions(dbmod.get_shared_db()) == ""
+    finally:
+        import_lock.release()
+    # 锁释放后保存恢复正常
+    with _client() as c:
+        assert _patch_cfg(c, {"instructions": "锁释放后OK"}).status_code == 200
