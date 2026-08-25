@@ -312,6 +312,13 @@ onMounted(load)
   justify-content: space-between;
   gap: var(--space-4);
 }
+
+/* flex 子项禁止压缩：overflow:hidden 卡片被压扁会裁行且页面不出滚动条
+   （同 McpToolsView 修复，用户多时同样触发） */
+.page-head,
+.table-card {
+  flex-shrink: 0;
+}
 .page-title {
   font-family: var(--display);
   font-size: 26px;

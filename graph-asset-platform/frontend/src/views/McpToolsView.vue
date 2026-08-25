@@ -167,6 +167,14 @@ onMounted(load)
   justify-content: space-between;
   gap: var(--space-4);
 }
+
+/* flex 子项禁止压缩（否则 overflow:hidden 卡片被压扁裁行、页面永不出滚动条——
+   放大/高分屏下"只见 4/3 个工具"根因，2026-08-25 用户反馈） */
+.page-head,
+.table-card,
+.instructions-card {
+  flex-shrink: 0;
+}
 .page-title {
   font-family: var(--display);
   font-size: 26px;
