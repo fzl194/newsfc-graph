@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config, jobs
+from ..config import win_long as _win_long  # 超长路径（>260）fs 操作 helper
 from . import bundles
 from . import modes as modes_reg
 
@@ -120,12 +121,15 @@ def locate_candidates(export_root: Path, mode: "modes_reg.ModeDef", nf: str) -> 
     recommended 仅供前端默认选中——最终由用户从 candidates 改选（防猜错）。
     """
     root = export_root.resolve()
+    # 枚举/rel 一致用长前缀根：普通 rglob 对 >260 目录静默漏扫（定位候选缺失）；
+    # relative_to 要求两侧前缀一致，故 rel 也基于 root_long
+    root_long = _win_long(root)
     out: dict[str, dict] = {}
     nf_cf = nf.casefold()
     for role, kws in mode.keywords.items():
         kw_cfs = [k.casefold() for k in kws]
         hits: dict[Path, bool] = {}  # path -> strict?
-        for p in root.rglob("*"):
+        for p in root_long.rglob("*"):
             if not p.is_dir():
                 continue
             name_cf = p.name.casefold()
@@ -137,7 +141,7 @@ def locate_candidates(export_root: Path, mode: "modes_reg.ModeDef", nf: str) -> 
         cands = sorted(hits, key=lambda p: (len(p.parts), p.name))  # 浅层优先、短名优先
         stricts = [p for p in cands if hits[p]]
         recommended = stricts[0] if stricts else (cands[0] if len(cands) == 1 else None)
-        rel = lambda p: p.relative_to(root).as_posix()  # noqa: E731
+        rel = lambda p: p.relative_to(root_long).as_posix()  # noqa: E731
         note = ""
         if recommended is None and cands:
             note = f"发现 {len(cands)} 个候选目录，请人工选择"
@@ -167,7 +171,8 @@ def validate_selected_dirs(bundle_root: Path, selected: dict) -> dict:
             p = (root / rel).resolve()
             if p != root and root not in p.parents:
                 raise ValueError(f"目录越界: {role}={rel}")
-            if not p.is_dir():
+            # is_dir 用长前缀：>260 的深目录普通 is_dir 静默 False（误报不存在）
+            if not _win_long(p).is_dir():
                 raise ValueError(f"目录不存在: {role}={rel}")
             if p not in out[role]:
                 out[role].append(p)
@@ -227,7 +232,7 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
 
         tmp_out = bundles.tmp_bundle_dir(nf, version)
         if tmp_out.exists():
-            shutil.rmtree(tmp_out)
+            shutil.rmtree(str(_win_long(tmp_out)))
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         exp = _load_exporter()
@@ -254,7 +259,8 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
         finally:
             hwics_path.unlink(missing_ok=True)
 
-        md_count = sum(1 for _ in tmp_out.rglob("*.md"))
+        # 枚举根用长前缀：普通路径 rglob 对 >260 的 md 静默漏扫（统计偏小）
+        md_count = sum(1 for _ in _win_long(tmp_out).rglob("*.md"))
         step("转换 md", "done", f"md {md_count} 篇"
              + (f"；⚠ {len(convert_fail)} 篇转换失败（多为超长路径，详见警告）" if convert_fail else ""))
 
@@ -282,7 +288,7 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
         # 转换失败时清理半成品 tmp（正式包未动——原子替换语义）
         t = bundles.tmp_bundle_dir(nf, version)
         if t.exists():
-            shutil.rmtree(t, ignore_errors=True)
+            shutil.rmtree(str(_win_long(t)), ignore_errors=True)
 
 
 # ---------- 步骤② 图谱挖掘 ----------
@@ -332,7 +338,7 @@ def run_mine(job_id: str, nf: str, version: str, mode_id: str,
                 d = config.ASSETS_DIR / layer / nf / version
                 if d.exists():
                     removed += sum(1 for _ in d.rglob("*.md"))
-                    shutil.rmtree(d)
+                    shutil.rmtree(str(_win_long(d)))
             step("覆盖清理", "done", f"已清理旧资产 {removed} 个 md")
 
         counts: dict[str, int] = {}

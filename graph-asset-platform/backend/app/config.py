@@ -1,6 +1,27 @@
 import os
 from pathlib import Path
 
+
+def win_long(path: Path) -> Path:
+    """Windows 上把绝对路径转为 ``\\\\?\\`` 前缀形式，突破 MAX_PATH(260) 限制。
+
+    供**纯文件系统调用**（mkdir/write/copy2/move/rmtree/**枚举 rglob/walk**——
+    普通路径对 >260 条目不报错而是静默漏扫）使用；返回值勿用于相对路径计算
+    或链接映射（``os.path.relpath`` 对 ``\\\\?\\`` 前缀会算错）。
+    非 Windows 或已是 ``\\\\?\\`` 前缀时原样返回；UNC（``\\\\server\\share``）
+    转 ``\\\\?\\UNC\\server\\share`` 形式（直接拼 ``\\\\?\\`` 是非法路径）。
+    """
+    if os.name != "nt":
+        return path
+    s = str(path)
+    if s.startswith("\\\\?\\"):
+        return path
+    p = os.path.abspath(s)
+    if p.startswith("\\\\"):  # UNC 网络路径（GAP_DATA_DIR 挂网络盘场景）
+        return Path("\\\\?\\UNC\\" + p[2:])
+    return Path("\\\\?\\" + p)
+
+
 # 资产库根（可用 GAP_DATA_DIR 环境变量覆盖，e2e/多实例部署用）。默认 ./platform-data
 DATA_DIR = Path(os.environ.get("GAP_DATA_DIR",
                                str(Path(__file__).resolve().parents[2] / "platform-data")))

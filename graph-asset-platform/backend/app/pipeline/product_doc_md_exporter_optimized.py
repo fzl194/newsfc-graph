@@ -22,6 +22,15 @@ REMOVE_MARKERS = (
     "breadcrumb", "toolbar", "navbtn", "footer", "headernav", "topnav",
 )
 
+# CHM 工程文件（.hhc, Sitemap 1.0）解析：用于无 navi.xml 时替代目录树。
+# 注意：华为 hhc 的 <param> 标签不自闭合（">" 直接接下一个 param），正则需兼容 /> 与 >。
+_HHC_OBJ = re.compile(
+    r'<param\s+name="Name"\s+value="([^"]*)"\s*/?\s*>\s*<param\s+name="Local"\s+value="([^"]*)"',
+    re.I,
+)
+_HHC_UL_OPEN = re.compile(r"<UL\b", re.I)
+_HHC_UL_CLOSE = re.compile(r"</UL\b", re.I)
+
 
 @dataclass
 class TopicRecord:
@@ -41,6 +50,32 @@ class TopicRecord:
 # =========================
 # 通用工具函数
 # =========================
+def _win_long(path: Path) -> Path:
+    """Windows 上把绝对路径转为 ``\\\\?\\`` 前缀形式，突破 MAX_PATH(260) 限制。
+
+    失败页根因：产品文档深层章节 + 图片资产（``<md>.assets/`` 子目录）叠加后路径
+    超过 260 字符，LongPathsEnabled=0 时 ``mkdir``/``write``/``copy2`` 抛
+    [WinError 3] 系统找不到指定的路径。加 ``\\\\?\\`` 前缀后文件系统调用不再受
+    260 限制。
+
+    注意：仅供**文件系统调用**与**枚举**（rglob——普通路径对 >260 条目静默漏扫）
+    使用；返回值不要用于相对路径计算 / md 链接映射（``os.path.relpath`` 等对
+    ``\\\\?\\`` 前缀会算错）。UNC（``\\\\server\\share``）转 ``\\\\?\\UNC\\`` 形式。
+
+    与 ``config.win_long`` 同逻辑（本模块经 runner 按文件路径独立加载，不能用
+    包相对导入，故内联；改动时两处同步）。
+    """
+    if os.name != "nt":
+        return path
+    s = str(path)
+    if s.startswith("\\\\?\\"):
+        return path
+    p = os.path.abspath(s)
+    if p.startswith("\\\\"):  # UNC 网络路径
+        return Path("\\\\?\\UNC\\" + p[2:])
+    return Path("\\\\?\\" + p)
+
+
 def read_text_auto(file_path: str) -> str:
     """自适应解码（v0.24.0 重写：确定性判据优先，chardet 降为兜底）。
 
@@ -54,7 +89,7 @@ def read_text_auto(file_path: str) -> str:
       ⑤ 序贯严格解码（gb18030 超集先于 gbk）
       ⑥ errors="ignore" 最后兜底
     """
-    raw = Path(file_path).read_bytes()
+    raw = _win_long(Path(file_path)).read_bytes()
 
     # ① BOM
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -170,8 +205,9 @@ class HtmlToMarkdownConverter:
             html_abs_to_md_abs=html_abs_to_md_abs,
         )
         md_path = Path(md_file)
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        md_path.write_text(markdown, encoding="utf-8")
+        md_path_long = _win_long(md_path)
+        md_path_long.parent.mkdir(parents=True, exist_ok=True)
+        md_path_long.write_text(markdown, encoding="utf-8")
 
     def convert_html_string(
         self,
@@ -1002,19 +1038,22 @@ class HtmlToMarkdownConverter:
         if src_key in self._copied_assets:
             return Path(self._copied_assets[src_key])
 
-        self._page_assets_dir.mkdir(parents=True, exist_ok=True)
+        assets_dir = _win_long(self._page_assets_dir)
+        assets_dir.mkdir(parents=True, exist_ok=True)
         target = self._page_assets_dir / safe_filename(src_path.name, max_len=80)
-        if target.exists() and not self._same_file(src_path, target):
+        target_long = _win_long(target)
+        if target_long.exists() and not self._same_file(src_path, target_long):
             stem, suffix, idx = target.stem, target.suffix, 2
             while True:
                 candidate = self._page_assets_dir / f"{stem}_{idx}{suffix}"
-                if not candidate.exists():
+                if not _win_long(candidate).exists():
                     target = candidate
+                    target_long = _win_long(candidate)
                     break
                 idx += 1
 
-        if not target.exists() or not self._same_file(src_path, target):
-            shutil.copy2(src_path, target)
+        if not target_long.exists() or not self._same_file(src_path, target_long):
+            shutil.copy2(src_path, target_long)
         self._copied_assets[src_key] = str(target)
         return target
 
@@ -1053,7 +1092,7 @@ class ProductDocMarkdownExporter:
         self._children_by_id: Dict[str, List[str]] = {}
 
     def export_all(self) -> List[TopicRecord]:
-        root = self._parse_navi_xml()
+        root = self._parse_catalog_root()
         self._records = self._collect_topic_records(root)
         self._html_abs_to_md_abs = {
             r.html_abs_path: str((self.output_root / r.md_rel_path).resolve())
@@ -1066,6 +1105,25 @@ class ProductDocMarkdownExporter:
         )
         return self._records
 
+    def _parse_catalog_root(self) -> ET.Element:
+        """解析目录树根节点：优先 navi.xml，缺失时回退到 CHM 工程文件 .hhc。
+
+        返回与 navi.xml 同构的 <topics> 树（topic 元素含 txt/url 属性），
+        下游 collect/walk/mapping 逻辑与 navi.xml 路径完全一致。
+        """
+        if self.navi_xml_path.exists():
+            return self._parse_navi_xml()
+        hhc_files = sorted(self.resources_root.glob("*.hhc"))
+        if hhc_files:
+            hhc_path = hhc_files[0]
+            self.log_message(
+                f"navi.xml 不存在，回退使用 CHM 目录树: {hhc_path.relative_to(self.resources_root)}"
+            )
+            return self._parse_hhc_to_topics(hhc_path)
+        raise FileNotFoundError(
+            f"目录树文件缺失：resources 下既无 navi.xml 也无 *.hhc ({self.resources_root})"
+        )
+
     def _parse_navi_xml(self) -> ET.Element:
         if not self.navi_xml_path.exists():
             raise FileNotFoundError(f"navi.xml 不存在: {self.navi_xml_path}")
@@ -1075,6 +1133,61 @@ class ProductDocMarkdownExporter:
         root = ET.fromstring(content)
         if root.tag != "topics":
             self.log_message(f"警告：XML 根节点不是 topics，而是 {root.tag}")
+        return root
+
+    def _parse_hhc_to_topics(self, hhc_path: Path) -> ET.Element:
+        """把 CHM Sitemap 1.0（GBK）目录树转成与 navi.xml 同构的 <topics> 树。
+
+        .hhc 中 <UL> 嵌套即目录层级（与 navi.xml 的 topic 嵌套等价，深度基准差 1，
+        这里统一为 navi 的 0-based：根 <UL> 下第一层 = depth 0）。
+        标题为 hhc Name 属性，链接为 Local 属性（相对 resources 根）。
+        hhc 无显式 topic id：用「父 id + Local + Name」生成稳定唯一 id，
+        避免两个目录位置（父标题相同但 url 不同）下的叶子伪 id 碰撞。
+        """
+        text = read_text_auto(str(hhc_path))
+        root = ET.Element("topics")
+        # stack[k] = (depth (k-1) 的最近 topic, 其 id, 其下已见 local 集合)
+        # stack[0] = (root, "", set())
+        stack: List[Tuple[ET.Element, str, set]] = [(root, "", set())]
+        pos = 0
+        depth = 0
+        count = 0
+        skipped = 0
+        for m in _HHC_OBJ.finditer(text):
+            name = m.group(1).strip()
+            local = m.group(2).strip()
+            span = text[pos:m.start()]
+            depth += len(_HHC_UL_OPEN.findall(span)) - len(_HHC_UL_CLOSE.findall(span))
+            # hhc depth 1-based -> navi 0-based（根 UL 层的第一个 obj 是 depth 0）
+            navi_depth = max(depth - 1, 0)
+            # 保持 stack 恰好容纳 navi_depth+1 层：stack[navi_depth] = 父
+            while len(stack) > navi_depth + 1:
+                stack.pop()
+            parent_el, parent_id, parent_seen = (
+                stack[navi_depth] if len(stack) >= navi_depth + 1 else (root, "", set())
+            )
+            # 同一父下同名同链接的重复条目（源数据质量问题）：保留首个
+            if local and (local, name) in parent_seen:
+                skipped += 1
+                pos = m.end()
+                continue
+            if local:
+                parent_seen.add((local, name))
+            node_id = hashlib.md5(f"{parent_id}|{local}|{name}".encode("utf-8")).hexdigest()[:16]
+            el = ET.SubElement(parent_el, "topic")
+            el.set("id", node_id)
+            el.set("txt", name)
+            if local:
+                el.set("url", local)
+            # 新 topic 成为该层最近节点；若后续出现更深的 obj，其父即此节点
+            del stack[navi_depth + 1:]
+            stack.append((el, node_id, set()))
+            pos = m.end()
+            count += 1
+        if skipped:
+            self.log_message(f"hhc 目录树解析完成: {count} 个 topic（忽略同父重复条目 {skipped} 个）")
+        else:
+            self.log_message(f"hhc 目录树解析完成: {count} 个 topic")
         return root
 
     def _collect_topic_records(self, root: ET.Element) -> List[TopicRecord]:
@@ -1166,7 +1279,8 @@ class ProductDocMarkdownExporter:
     def _convert_all_records(self, records: Iterable[TopicRecord]) -> None:
         for rec in records:
             output_path = self.output_root / rec.md_rel_path
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path_long = _win_long(output_path)
+            output_path_long.parent.mkdir(parents=True, exist_ok=True)
             try:
                 if rec.file_type == "pdf":
                     self._handle_pdf_record(rec, output_path)
@@ -1182,7 +1296,7 @@ class ProductDocMarkdownExporter:
                     html_abs_to_md_abs=self._html_abs_to_md_abs,
                 )
                 if meaningful:
-                    output_path.write_text(markdown, encoding="utf-8")
+                    output_path_long.write_text(markdown, encoding="utf-8")
                     rec.mode = "html"
             except Exception as exc:
                 self.log_message(f"转换失败: {rec.html_abs_path or rec.url} -> {output_path} | {exc}")
@@ -1190,14 +1304,17 @@ class ProductDocMarkdownExporter:
         self._cleanup_empty_asset_dirs()
 
     def _handle_pdf_record(self, rec: TopicRecord, output_path: Path) -> None:
-        if rec.exists and rec.html_abs_path and Path(rec.html_abs_path).exists():
-            shutil.copy2(Path(rec.html_abs_path), output_path)
+        # 长路径：输出侧必包（深章节 pdf 同样可 >260）；输入侧包上无害
+        if rec.exists and rec.html_abs_path and _win_long(Path(rec.html_abs_path)).exists():
+            shutil.copy2(_win_long(Path(rec.html_abs_path)), _win_long(output_path))
             rec.mode = "pdf"
         else:
             rec.mode = "stub"
 
     def _cleanup_empty_asset_dirs(self) -> None:
-        for assets_dir in sorted(self.output_root.rglob("*.assets"), key=lambda p: len(p.parts), reverse=True):
+        # 枚举根须用长前缀：普通路径 rglob 对 >260 目录静默漏扫（空目录清不掉）
+        root_long = _win_long(self.output_root)
+        for assets_dir in sorted(root_long.rglob("*.assets"), key=lambda p: len(p.parts), reverse=True):
             if not assets_dir.is_dir():
                 continue
             try:
@@ -1270,7 +1387,7 @@ def extract_hdx_file(hdx_path: str) -> str:
         print("检测到文档文件已更新，重新解压...")
 
     if os.path.exists(extract_dir):
-        shutil.rmtree(extract_dir)
+        shutil.rmtree(_win_long(Path(extract_dir)))
     os.makedirs(extract_dir, exist_ok=True)
 
     try:
@@ -1331,7 +1448,7 @@ def main2(input_dir: str, output_dir: Optional[str] = None) -> None:
         try:
             rel_path = html_path.relative_to(src_root)
             md_path = (dst_root / rel_path).with_suffix(".md")
-            md_path.parent.mkdir(parents=True, exist_ok=True)
+            _win_long(md_path).parent.mkdir(parents=True, exist_ok=True)
             converter.convert_file(
                 html_file=str(html_path),
                 md_file=str(md_path),

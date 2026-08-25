@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from .. import config
+from ..config import win_long as _win_long  # 超长路径（>260）fs 操作 helper
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$")
 
@@ -131,12 +132,12 @@ def atomic_replace(nf: str, version: str, tmp_dir: Path) -> Path:
         trash = config.DATA_DIR / ".trash"
         trash.mkdir(parents=True, exist_ok=True)
         old_backup = trash / f"bundle_{nf}_{version}_{time.strftime('%Y%m%d%H%M%S')}"
-        shutil.move(str(formal), str(old_backup))
+        shutil.move(str(_win_long(formal)), str(_win_long(old_backup)))
     try:
-        shutil.move(str(tmp_dir), str(formal))
+        shutil.move(str(_win_long(tmp_dir)), str(_win_long(formal)))
     except Exception:
         if old_backup is not None and not formal.exists():
-            shutil.move(str(old_backup), str(formal))  # 回滚
+            shutil.move(str(_win_long(old_backup)), str(_win_long(formal)))  # 回滚
         raise
     return formal
 
@@ -152,9 +153,9 @@ def sweep_orphan_tmp() -> int:
         for p in root.glob(pat):
             try:
                 if p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
+                    shutil.rmtree(str(_win_long(p)), ignore_errors=True)
                 else:
-                    p.unlink(missing_ok=True)
+                    _win_long(p).unlink(missing_ok=True)
                 n += 1
             except OSError:
                 pass
