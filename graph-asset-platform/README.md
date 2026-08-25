@@ -65,6 +65,9 @@ cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 - Swagger：http://localhost:8000/docs
 - API 根：http://localhost:8000/api/v1
 
+**Agent 接入（MCP）**：端点 `http://<host>:8000/mcp`（`X-API-Key` 鉴权，5 个查询工具）。
+完整配置见 [docs/MCP配置指南.md](docs/MCP配置指南.md)，工具明细见 [图谱平台接口文档.md](图谱平台接口文档.md)。
+
 ### 一次性环境准备
 
 后端依赖（首次）：
