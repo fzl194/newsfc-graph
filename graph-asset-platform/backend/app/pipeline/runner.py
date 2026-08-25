@@ -237,27 +237,33 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
 
         exp = _load_exporter()
         convert_fail: list = []
+        # 手管临时目录（不用 TemporaryDirectory）：其 __exit__ 用**普通路径**
+        # rmtree——>260 的解压产物（长前缀解压写的）删不掉 → rmdir 报
+        # WinError 145「目录不是空的」，把已成功的解压任务标失败（2026-08-25
+        # 内网现场）。清理必须走长前缀；ignore_errors 兜底，极端残留由启动
+        # sweep_orphan_tmp（同为长前缀版）再扫。
+        td = tempfile.mkdtemp(prefix=".pdoc_", dir=str(config.DATA_DIR))
         try:
-            with tempfile.TemporaryDirectory(prefix=".pdoc_", dir=str(config.DATA_DIR)) as td:
-                up = Path(td) / hwics_path.name
-                shutil.move(str(hwics_path), str(up))
-                extracted = exp.extract_hdx_file(str(up))  # html 解到 td 内 → 随 td 删除
-                # D14：版本一致性（抽目录名版本 vs 表单；不一致即阻断，防止版本分裂）
-                hint = _extract_version_hint(Path(extracted))
-                if hint and hint != version:
-                    raise ValueError(
-                        f"归档版本为 {hint}，与填写的 {version} 不符——请用版本 {hint} 重新上传")
-                step("解压导出", "done", f"html 就绪（版本识别 {hint or '未识别'}）")
-                step("转换 md")
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):  # 捕获 exporter 逐文件失败行（长路径等）
-                    exp.main_from_extracted(extracted, str(tmp_out))
-                convert_fail = [ln for ln in buf.getvalue().splitlines()
-                                if ln.startswith("转换失败")][:20]
-                warnings.extend(convert_fail)
-                jobs.update_job(job_id, warnings=list(warnings))
+            up = Path(td) / hwics_path.name
+            shutil.move(str(hwics_path), str(up))
+            extracted = exp.extract_hdx_file(str(up))  # html 解到 td 内 → 随 td 删除
+            # D14：版本一致性（抽目录名版本 vs 表单；不一致即阻断，防止版本分裂）
+            hint = _extract_version_hint(Path(extracted))
+            if hint and hint != version:
+                raise ValueError(
+                    f"归档版本为 {hint}，与填写的 {version} 不符——请用版本 {hint} 重新上传")
+            step("解压导出", "done", f"html 就绪（版本识别 {hint or '未识别'}）")
+            step("转换 md")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):  # 捕获 exporter 逐文件失败行（长路径等）
+                exp.main_from_extracted(extracted, str(tmp_out))
+            convert_fail = [ln for ln in buf.getvalue().splitlines()
+                            if ln.startswith("转换失败")][:20]
+            warnings.extend(convert_fail)
+            jobs.update_job(job_id, warnings=list(warnings))
         finally:
             hwics_path.unlink(missing_ok=True)
+            shutil.rmtree(str(_win_long(Path(td))), ignore_errors=True)
 
         # 枚举根用长前缀：普通路径 rglob 对 >260 的 md 静默漏扫（统计偏小）
         md_count = sum(1 for _ in _win_long(tmp_out).rglob("*.md"))

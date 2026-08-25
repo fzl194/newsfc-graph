@@ -125,6 +125,30 @@ def test_extract_sanitizes_zip_slip(tmp_path):
         shutil.rmtree(extracted, ignore_errors=True)
 
 
+# ---------- 临时目录清理（run_extract 手管 mkdtemp，2026-08-25 WinError 145 回归） ----------
+
+def test_tmp_dir_cleanup_removes_deep_children(tmp_path):
+    """临时目录含 >260 解压产物：长前缀 rmtree 必须清干净。
+
+    现场：TemporaryDirectory.__exit__ 普通路径 rmtree——>260 文件删不掉，
+    rmdir 报 WinError 145「目录不是空的」，已成功的解压任务被标失败。
+    修复：run_extract 手管 mkdtemp + finally rmtree(_win_long(td))。
+    """
+    import shutil
+    import tempfile
+    td = tempfile.mkdtemp(prefix=".pdoc_", dir=str(tmp_path))
+    deep = Path(td) / ("a" * 90) / ("b" * 90) / ("c" * 90)
+    win_long(deep).mkdir(parents=True)
+    f = deep / ("UDG_" + "x" * 90 + "_CH_0000002282477504.zip")
+    win_long(f).write_bytes(b"Z")
+    if os.name == "nt":
+        assert len(str(f)) > 260
+    # 修复后的清理方式（run_extract finally 同款）
+    shutil.rmtree(str(win_long(Path(td))), ignore_errors=True)
+    assert not win_long(Path(td)).exists()
+    assert not Path(td).exists()
+
+
 # ---------- 深路径真实行为（回归：静默漏扫 vs 长前缀命中） ----------
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 长路径语义")
