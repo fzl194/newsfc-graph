@@ -4,6 +4,10 @@
 ——调用方从 ``objects_repo.delete_by_source`` 拿到旧集合后调 ``delete_many``，
 不留"幽灵命中"。
 
+删除走 ``md_fts_map`` 伴生映射按 rowid 删（v7，2026-08-25）：按 UNINDEXED 列
+DELETE 是全 FTS 扫（含全部正文页），批量 reindex 每文件一扫成 O(N²) 主因；
+map 缺失（存量/直写行）回退全扫删保正确。
+
 查询转义（对抗审查 C2）：FTS5 MATCH 有自身语法（AND/OR/NEAR/*/-/引号，含空格的
 查询如 ``ADD URR`` 会语法错误）——统一包装为短语查询（内层引号翻倍）。
 
@@ -24,33 +28,51 @@ def escape_phrase(q: str) -> str:
 def upsert(conn: sqlite3.Connection, *, obj_id: str, version, body: str) -> None:
     version = "" if version is None else version
     delete(conn, obj_id, version)
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO md_fts(obj_id, version, body) VALUES(?,?,?)",
         (obj_id, version, body),
+    )
+    # 伴生映射（v7）：下次 delete 走 rowid（O(log n)）而非 UNINDEXED 全扫
+    conn.execute(
+        "INSERT OR REPLACE INTO md_fts_map(obj_id, version, fts_rowid) VALUES(?,?,?)",
+        (obj_id, version, cur.lastrowid),
     )
 
 
 def delete(conn: sqlite3.Connection, obj_id: str, version) -> None:
+    """按 (obj_id,version) 删一行：map 命中走 rowid；缺失（存量/直写行）回退
+    UNINDEXED 全扫删——正确性网底，慢但准。"""
+    version = "" if version is None else version
+    rid = conn.execute(
+        "SELECT fts_rowid FROM md_fts_map WHERE obj_id=? AND version=?",
+        (obj_id, version),
+    ).fetchone()
+    if rid is not None:
+        conn.execute("DELETE FROM md_fts WHERE rowid=?", (rid[0],))
+        conn.execute(
+            "DELETE FROM md_fts_map WHERE obj_id=? AND version=?", (obj_id, version))
+        return
     conn.execute(
-        "DELETE FROM md_fts WHERE obj_id=? AND version=?",
-        (obj_id, "" if version is None else version),
-    )
+        "DELETE FROM md_fts WHERE obj_id=? AND version=?", (obj_id, version))
 
 
 def delete_many(conn: sqlite3.Connection, pairs: list) -> None:
-    """批量删（旧 (id,version) 集合；单条 delete 走 UNINDEXED 列过滤）。"""
-    conn.executemany(
-        "DELETE FROM md_fts WHERE obj_id=? AND version=?",
-        [(oid, "" if over is None else over) for oid, over in pairs],
-    )
+    """批量删（旧 (id,version) 集合；逐条走 delete 的 map 快路径）。"""
+    for oid, over in pairs:
+        delete(conn, oid, over)
 
 
 def rebuild_from_objects(conn: sqlite3.Connection) -> int:
-    """全量重建：清空后从 objects 表灌入（单事务，原子替换）。返回行数。"""
+    """全量重建：清空后从 objects 表灌入（单事务，原子替换）+ 重灌 map。返回行数。"""
     conn.execute("DELETE FROM md_fts")
+    conn.execute("DELETE FROM md_fts_map")
     cur = conn.execute(
         "INSERT INTO md_fts(obj_id, version, body) "
         "SELECT id, version, body_md FROM objects"
+    )
+    conn.execute(
+        "INSERT INTO md_fts_map(obj_id, version, fts_rowid) "
+        "SELECT obj_id, version, rowid FROM md_fts"
     )
     return cur.rowcount or 0
 

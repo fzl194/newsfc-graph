@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS objects(
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_objects_nf ON objects(nf);
 CREATE INDEX IF NOT EXISTS idx_objects_type ON objects(type);
+-- source_path 索引（v7，2026-08-25）：reindex_path 每文件 delete_by_source 原为
+-- 全表扫（连带 body_md/raw_md 正文页）——批量增量索引 O(N²) 的主因之一
+CREATE INDEX IF NOT EXISTS idx_objects_source ON objects(source_path);
 
 CREATE TABLE IF NOT EXISTS edges(
   from_id TEXT, from_version TEXT, relation TEXT, "to" TEXT,
@@ -71,6 +74,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS md_fts USING fts5(
   tokenize='trigram'
 );
 
+-- md_fts 伴生映射（v7，2026-08-25）：(obj_id,version)→fts rowid。按 UNINDEXED 列
+-- DELETE 是全 FTS 扫（含全部正文页）——批量 reindex 每文件一扫成 O(N²) 主因；
+-- 改按 rowid 删。fts_repo 维护；init_schema 对存量行一次性回填（map 空且 fts
+-- 非空时）。map 缺失时 fts_repo 回退全扫删（正确性网底）。
+CREATE TABLE IF NOT EXISTS md_fts_map(
+  obj_id TEXT NOT NULL, version TEXT NOT NULL, fts_rowid INTEGER NOT NULL,
+  PRIMARY KEY(obj_id, version)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS test_cases(
   id TEXT PRIMARY KEY, domain TEXT, scenario TEXT, name TEXT,
   status TEXT, solution TEXT, author TEXT, created_at TEXT,
@@ -115,10 +127,17 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_owner ON test_artifacts(owner_type, own
 
 
 def get_db(path: Path = None) -> sqlite3.Connection:
-    """打开/创建 SQLite 连接（WAL + foreign_keys + Row 工厂）。"""
+    """打开/创建 SQLite 连接（WAL + NORMAL + foreign_keys + Row 工厂）。
+
+    synchronous=NORMAL（WAL 下）：commit 不再逐条 fsync（reindex 逐文件 commit 曾
+    因此每小时多花几十秒）。代价仅 OS 崩溃/断电丢最近提交——图谱索引可由 md
+    全量重建（mtime 对账/全量重建兜底），users/trash/jobs 等元数据丢最后一笔
+    可接受；应用崩溃不丢（WAL 特性）。
+    """
     conn = sqlite3.connect(str(path or DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -153,6 +172,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO md_fts(obj_id, version, body) "
                 "SELECT id, version, body_md FROM objects"
+            )
+    # v7 迁移：md_fts_map 存量回填（一次性——仅 map 空且 fts 非空；此后由
+    # fts_repo 维护）。单遍扫描，老库首启多花秒级。
+    if conn.execute("SELECT COUNT(*) FROM md_fts_map").fetchone()[0] == 0:
+        n = conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0]
+        if n:
+            conn.execute(
+                "INSERT INTO md_fts_map(obj_id, version, fts_rowid) "
+                "SELECT obj_id, version, rowid FROM md_fts"
             )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",

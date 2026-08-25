@@ -79,6 +79,7 @@ def _db() -> sqlite3.Connection:
         _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")  # 与 db.get_db 同策略（WAL 免逐条 fsync）
         _conn.execute("PRAGMA busy_timeout=5000")
         _conn.executescript(_TABLE_SQL)
         _conn.commit()
