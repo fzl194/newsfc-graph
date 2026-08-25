@@ -27,18 +27,15 @@
             <el-switch v-model="row.enabled" @change="markDirty" />
           </template>
         </el-table-column>
-        <el-table-column label="描述（Agent 在 tools/list 看到的说明）" min-width="480">
+        <el-table-column label="描述（Agent 在 tools/list 看到的说明；清空恢复默认）" min-width="480">
           <template #default="{ row }">
             <el-input
               v-model="row.description"
               type="textarea"
-              :rows="3"
+              :autosize="{ minRows: 2, maxRows: 8 }"
               placeholder="留空使用默认描述"
               @input="markDirty"
             />
-            <div class="default-desc" :title="row.default_description">
-              默认：{{ row.default_description }}
-            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -49,7 +46,7 @@
         <div>
           <div class="card-title">服务总体说明（instructions）</div>
           <div class="card-sub">
-            Agent 建立连接时收到的服务说明（推荐查询路径等）。留空使用默认。
+            Agent 建立连接时收到的服务说明（推荐查询路径等）。输入框已预填默认值，清空恢复默认。
           </div>
         </div>
         <el-button link size="small" @click="resetInstructions">恢复默认说明</el-button>
@@ -57,13 +54,10 @@
       <el-input
         v-model="instructions"
         type="textarea"
-        :rows="6"
+        :autosize="{ minRows: 3, maxRows: 12 }"
         placeholder="留空使用默认说明"
         @input="markDirty"
       />
-      <div class="default-desc" :title="defaultInstructions">
-        默认：{{ defaultInstructions }}
-      </div>
     </div>
   </div>
 </template>
@@ -96,8 +90,13 @@ function markDirty(): void {
 
 // 恢复默认说明也是一次变更（审查修正：漏 markDirty 会卡死保存按钮）
 function resetInstructions(): void {
-  instructions.value = ''
+  instructions.value = defaultInstructions.value
   markDirty()
+}
+
+// 展示值 ↔ 存储值：空存储预填默认进输入框；保存时与默认相同则存空（代码默认升级仍能透出）
+function displayDesc(t: McpToolRow): string {
+  return t.description || t.default_description
 }
 
 async function load(): Promise<void> {
@@ -105,7 +104,10 @@ async function load(): Promise<void> {
   try {
     const cfg = await listMcpTools()
     tools.value = cfg.tools
-    instructions.value = cfg.instructions
+    tools.value.forEach((t) => {
+      t.description = displayDesc(t)
+    })
+    instructions.value = cfg.instructions || cfg.default_instructions
     defaultInstructions.value = cfg.default_instructions
     baseline = snapshot.value
     dirty.value = false
@@ -123,12 +125,15 @@ async function save(): Promise<void> {
       tools: tools.value.map((t) => ({
         name: t.name,
         enabled: t.enabled,
-        description: t.description,
+        description: t.description === t.default_description ? '' : t.description,
       })),
-      instructions: instructions.value,
+      instructions: instructions.value === defaultInstructions.value ? '' : instructions.value,
     })
     tools.value = cfg.tools
-    instructions.value = cfg.instructions
+    tools.value.forEach((t) => {
+      t.description = displayDesc(t)
+    })
+    instructions.value = cfg.instructions || cfg.default_instructions
     defaultInstructions.value = cfg.default_instructions
     baseline = snapshot.value
     dirty.value = false
@@ -208,16 +213,6 @@ onMounted(load)
   border: 1px solid rgba(220, 38, 38, 0.2);
   border-radius: 999px;
   padding: 1px 7px;
-}
-
-/* 默认描述小字（截断 + title 悬停看全） */
-.default-desc {
-  margin-top: 4px;
-  font-size: 11px;
-  color: var(--text-faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 /* 总体说明卡片 */
