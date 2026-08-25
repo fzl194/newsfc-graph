@@ -39,8 +39,9 @@ def _seed(db, rows):
 
 def test_record_object_inserts_to_db(tmp_path, monkeypatch):
     db = _use_tmp_telemetry(tmp_path, monkeypatch)
-    from app.telemetry.recorder import record
+    from app.telemetry.recorder import record, flush
     record("/md", "F@1", "Feature", user="sa", caller="skill", level="object")
+    assert flush()  # 异步写线程落库（v3 队列化）
     rows = db.execute("SELECT * FROM telemetry WHERE level='object'").fetchall()
     assert len(rows) == 1
     assert rows[0]["obj_id"] == "F@1" and rows[0]["caller"] == "skill"
@@ -48,21 +49,24 @@ def test_record_object_inserts_to_db(tmp_path, monkeypatch):
 
 def test_record_request_inserts_to_db(tmp_path, monkeypatch):
     db = _use_tmp_telemetry(tmp_path, monkeypatch)
-    from app.telemetry.recorder import record
+    from app.telemetry.recorder import record, flush
     record("/api/v1/objects/F@1/md", user="fe", caller="web", level="request")
+    assert flush()
     rows = db.execute("SELECT * FROM telemetry WHERE level='request'").fetchall()
     assert len(rows) == 1
 
 
 def test_record_swallows_failure(tmp_path, monkeypatch):
-    _use_tmp_telemetry(tmp_path, monkeypatch)
-    # monkeypatch insert 抛，确认 record 吞异常不抛
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    # monkeypatch insert 抛：入队不抛 + 写线程丢批不抛不重试
     from app.repos import telemetry_repo
     def _boom(*a, **kw):
         raise RuntimeError("boom")
     monkeypatch.setattr(telemetry_repo, "insert", _boom)
-    from app.telemetry.recorder import record
-    record("/md", "x", "y", user="u", caller="c", level="object")  # 不抛即通过
+    from app.telemetry.recorder import record, flush
+    record("/md", "x", "y", user="u", caller="c", level="object")  # 入队不抛
+    assert flush()  # 写线程丢批完成（pending 归零）
+    assert db.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0] == 0  # 整批丢弃
 
 
 # ---------- aggregator ----------

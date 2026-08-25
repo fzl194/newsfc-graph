@@ -81,6 +81,8 @@ def test_reindex_survives_concurrent_telemetry(tmp_data_dir, monkeypatch):
         t.join(timeout=5)
 
     assert ix["indexed"] == 40 and ix["removed"] == 0
+    # 打点异步落库（v3 队列化）→ flush 后再断言
+    assert tel_recorder.flush(timeout=10)
     # 索引完整（对象/FTS 对账）+ 打点行落库且经共享连接可见
     assert s.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 40
     from app.repos import fts_repo

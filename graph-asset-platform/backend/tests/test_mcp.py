@@ -149,6 +149,8 @@ def test_get_domains_returns_md(tmp_data_dir, monkeypatch):
         out = _call(c, "get_domains", dict(_CTX))
     assert [d["id"] for d in out["domains"]] == ["BusinessDomain@business-awareness"]
     assert "业务感知" in out["domains"][0]["md"]
+    from app.telemetry.recorder import flush as _tel_flush
+    assert _tel_flush()  # 打点异步落库（v3 队列化）
     rows = [dict(r) for r in s.db.execute(
         "SELECT * FROM telemetry WHERE level='object'").fetchall()]
     assert len(rows) == 1
@@ -231,6 +233,8 @@ def test_telemetry_three_levels_and_stats(tmp_data_dir, monkeypatch):
     with _client() as c:
         _call(c, "get_md", {**_CTX, "ids": ["UDG@MMLCommand@ADD URR"]})
         _call(c, "search_md", {**_CTX, "q": "计费"}, sid=2)
+    from app.telemetry.recorder import flush as _tel_flush
+    assert _tel_flush()
     rows = [dict(r) for r in s.db.execute(
         "SELECT level, endpoint, caller, operator, session_id FROM telemetry ORDER BY rowid"
     ).fetchall()]
@@ -250,6 +254,7 @@ def test_telemetry_three_levels_and_stats(tmp_data_dir, monkeypatch):
     # skill 历史行与新 mcp 行同口径并存
     from app.telemetry.recorder import record
     record("/md", "X@1", "Feature", user="sk", caller="skill", level="object")
+    assert _tel_flush()
     st2 = aggregate_stats(s.db)
     assert st2["total"] == st["total"] + 1
 
@@ -261,6 +266,8 @@ def test_tool_rows_record_params_and_result(tmp_data_dir, monkeypatch):
     with _client() as c:
         _call(c, "get_md", {**_CTX, "ids": ["UDG@MMLCommand@ADD URR", "no@such@id"]})
         _call(c, "search_md", {**_CTX, "q": "计费"}, sid=2)
+    from app.telemetry.recorder import flush as _tel_flush
+    assert _tel_flush()
     tool_rows = [dict(r) for r in s.db.execute(
         "SELECT endpoint, params, result FROM telemetry WHERE level='tool' ORDER BY rowid"
     ).fetchall()]
@@ -282,6 +289,8 @@ def test_tool_row_records_error_result(tmp_data_dir, monkeypatch):
     s = _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
     with _client() as c:
         _call_err(c, "get_md", {**_CTX, "ids": [f"x@y@{i}" for i in range(101)]})
+    from app.telemetry.recorder import flush as _tel_flush
+    assert _tel_flush()
     rows = [dict(r) for r in s.db.execute(
         "SELECT params, result FROM telemetry WHERE level='tool' AND endpoint='mcp:get_md'"
     ).fetchall()]
