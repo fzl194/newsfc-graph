@@ -6,11 +6,14 @@ from datetime import datetime, timedelta, timezone
 
 
 def _use_tmp_telemetry(tmp_path, monkeypatch):
-    """重置 _shared 到独立 tmp DB（隔离每个 telemetry 测试），返回连接。"""
+    """重置 _shared 与 recorder._conn 到独立 tmp DB（隔离每个 telemetry 测试）。"""
     import app.db as dbmod
+    import app.telemetry.recorder as tel_recorder
     db = dbmod.get_db(tmp_path / "test.db")
     dbmod.init_schema(db)
     monkeypatch.setattr(dbmod, "_shared", db, raising=False)
+    # recorder 独立连接（2026-08-25）：不再随 _shared 走，须一并指到本测试库
+    monkeypatch.setattr(tel_recorder, "_conn", db, raising=False)
     return db
 
 

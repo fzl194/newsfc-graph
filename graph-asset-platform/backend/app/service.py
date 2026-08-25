@@ -19,6 +19,25 @@ from .store import Store
 import_lock = threading.Lock()
 
 
+def _commit(db) -> None:
+    """提交；容忍「事务已被并发写者抢先提交」。
+
+    共享连接存在少量不持 import_lock 的写者（如 users 管理操作）：它们的
+    commit 会连带提交本线程开着的事务，本线程随后 commit 报
+    ``cannot commit - no transaction is active``。此时语句均已执行且已落库
+    （被抢先提交即已持久化），跳过本次 commit 是安全的；其他错误原样抛。
+    （打点已改独立连接根治高频来源，2026-08-25；此处为残余写者兜底。）
+    """
+    import sqlite3
+    try:
+        db.commit()
+    except sqlite3.OperationalError as e:
+        if "no transaction" in str(e).lower():
+            print(f"[service] commit 跳过（事务已被并发写者提交）: {e}", flush=True)
+            return
+        raise
+
+
 class Service:
     def __init__(self):
         self.store = Store(ASSETS_DIR)
@@ -130,17 +149,17 @@ class Service:
             text = self.store.read(rel)
             fm, body, edge_sec = parse_md(text)
         except Exception:
-            self.db.commit()
+            _commit(self.db)
             return
         id_ = fm.get("id")
         typ = fm.get("type")
         if not id_ or not typ or not self.registry.known(typ):
-            self.db.commit()
+            _commit(self.db)
             return
         try:
             nf, _t, _l = split_id(id_)
         except ValueError:
-            self.db.commit()
+            _commit(self.db)
             return
         version = fm.get("version")
         entry = self.registry.get(typ) or {}
@@ -156,7 +175,7 @@ class Service:
         )
         edges_repo.replace_for_node(self.db, id_, version, edges)
         fts_repo.upsert(self.db, obj_id=id_, version=version, body=body)
-        self.db.commit()
+        _commit(self.db)
 
     def unindex_path(self, rel: str) -> None:
         """删该 source_path 的 DB 节点 + 边 + FTS 行（md 被删时）。"""
@@ -165,7 +184,7 @@ class Service:
         for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
         fts_repo.delete_many(self.db, old_pairs)
-        self.db.commit()
+        _commit(self.db)
 
     def reindex_prefixes(self, prefixes: list) -> dict:
         """**按前缀增量索引**（与 reindex_path 同一套 DB/锁/解析语义，目录级）。

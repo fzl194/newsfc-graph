@@ -56,6 +56,9 @@ def _empty_service_to_avoid_real_index(tmp_data_dir, monkeypatch):
     # jobs 独立连接（生产并发隔离）→ 测试注入同一 tmp 连接
     import app.jobs as jobs_mod
     monkeypatch.setattr(jobs_mod, "_conn", s.db, raising=False)
+    # telemetry 独立连接（同上，2026-08-25）→ 测试注入同一 tmp 连接
+    import app.telemetry.recorder as tel_recorder
+    monkeypatch.setattr(tel_recorder, "_conn", s.db, raising=False)
 
 
 @pytest.fixture(autouse=True)
