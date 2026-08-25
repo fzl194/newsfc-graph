@@ -79,6 +79,52 @@ def test_exporter_inline_copy_matches_config(tmp_path):
         assert str(exp._win_long(c)) == str(win_long(c)), f"不一致: {c}"
 
 
+# ---------- 解压长路径（extract_hdx_file 逐成员版，2026-08-25 解压失败回归） ----------
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 长路径语义")
+def test_extract_long_path_deep_member(tmp_path):
+    """归档内 >260 成员（嵌套资源 zip 同款）解压成功且内容正确。
+
+    原 ``extractall`` 普通路径 open() 抛 FileNotFoundError（内网现场）。
+    """
+    import zipfile
+    exp = _load_exporter()
+    deep_name = "/".join(["d" * 90] * 3 + ["UDG_" + "x" * 90 + "_CH_0000002282477504.zip"])
+    zpath = tmp_path / "arch.hwics"
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.writestr("index.html", "<html></html>")
+        z.writestr(deep_name, "ZIPCONTENT")
+    try:
+        extracted = exp.extract_hdx_file(str(zpath))
+        f = Path(extracted) / Path(*deep_name.split("/"))
+        assert len(str(f)) > 260
+        assert win_long(f).read_bytes() == b"ZIPCONTENT"
+        # 正常成员不受影响
+        assert win_long(Path(extracted) / "index.html").exists()
+    finally:
+        import shutil
+        shutil.rmtree(win_long(Path(extracted)), ignore_errors=True)
+
+
+def test_extract_sanitizes_zip_slip(tmp_path):
+    """成员名含 ``..`` → 剥离后落解压目录内，不逃逸（沿用 CPython 清洗规则）。"""
+    import zipfile
+    exp = _load_exporter()
+    zpath = tmp_path / "arch2.hwics"
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.writestr("../../evil.txt", "EVIL")
+        z.writestr("ok.txt", "OK")
+    extracted = exp.extract_hdx_file(str(zpath))
+    extracted = Path(extracted)
+    try:
+        assert (extracted / "evil.txt").read_text(encoding="utf-8") == "EVIL"
+        assert (extracted / "ok.txt").exists()
+        assert not (tmp_path / "evil.txt").exists()  # 未逃逸到解压目录之外
+    finally:
+        import shutil
+        shutil.rmtree(extracted, ignore_errors=True)
+
+
 # ---------- 深路径真实行为（回归：静默漏扫 vs 长前缀命中） ----------
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 长路径语义")

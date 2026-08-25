@@ -981,12 +981,12 @@ class HtmlToMarkdownConverter:
             rel = Path(os.path.relpath(target_md, self._output_md_path.parent)).as_posix()
             return rel + (f"#{anchor}" if anchor else "")
 
-        if self.copy_non_image_link_targets and local_path.exists():
+        if self.copy_non_image_link_targets and _win_long(local_path).exists():
             copied = self._copy_asset(local_path)
             rel = Path(os.path.relpath(copied, self._output_md_path.parent)).as_posix()
             return rel + (f"#{anchor}" if anchor else "")
 
-        if local_path.exists():
+        if _win_long(local_path).exists():
             rel = Path(os.path.relpath(local_path, self._output_md_path.parent)).as_posix()
             return rel + (f"#{anchor}" if anchor else "")
 
@@ -999,7 +999,7 @@ class HtmlToMarkdownConverter:
             return src
 
         local_path, anchor = self._resolve_local_path_with_anchor(src)
-        if not local_path or not local_path.exists():
+        if not local_path or not _win_long(local_path).exists():
             self.log_message(f"资源不存在，保留原路径: {src}")
             return src
 
@@ -1042,7 +1042,8 @@ class HtmlToMarkdownConverter:
         assets_dir.mkdir(parents=True, exist_ok=True)
         target = self._page_assets_dir / safe_filename(src_path.name, max_len=80)
         target_long = _win_long(target)
-        if target_long.exists() and not self._same_file(src_path, target_long):
+        src_long = _win_long(src_path)  # 源也可能 >260（解压树深处）
+        if target_long.exists() and not self._same_file(src_long, target_long):
             stem, suffix, idx = target.stem, target.suffix, 2
             while True:
                 candidate = self._page_assets_dir / f"{stem}_{idx}{suffix}"
@@ -1052,8 +1053,8 @@ class HtmlToMarkdownConverter:
                     break
                 idx += 1
 
-        if not target_long.exists() or not self._same_file(src_path, target_long):
-            shutil.copy2(src_path, target_long)
+        if not target_long.exists() or not self._same_file(src_long, target_long):
+            shutil.copy2(src_long, target_long)
         self._copied_assets[src_key] = str(target)
         return target
 
@@ -1211,7 +1212,8 @@ class ProductDocMarkdownExporter:
         source_abs = self._resolve_source_abs(url)
         source_rel = safe_relpath(source_abs, self.extracted_root) if source_abs else ""
         output_rel = self._build_unique_output_rel_path(topic_path, topic_id, ".pdf" if file_type == "pdf" else ".md")
-        exists = bool(source_abs and Path(source_abs).exists())
+        # 源页存在性走长前缀：>260 的源 html/pdf 普通 exists 静默 False（整页静默跳过）
+        exists = bool(source_abs and _win_long(Path(source_abs)).exists())
 
         records.append(
             TopicRecord(
@@ -1392,12 +1394,40 @@ def extract_hdx_file(hdx_path: str) -> str:
 
     try:
         print(f"开始解压文档: {os.path.basename(hdx_path)}")
-        with zipfile.ZipFile(hdx_path, "r") as zip_ref:
-            zip_ref.extractall(extract_dir)
+        _extract_all_longpath(hdx_path, extract_dir)
         print(f"文档解压完成: {extract_dir}")
         return extract_dir
     except zipfile.BadZipFile as exc:
         raise ValueError("文件不是有效的 ZIP 格式") from exc
+
+
+def _extract_all_longpath(hdx_path: str, extract_dir: str) -> None:
+    """逐成员解压（长路径安全版 extractall）。
+
+    ``zipfile.extractall`` 内部用普通路径 ``open()``——嵌套资源（如 resources 下
+    的 zip）解出的目标 >260 字符时抛 FileNotFoundError（内网解压失败根因，
+    2026-08-25）。此处目标统一走 ``_win_long``。成员名清洗沿用 CPython
+    ``_extract_member`` 同款规则（去盘符/去 ``..``/``.``——防 zip-slip 穿越）。
+    """
+    with zipfile.ZipFile(hdx_path, "r") as zip_ref:
+        for info in zip_ref.infolist():
+            arcname = info.filename.replace("/", os.path.sep)
+            if os.path.altsep:
+                arcname = arcname.replace(os.path.altsep, os.path.sep)
+            arcname = os.path.splitdrive(arcname)[1]
+            invalid = ("", os.path.curdir, os.path.pardir)
+            arcname = os.path.sep.join(
+                x for x in arcname.split(os.path.sep) if x not in invalid
+            )
+            if not arcname:
+                continue
+            target = _win_long(Path(extract_dir) / arcname)
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zip_ref.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
 
 def main(hdx_file: str) -> None:
