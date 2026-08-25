@@ -17,6 +17,7 @@ from .routers import admin as admin_router
 from .routers import assets as assets_router
 from .routers import docs as docs_router
 from .routers import fs as fs_router
+from .routers import mcp_tools as mcp_tools_router
 from .routers import objects as objects_router
 from .routers import productdoc as productdoc_router
 from .routers import telemetry as telemetry_router
@@ -67,7 +68,14 @@ async def lifespan(app: FastAPI):
         print(f"[startup] WARNING: users.json 读取失败 ({e})", flush=True)
     # MCP 服务（Streamable HTTP，/mcp）：session manager 随应用生命周期启停
     # （SDK 限制 run() 仅一次/实例 → 每次启动重建；测试多 TestClient 场景可重入）
-    from .mcp_server import rebuild_session_manager
+    from .mcp_server import apply_instructions, rebuild_session_manager
+    # 总体说明覆盖随配置恢复（enabled/description 每请求读 DB 无需启动应用）
+    try:
+        from .db import get_shared_db
+        from .repos import mcp_tools_repo
+        apply_instructions(mcp_tools_repo.get_instructions(get_shared_db()))
+    except Exception as e:  # noqa: BLE001 配置恢复失败不阻断启动（回退默认说明）
+        print(f"[startup] WARNING: MCP instructions 配置恢复失败 ({e})", flush=True)
     async with rebuild_session_manager().run():
         print("[startup] MCP 服务就绪 → /mcp（鉴权：X-API-Key，需 skill 权限）", flush=True)
         yield
@@ -88,6 +96,7 @@ app.include_router(admin_router.router, prefix="/api/v1")
 app.include_router(docs_router.router, prefix="/api/v1")
 app.include_router(fs_router.router, prefix="/api/v1")
 app.include_router(objects_router.router, prefix="/api/v1")
+app.include_router(mcp_tools_router.router, prefix="/api/v1")
 app.include_router(productdoc_router.router, prefix="/api/v1")
 app.include_router(telemetry_router.router, prefix="/api/v1")
 app.include_router(tests_router.router, prefix="/api/v1")

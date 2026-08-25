@@ -22,6 +22,7 @@ from pydantic import Field
 
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.server import Context
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -41,13 +42,60 @@ _CTX = ("【必传】当前使用者工号：每次调用从环境变量 _AGENT_
 _CTX_SID = ("【必传】当前会话ID：每次调用从环境变量 _AGENT_SESSION_ID 读取后传入。"
             "仅用于平台取用统计与追溯，不影响调用结果。")
 
-mcp = FastMCP(
+# 服务总体说明默认值（admin 可在 mcp_tools 配置覆盖，''=用本默认）
+DEFAULT_INSTRUCTIONS = (
+    "三层电信图谱（业务层→任务层→特性层→命令层）查询服务。"
+    "推荐入口：get_domains 锁定业务域 → 读 md 提取 [[ID]] 引用 → get_md 逐层下钻；"
+    "不确定对象 ID 时先用 search_md 按业务关键词召回。"
+)
+
+
+# ---------- 工具配置动态生效（admin 前端可配，2026-08-25） ----------
+
+def _load_config_safe() -> dict:
+    """读 mcp_tools 配置；任何异常回退空配置（全启用+默认描述）——配置面故障
+    绝不影响工具结果（与打点同哲学）。每请求读 DB（5 行 SELECT，成本可忽略）。"""
+    try:
+        from .db import get_shared_db
+        from .repos import mcp_tools_repo
+        return mcp_tools_repo.get_all(get_shared_db())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+class _ConfigurableFastMCP(FastMCP):
+    """tools/list 过滤禁用 + 描述覆盖；直连调用禁用拦截（决策：隐藏+拦截）。
+
+    必须子类覆写：``__init__`` 注册的是 bound method，事后 monkey-patch 无效。
+    描述覆盖只改**返回的 MCPTool 副本**（super().list_tools 每次从注册表重建），
+    注册表 Tool 对象保持 docstring 默认——清空覆盖即回默认，无需恢复逻辑。
+    """
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        cfg = _load_config_safe()
+        out = []
+        for t in tools:
+            c = cfg.get(t.name)
+            if c is not None and not c["enabled"]:
+                continue  # 禁用 → 隐藏（Agent 看不到）
+            d = (c or {}).get("description") or ""
+            if d:
+                t.description = d  # 完全替换（决策）；pydantic 模型可变
+            out.append(t)
+        return out
+
+    async def call_tool(self, name: str, arguments: dict, **kwargs):
+        c = _load_config_safe().get(name)
+        if c is not None and not c["enabled"]:
+            # ToolError → MCP isError=true，中文原文透传给 Agent
+            raise ToolError(f"工具 {name} 已被管理员禁用，如有需要请联系平台管理员开启")
+        return await super().call_tool(name, arguments, **kwargs)
+
+
+mcp = _ConfigurableFastMCP(
     "graph-asset-platform",
-    instructions=(
-        "三层电信图谱（业务层→任务层→特性层→命令层）查询服务。"
-        "推荐入口：get_domains 锁定业务域 → 读 md 提取 [[ID]] 引用 → get_md 逐层下钻；"
-        "不确定对象 ID 时先用 search_md 按业务关键词召回。"
-    ),
+    instructions=DEFAULT_INSTRUCTIONS,
     streamable_http_path="/",   # 挂载于 FastAPI /mcp 之下，最终端点即 /mcp
     stateless_http=True,        # 无会话状态（免 TTL/孤儿清理）
     json_response=True,         # 响应纯 JSON（非 SSE 流）
@@ -317,6 +365,20 @@ def get_object(id: str, AGENT_USERNAME: Annotated[str, Field(description=_CTX)],
         _record_tool("get_object", user=user, operator=AGENT_USERNAME,
                      session_id=AGENT_SESSION_ID, params=params, result=_err_summary(e))
         raise
+
+
+# ---------- 配置快照与总体说明应用 ----------
+
+# 默认描述快照（注册表 Tool 的 docstring 描述；GET /mcp-tools 的 default_description
+# 数据源）。放在全部 @mcp.tool() 注册之后。
+_DEFAULT_DESCRIPTIONS = {t.name: t.description
+                         for t in mcp._tool_manager.list_tools()}
+
+
+def apply_instructions(text: str) -> None:
+    """应用总体说明覆盖（''=恢复默认）。stateless 模式每请求经
+    ``create_initialization_options()`` 读 ``_mcp_server.instructions``——改即生效。"""
+    mcp._mcp_server.instructions = text or DEFAULT_INSTRUCTIONS  # SDK 无公开 setter（1.27.1）
 
 
 # ---------- 纯 ASGI 鉴权（审查 A1：BaseHTTPMiddleware 对 SSE 流有缓冲/挂起风险） ----------

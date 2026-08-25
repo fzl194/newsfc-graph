@@ -37,6 +37,11 @@ export const router = createRouter({
       component: () => import('./views/UsersView.vue'),
     },
     {
+      path: '/mcp-tools',
+      name: 'mcp-tools',
+      component: () => import('./views/McpToolsView.vue'),
+    },
+    {
       path: '/tests',
       name: 'tests',
       component: () => import('./tests-module/views/TestCasesView.vue'),
@@ -60,6 +65,7 @@ router.beforeEach((to) => {
   const s = getSession()
   if (!s) return { name: 'login' }
   if (to.name === 'users' && !s.is_admin) return false // 非 admin 拒绝
+  if (to.name === 'mcp-tools' && !s.is_admin) return false // MCP 工具配置面（admin）
   // 资产管理表面（目录 + 上传页）专属 can_assets（默认仅 admin）
   if ((to.name === 'fs' || to.name === 'upload') && !s.can_assets) return false
   return true

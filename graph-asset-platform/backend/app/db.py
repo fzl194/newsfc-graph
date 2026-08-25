@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -97,6 +97,16 @@ CREATE TABLE IF NOT EXISTS test_review_problems(
 CREATE TABLE IF NOT EXISTS test_artifacts(
   id INTEGER PRIMARY KEY, owner_type TEXT, owner_id TEXT,
   path TEXT, kind TEXT, size INT
+);
+
+-- MCP 工具配置（admin 前端可配，2026-08-25）：enabled=0 隐藏+拦截；description
+-- ''=用代码默认（docstring）。服务总体说明存 meta 表 key='mcp_instructions'。
+CREATE TABLE IF NOT EXISTS mcp_tools(
+  tool_name TEXT PRIMARY KEY,
+  enabled INT NOT NULL DEFAULT 1,
+  description TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_runs_case ON test_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_run ON test_reviews(run_id);

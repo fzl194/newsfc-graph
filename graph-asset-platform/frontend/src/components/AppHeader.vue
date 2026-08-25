@@ -182,6 +182,21 @@ const UserIcon = () =>
     ],
   )
 
+// MCP 工具配置（扳手图标）
+const McpToolIcon = () =>
+  h(
+    'svg',
+    { width: '15', height: '15', viewBox: '0 0 24 24', fill: 'none' },
+    [
+      h('path', {
+        d: 'M14.5 6.5a4 4 0 0 0-5.6 4.9L4 16.3V20h3.7l4.9-4.9a4 4 0 0 0 4.9-5.6l-2.6 2.6-2.4-.6-.6-2.4z',
+        stroke: 'currentColor',
+        'stroke-width': '1.7',
+        'stroke-linejoin': 'round',
+      }),
+    ],
+  )
+
 const FolderIcon = () =>
   h(
     'svg',
@@ -206,6 +221,7 @@ const tabs = computed(() => {
   if (s?.can_assets) base.push({ to: '/upload', label: '上传', icon: UploadIcon })
   if (s?.can_test) base.push({ to: '/tests', label: '测试', icon: TestIcon })
   if (s?.is_admin) base.push({ to: '/users', label: '用户', icon: UserIcon })
+  if (s?.is_admin) base.push({ to: '/mcp-tools', label: 'MCP 工具', icon: McpToolIcon })
   return base
 })
 

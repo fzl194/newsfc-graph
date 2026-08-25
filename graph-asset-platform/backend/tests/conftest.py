@@ -63,7 +63,7 @@ def _skip_auth_for_pure_graph_tests(monkeypatch, request):
     """纯图谱资产测试（assets/e2e/jobs/store/index/classify 等不测 auth/打点的）
     跳过 auth 中间件，避免 v2 后逐个加 admin KEY。测 auth/打点的模块用真实中间件。"""
     mod = getattr(request.module, "__name__", "") if hasattr(request, "module") else ""
-    if any(x in mod for x in ("test_auth", "test_users", "test_api_objects", "test_telemetry")):
+    if any(x in mod for x in ("test_auth", "test_users", "test_api_objects", "test_telemetry", "test_mcp_tools_config")):
         return
     from app.middleware import auth
     _ADMIN = {"username": "admin", "key": "x", "can_frontend": True, "can_upload": True, "can_test": True, "can_skill": True, "is_admin": True}

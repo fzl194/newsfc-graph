@@ -134,6 +134,33 @@ export const userActivity = (
 ): Promise<{ ts: string; endpoint: string; caller: string; operator: string }[]> =>
   _req(`${BASE}/users/${encodeURIComponent(name)}/activity?days=${days}`)
 
+// ---------- MCP 工具配置（admin）----------
+
+export interface McpToolRow {
+  name: string
+  enabled: boolean
+  description: string // '' = 用默认描述
+  default_description: string
+}
+
+export interface McpToolsConfig {
+  tools: McpToolRow[]
+  instructions: string // '' = 用默认说明
+  default_instructions: string
+}
+
+export const listMcpTools = (): Promise<McpToolsConfig> => _req(`${BASE}/mcp-tools`)
+
+export const updateMcpTools = (b: {
+  tools?: { name: string; enabled: boolean; description: string }[]
+  instructions?: string
+}): Promise<McpToolsConfig> =>
+  _req(`${BASE}/mcp-tools`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(b),
+  })
+
 function qs(p: Record<string, string | number | undefined>): string {
   const entries = Object.entries(p).filter(([, v]) => v !== undefined && v !== '')
   if (entries.length === 0) return ''
