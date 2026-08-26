@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -182,6 +182,14 @@ def init_schema(conn: sqlite3.Connection) -> None:
                 "INSERT INTO md_fts_map(obj_id, version, fts_rowid) "
                 "SELECT obj_id, version, rowid FROM md_fts"
             )
+    # v8 迁移（打点瘦身 2026-08-26·方案B）：一次性清理历史 request 级行——
+    # 任务面板轮询/浏览读请求曾占绝对大头且无统计价值（object/tool 级保留）。
+    # 此后 request 级仅剩 fs/import 写操作审计行（各 router 自行 _record）。
+    if not conn.execute(
+        "SELECT value FROM meta WHERE key='telemetry_request_purged'"
+    ).fetchone():
+        conn.execute("DELETE FROM telemetry WHERE level='request'")
+        conn.execute("INSERT INTO meta(key, value) VALUES('telemetry_request_purged','1')")
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (SCHEMA_VERSION,),

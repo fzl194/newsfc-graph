@@ -408,8 +408,8 @@ class MCPAuthMiddleware:
                                content={"detail": "permission denied"}
                                )(scope, receive, send)
             return
-        # request 级：鉴权通过即记（caller=mcp 通道语义，与用户属性解耦）
-        record("/mcp", user=user["username"], caller="mcp", level="request")
+        # /mcp 请求级打点已移除（2026-08-26 打点瘦身·方案B）：无任何消费方；
+        # 取用观测由 tool 级（mcp_server 工具装饰器内）+ object 级承担
         await self.app(scope, receive, send)
 
 

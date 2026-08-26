@@ -70,8 +70,9 @@ class Service:
             self.fts_rebuilding = True
             try:
                 with import_lock:
+                    # rebuild 分块提交（2026-08-26）：块间释放 WAL 写锁，避免
+                    # telemetry/jobs 独立连接被全量重建饿死（database is locked）
                     n = fts_repo.rebuild_from_objects(self.db)
-                    self.db.commit()
                 print(f"[startup] md_fts 与 objects 不一致，已后台重建 {n} 行", flush=True)
             finally:
                 self.fts_rebuilding = False

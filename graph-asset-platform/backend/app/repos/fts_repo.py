@@ -62,19 +62,44 @@ def delete_many(conn: sqlite3.Connection, pairs: list) -> None:
         delete(conn, oid, over)
 
 
-def rebuild_from_objects(conn: sqlite3.Connection) -> int:
-    """全量重建：清空后从 objects 表灌入（单事务，原子替换）+ 重灌 map。返回行数。"""
+def rebuild_from_objects(conn: sqlite3.Connection, chunk: int = 5000) -> int:
+    """全量重建：清空后从 objects 分块灌入 + 重灌 map。返回行数。
+
+    **分块提交**（2026-08-26）：原单事务全量重建在 10 万+ 对象库上持 WAL 写锁
+    数分钟——期间 telemetry/jobs 等独立连接全部饿死超时（database is locked，
+    内网现场）。改为每 chunk 行一个事务，块间释放写锁；重建期间一致性由调用方
+    的 ``fts_rebuilding`` 标志保证（search_md 明确报错不返回残缺）。
+    """
     conn.execute("DELETE FROM md_fts")
     conn.execute("DELETE FROM md_fts_map")
-    cur = conn.execute(
-        "INSERT INTO md_fts(obj_id, version, body) "
-        "SELECT id, version, body_md FROM objects"
-    )
-    conn.execute(
-        "INSERT INTO md_fts_map(obj_id, version, fts_rowid) "
-        "SELECT obj_id, version, rowid FROM md_fts"
-    )
-    return cur.rowcount or 0
+    conn.commit()
+    total = 0
+    # (id, version) 复合游标（PK 序）：同 id 多版本被 LIMIT 切开时不丢尾块
+    last_id, last_ver = "", ""
+    while True:
+        rows = conn.execute(
+            "SELECT id, version, body_md FROM objects "
+            "WHERE id > ? OR (id = ? AND version > ?) "
+            "ORDER BY id, version LIMIT ?",
+            (last_id, last_id, last_ver, chunk),
+        ).fetchall()
+        if not rows:
+            break
+        max_rid = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM md_fts").fetchone()[0]
+        conn.executemany(
+            "INSERT INTO md_fts(obj_id, version, body) VALUES(?,?,?)",
+            [(r["id"], r["version"] or "", r["body_md"]) for r in rows],
+        )
+        # 本块新行的 rowid 必然 > max_rid（FTS5 自增 rowid）→ 直接回填 map
+        conn.execute(
+            "INSERT INTO md_fts_map(obj_id, version, fts_rowid) "
+            "SELECT obj_id, version, rowid FROM md_fts WHERE rowid > ?",
+            (max_rid,),
+        )
+        conn.commit()
+        total += len(rows)
+        last_id, last_ver = rows[-1]["id"], rows[-1]["version"] or ""
+    return total
 
 
 def integrity_ok(conn: sqlite3.Connection) -> bool:

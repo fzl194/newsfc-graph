@@ -92,3 +92,29 @@ def test_fts_rebuild_repopulates_map(tmp_path):
     assert fts_repo.integrity_ok(conn)
     fts_repo.delete(conn, "A@1", None)  # 重建后 map 可用
     assert conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 0
+
+
+def test_fts_rebuild_chunked_multi_version(tmp_path):
+    """分块重建（小 chunk）：同 id 多版本被块边界切开也不丢行（(id,version) 游标）。"""
+    conn = dbmod.get_db(tmp_path / "t.db")
+    dbmod.init_schema(conn)
+    rows = []
+    for i in range(7):  # 同 id 7 个版本 + 3 个别的 id
+        rows.append((f"A@1", f"20.1{i}", f"正文{i}"))
+    for j in range(3):
+        rows.append((f"B@{j}", "", f"他文{j}"))
+    for id_, ver, body in rows:
+        conn.execute(
+            "INSERT INTO objects(id, version, type, layer, scope, nf, domain, scenario,"
+            " source_path, name, frontmatter_json, body_md, raw_md, mtime)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (id_, ver, "T", "L", "S", "nf", "", "", f"{id_}_{ver}.md", "", "{}", body, body, 1.0))
+    n = fts_repo.rebuild_from_objects(conn, chunk=2)  # 10 行 → 5 块，A@1 多次被切
+    assert n == 10
+    assert conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 10
+    assert conn.execute("SELECT COUNT(*) FROM md_fts_map").fetchone()[0] == 10
+    assert fts_repo.integrity_ok(conn)
+    # 分块后删除仍走 map 快路径
+    fts_repo.delete(conn, "A@1", "20.13")
+    assert conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 9
+    assert fts_repo.integrity_ok(conn) is False  # objects 10 行 vs fts 9 行（对账口径）

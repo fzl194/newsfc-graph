@@ -69,6 +69,57 @@ def test_record_swallows_failure(tmp_path, monkeypatch):
     assert db.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0] == 0  # 整批丢弃
 
 
+# ---------- 打点瘦身（方案B，2026-08-26）：中间件/MCP 不再记 request 级 ----------
+
+def test_middleware_no_longer_records_requests(tmp_path, monkeypatch):
+    """普通 /api 请求不再产生 request 级打点（轮询/浏览噪音根治）。"""
+    _use_tmp_telemetry(tmp_path, monkeypatch)
+    from app.users.store import add_user
+    add_user({"username": "admin", "key": "gap_admin", "can_frontend": True, "is_admin": True})
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as c:
+        r = c.get("/api/v1/stats", headers={"X-API-Key": "gap_admin"})
+        assert r.status_code == 200
+    from app.telemetry.recorder import flush
+    assert flush()
+    n = _shared_row_count()
+    assert n == 0  # 无 request 级行
+
+
+def _shared_row_count() -> int:
+    import app.db as dbmod
+    return dbmod.get_shared_db().execute(
+        "SELECT COUNT(*) FROM telemetry").fetchone()[0]
+
+
+def test_purge_historical_request_rows_once(tmp_path, monkeypatch):
+    """v8 一次性清理：历史 request 行删除（object/tool 保留），此后不再删。"""
+    import app.db as dbmod
+    from app.repos import telemetry_repo
+    from datetime import datetime, timezone
+    db = dbmod.get_db(tmp_path / "t.db")
+    dbmod.init_schema(db)
+    ts = datetime.now(timezone.utc).isoformat()
+    for lv in ("request", "object", "tool"):
+        telemetry_repo.insert(db, ts=ts, level=lv, caller="web" if lv == "request" else "mcp",
+                              endpoint="/x", obj_id="", obj_type="", user="u", operator="")
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0] == 3
+    # 模拟存量库：首次 init_schema 在空表上已消耗掉一次性标记 → 重置后再触发
+    db.execute("DELETE FROM meta WHERE key='telemetry_request_purged'")
+    db.commit()
+    dbmod.init_schema(db)  # 触发一次性清理
+    assert db.execute("SELECT COUNT(*) FROM telemetry WHERE level='request'").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0] == 2  # object/tool 保留
+    # 清理后新写入的 request 行（fs/import 审计）不再被删
+    telemetry_repo.insert(db, ts=ts, level="request", caller="web",
+                          endpoint="/fs/upload", obj_id="", obj_type="", user="u", operator="")
+    db.commit()
+    dbmod.init_schema(db)  # 幂等重跑
+    assert db.execute("SELECT COUNT(*) FROM telemetry WHERE level='request'").fetchone()[0] == 1
+
+
 # ---------- aggregator ----------
 
 def test_aggregate_stats_skill_objects_only(tmp_path, monkeypatch):

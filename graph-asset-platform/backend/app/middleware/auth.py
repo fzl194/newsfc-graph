@@ -10,17 +10,14 @@ v3（MCP 服务化 2026-08-24）：Agent 访问迁移至 MCP（/mcp，独立纯 
 caller=mcp）；原 SKILL 两端点（POST /domains、POST /md）已删，本中间件不再有
 skill 专属 REST 分支；X-User-Id 工号机制整体移除（MCP 打点归因走工具参数
 AGENT_USERNAME / AGENT_SESSION_ID）。
-"""
-import logging
-import urllib.parse
 
+v4（打点瘦身 2026-08-26）：请求级全量打点移除（见文件尾注释）——中间件回归
+纯鉴权职责。
+"""
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from ..telemetry.recorder import record
 from ..users.service import authenticate, check_perm
-
-logger = logging.getLogger(__name__)
 
 
 def _need_perm(path: str) -> str:
@@ -65,21 +62,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not check_perm(user, _need_perm(path)):
             return JSONResponse(status_code=403, content={"detail": "permission denied"})
 
-        response = await call_next(request)
-
-        # 打点①请求级（排除 telemetry 自身避免自循环；login 已豁免不到这）
-        if not path.startswith("/api/v1/telemetry"):
-            try:
-                record(path, id_=_extract_id(path), type_="", user=user["username"], caller=caller, level="request")
-            except Exception as e:  # 观测用，不阻断
-                logger.warning("audit record failed: %s", e)
-        return response
+        return await call_next(request)
 
 
-def _extract_id(path: str) -> str:
-    """从 /objects/{id}* 提取 id（URL-decode；id 含 @ 与空格）。"""
-    if "/objects/" in path:
-        rest = path.split("/objects/", 1)[1]
-        id_encoded = rest.split("/", 1)[0]
-        return urllib.parse.unquote(id_encoded)
-    return ""
+# 请求级全量打点已移除（2026-08-26 打点瘦身·方案B）：任务面板轮询（~2s/行）与
+# 图谱浏览读请求曾占打点绝对大头，而统计页只消费 object 级取用行——request 级
+# 唯一消费方「行为轨迹」退化为 fs/import 写操作审计（各 router 自行 _record）。

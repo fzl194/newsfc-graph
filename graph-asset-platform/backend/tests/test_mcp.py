@@ -239,7 +239,8 @@ def test_telemetry_three_levels_and_stats(tmp_data_dir, monkeypatch):
         "SELECT level, endpoint, caller, operator, session_id FROM telemetry ORDER BY rowid"
     ).fetchall()]
     levels = {(r["level"], r["endpoint"]) for r in rows}
-    assert ("request", "/mcp") in levels                     # request 级
+    # request 级（"/mcp"）已随打点瘦身移除（2026-08-26·方案B）：仅 tool + object 两层
+    assert ("request", "/mcp") not in levels
     assert ("tool", "mcp:get_md") in levels                  # tool 级（含 search 类可观测）
     assert ("tool", "mcp:search_md") in levels
     assert ("object", "mcp:get_md") in levels                # object 级（取用统计口径）
