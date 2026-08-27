@@ -1,13 +1,20 @@
 """ImportJob：异步导入任务的状态载体（内存缓存 + platform.db 持久化）。
 
 v3（2026-08-19，两步流水线）：
-- kind：``product_doc_extract``（解压转换）/ ``product_doc_mine``（图谱挖掘）；
+- kind：``product_doc_extract``（解压转换）/ ``product_doc_mine``（抽取任务）；
   两类各自全局单任务互斥、允许并行（用户决策）。
 - ``child_pids``：构建子进程 PID 记录——后端被硬杀后孤儿进程继续写资产目录，
   ``sweep_interrupted()`` 启动时按 PID 树终止（评审清单 D16）。
 - **独立 SQLite 连接**（评审清单 D7）：后台线程高频落库不再与共享连接跨线程混写；
   WAL 多连接 + busy_timeout。测试通过 monkeypatch ``jobs._conn`` 注入 tmp 连接。
 - 历史持久化 / 删除（非 processing）/ 重启清账语义见 v2 注释，不变。
+
+v4（2026-08-26，抽取任务化+入图闸门）：
+- status 扩展 ``awaiting``（沙箱构建完成、等用户在闸门三选——**非终态**，
+  ``sweep_interrupted`` 只清 processing 不动它，跨重启存活）与 ``cancelled``
+  （闸门撤销，终态）。awaiting 期间 kind 互斥已释放（其他目标可继续抽）。
+- job.nf/version 对抽取任务存**目标**网元/版本（同目标 awaiting 守卫一条 SQL）；
+  包身份在 result.bundle_nf/bundle_version。
 """
 import json
 import os
@@ -29,7 +36,7 @@ _KINDS = ("import", "product_doc_extract", "product_doc_mine")
 @dataclass
 class ImportJob:
     job_id: str
-    status: str = "processing"      # processing | done | failed
+    status: str = "processing"      # processing | awaiting | done | failed | cancelled
     added: int = 0
     updated: int = 0
     skipped: int = 0
@@ -148,7 +155,7 @@ def update_job(jid: str, **kw) -> None:
             return
         for k, v in kw.items():
             setattr(j, k, v)
-        if kw.get("status") in ("done", "failed"):
+        if kw.get("status") in ("done", "failed", "cancelled"):
             j.finished_at = time.time()
         snapshot = asdict(j)
     _persist(ImportJob(**snapshot))
@@ -187,13 +194,17 @@ def list_jobs(limit: int = 100) -> list:
 
 
 def delete_job(jid: str) -> bool:
-    """删除历史任务（**仅非 processing**——解析进行中不可删，用户决策）。"""
+    """删除历史任务（**仅非 processing/awaiting**——进行中或待闸门确认不可删，
+    用户决策；awaiting 需先在闸门三选落地）。"""
     with _lock:
         j = _registry.get(jid)
-    if j is not None and j.status == "processing":
+    if j is not None and j.status in ("processing", "awaiting"):
         return False
     try:
         db = _db()
+        row = db.execute("SELECT status FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
+        if row and row["status"] in ("processing", "awaiting"):
+            return False  # DB 权威态（内存缓存缺失，如重启后）
         cur = db.execute("DELETE FROM import_jobs WHERE job_id=?", (jid,))
         db.commit()
     except sqlite3.Error:
@@ -217,6 +228,31 @@ def has_processing(kind: str) -> Optional[ImportJob]:
     except sqlite3.Error:
         return None
     return _from_row(row) if row else None
+
+
+def awaiting_for(kind: str, nf: str, version: str) -> Optional[ImportJob]:
+    """该 kind 下同 (nf, version) 是否已有 awaiting（待闸门确认）任务——
+    同目标守卫：沙箱/报告是单份的，同目标并发待确认会互相踩（用户决策阻断）。"""
+    try:
+        row = _db().execute(
+            "SELECT * FROM import_jobs WHERE kind=? AND status='awaiting' "
+            "AND nf=? AND version=? ORDER BY started_at DESC LIMIT 1",
+            (kind, nf, version)).fetchone()
+    except sqlite3.Error:
+        return None
+    return _from_row(row) if row else None
+
+
+def recent_done(kind: str, limit: int = 200) -> list:
+    """最近完成（含已回退标记）的任务，finished_at 倒序——抽取任务重跑检索用
+    （如 feature 任务找同目标最近一次成功 cmd 任务记录的源目录）。"""
+    try:
+        rows = _db().execute(
+            "SELECT * FROM import_jobs WHERE kind=? AND status='done' "
+            "ORDER BY finished_at DESC LIMIT ?", (kind, limit)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [_from_row(r) for r in rows]
 
 
 def _kill_pid_tree(pid: int) -> None:

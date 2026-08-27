@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -120,6 +120,17 @@ CREATE TABLE IF NOT EXISTS mcp_tools(
   updated_at TEXT NOT NULL DEFAULT '',
   updated_by TEXT NOT NULL DEFAULT ''
 );
+-- 抽取产物清单（v9，抽取任务化 2026-08-26）：入图闸门 confirm 后写入，按任务回退
+-- （revert）的依据。op: add=本次新增（回退=软删进回收站）；modify=本次覆盖（回退=
+-- 还原 originals 备份）。sha256=应用后内容摘要（回退前比对磁盘，防后续任务已覆盖）。
+CREATE TABLE IF NOT EXISTS extract_files(
+  job_id TEXT NOT NULL, path TEXT NOT NULL,
+  op TEXT NOT NULL, sha256 TEXT NOT NULL,
+  layer TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(job_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_extract_files_job ON extract_files(job_id);
+
 CREATE INDEX IF NOT EXISTS idx_runs_case ON test_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_run ON test_reviews(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_owner ON test_artifacts(owner_type, owner_id);

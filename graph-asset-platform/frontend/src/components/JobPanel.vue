@@ -3,9 +3,7 @@
     <div class="pd-job-head">
       <span class="pd-job-title">任务进度</span>
       <span class="mono pd-job-id">{{ job.job_id }} · {{ job.nf }} {{ job.version }}</span>
-      <span class="pd-status" :class="`pd-${job.status}`">
-        {{ job.status === 'processing' ? '进行中' : job.status === 'done' ? '完成' : '失败' }}
-      </span>
+      <span class="pd-status" :class="`pd-${job.status}`">{{ STATUS_LABEL[job.status] ?? job.status }}</span>
     </div>
     <ol class="pd-steps">
       <li v-for="s in job.steps" :key="s.name" class="pd-step" :class="`pd-${s.status}`">
@@ -44,6 +42,15 @@ const props = defineProps<{
 
 defineEmits<{ (e: 'refresh-history'): void }>()
 
+/** 状态标签（awaiting=抽取闸门待三选，2026-08-26；cancelled=闸门撤销） */
+const STATUS_LABEL: Record<string, string> = {
+  processing: '进行中',
+  awaiting: '待确认',
+  done: '完成',
+  failed: '失败',
+  cancelled: '已撤销',
+}
+
 const statRows = computed(() => {
   const r = (props.job?.result ?? {}) as Record<string, unknown>
   const layers = (r.layers ?? {}) as Record<string, number>
@@ -63,8 +70,10 @@ const statRows = computed(() => {
 .pd-job-id { font-size: 11px; color: var(--text-faint); }
 .pd-status { font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 999px; }
 .pd-processing { background: var(--accent-soft); color: var(--accent); }
+.pd-awaiting { background: rgba(245, 158, 11, 0.14); color: var(--warn); }
 .pd-done { background: rgba(16, 185, 129, 0.12); color: var(--success); }
 .pd-failed { background: #fef2f2; color: var(--danger); }
+.pd-cancelled { background: var(--bg-sunken); color: var(--text-faint); }
 .pd-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .pd-step { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
 .pd-step.pd-done { color: var(--text); }

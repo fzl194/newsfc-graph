@@ -1,15 +1,18 @@
-"""两步流水线编排（2026-08-19 重构，用户决策拆分）：
+"""两步流水线编排（2026-08-26 抽取任务化重构，用户决策）：
 
 - 步骤① ``run_extract``（上传页·产品文档解压）：.hwics → 解压（html 临时态）→
   转 md → ``output/{nf}_{version}/`` 留存（**只留 md + bundle.json**，html/原件随
-  临时目录删除；原子替换失败不动旧包）。
-- 步骤② ``run_mine``（上传页·自动抽取）：包须解压完成（门槛）→ 用户确认的源目录
-  （候选来自 ``locate_candidates``，只能选服务端枚举项）→ 范围勾选（依赖强制补齐）
-  → 按模式注册表调度构建器（``two_pass`` 修 D5 force 剥引用）→ ``svc.rebuild()``。
+  临时目录删除；原子替换失败不动旧包）。包的 nf/version=物理网元基本信息，
+  仅作管理与抽取默认值。
+- 步骤② ``run_mine``（上传页·抽取任务）：选包 + **目标网元/版本**（可改——图谱
+  逻辑网元名由用户定）+ 单抽取器 → 依赖**阻断**校验 → 沙箱构建（脚本写
+  ``.extract_gate/{job_id}/storage/``，预拷目标现有层供跨层读；feature 自动重跑
+  命令构建器补引用）→ diff 报告 → ``awaiting`` 等闸门三选（``pipeline/gate.py``：
+  覆盖/只新增/撤销 + 按任务回退）。正式资产在 confirm 前零改动。
 
-安全底线（评审清单 2026-08-18，2026-08-19 批准随重构实施）：
-D1 命名白名单+目录祖先校验；D14 版本不一致阻断；D16 子进程 PID 记录（sweep 终止）；
-D17 zip namelist 预检；D20 摘要=四层之和+manifest 缺失告警。
+安全底线（评审清单 2026-08-18/19 沿用）：D1 命名白名单+目录祖先校验；D14 版本
+不一致阻断（解压侧）；D16 子进程 PID 记录（sweep 终止）；D17 zip namelist 预检；
+D20 摘要=层计数之和+manifest 缺失告警。
 构建脚本为规范拷贝件（字节一致），全部经 subprocess 隔离运行（两份同名 _common 平面导入）。
 """
 from __future__ import annotations
@@ -30,14 +33,13 @@ from pathlib import Path
 
 from .. import config, jobs
 from ..config import win_long as _win_long  # 超长路径（>260）fs 操作 helper
-from . import bundles
-from . import modes as modes_reg
+from . import bundles, gate
+from . import extractors as extractors_reg
 
 HERE = Path(__file__).resolve().parent
-GRAPH_LAYERS = ("Command", "ConfigObject", "Feature", "License")
 
-# 挖掘范围 → 产物层（范围勾选即层选择；配置对象层随命令层走同目录计数）
-_UPLOAD_MAX_BYTES = 2 * 1024 ** 3  # 2GB（router 侧强制，D4）
+# 上传上限（router 侧强制，D4）
+_UPLOAD_MAX_BYTES = 2 * 1024 ** 3  # 2GB
 
 
 # ---------- 公共 ----------
@@ -112,10 +114,11 @@ def _fail(job_id: str, hwics_or_none: Path | None, e: Exception) -> None:
                     error=f"{type(e).__name__}: {e}\n{traceback.format_exc()[-3000:]}")
 
 
-# ---------- 步骤② 定位（推荐 + 候选，人工确认；架构性缓解 D11/D1） ----------
+# ---------- 目录定位（推荐 + 候选，人工确认；架构性缓解 D11/D1） ----------
 
-def locate_candidates(export_root: Path, mode: "modes_reg.ModeDef", nf: str) -> dict:
-    """按模式关键词扫描包内源目录候选。
+def locate_candidates(export_root: Path, extractor: "extractors_reg.ExtractorDef", nf: str) -> dict:
+    """按抽取器关键词扫描包内源目录候选（nf=**目标网元**，非包名——逻辑网元名
+    由用户抽取时输入）。
 
     每角色返回 {recommended: 相对路径|None, candidates: [相对路径], note}；
     recommended 仅供前端默认选中——最终由用户从 candidates 改选（防猜错）。
@@ -126,7 +129,7 @@ def locate_candidates(export_root: Path, mode: "modes_reg.ModeDef", nf: str) -> 
     root_long = _win_long(root)
     out: dict[str, dict] = {}
     nf_cf = nf.casefold()
-    for role, kws in mode.keywords.items():
+    for role, kws in extractor.keywords.items():
         kw_cfs = [k.casefold() for k in kws]
         hits: dict[Path, bool] = {}  # path -> strict?
         for p in root_long.rglob("*"):
@@ -158,8 +161,8 @@ def locate_candidates(export_root: Path, mode: "modes_reg.ModeDef", nf: str) -> 
 def validate_selected_dirs(bundle_root: Path, selected: dict) -> dict:
     """用户提交的目录选择校验：必须在包内且真实存在（防注入；D1 纵深）。
 
-    v0.23.0：角色值支持 str | list[str]（命令角色可多目录——新产品文档命令拆分
-    多分册）；返回统一 dict[role, list[Path]]。str 归一化为单元素列表。
+    角色值支持 str | list[str]（命令角色可多目录——新产品文档命令拆分多分册，
+    且全部目录须单次调用传入构建器）；返回统一 dict[role, list[Path]]。
     """
     root = bundle_root.resolve()
     out: dict[str, list[Path]] = {}
@@ -169,6 +172,8 @@ def validate_selected_dirs(bundle_root: Path, selected: dict) -> dict:
             out[role] = []
         for rel in vals:
             p = (root / rel).resolve()
+            if p == root:
+                raise ValueError(f"目录不能是包根: {role}={rel}")
             if p != root and root not in p.parents:
                 raise ValueError(f"目录越界: {role}={rel}")
             # is_dir 用长前缀：>260 的深目录普通 is_dir 静默 False（误报不存在）
@@ -180,24 +185,15 @@ def validate_selected_dirs(bundle_root: Path, selected: dict) -> dict:
 
 
 def layer_assets_exist(layer: str, nf: str, version: str) -> bool:
-    d = config.ASSETS_DIR / layer / nf / version
+    # 长前缀：>260 的层目录普通 rglob 静默漏扫 → 依赖阻断误报缺层（评审修复 2026-08-26）
+    d = _win_long(config.ASSETS_DIR / layer / nf / version)
     return d.is_dir() and any(d.rglob("*.md"))
 
 
-def expand_scope(scope: list, mode: "modes_reg.ModeDef", nf: str, version: str) -> tuple:
-    """范围×依赖强制（用户决策 2026-08-19）：勾选层的 needs 层若资产不存在，
-    自动补选并锁定（返回 final + 补选说明）。资产已存在则不强制（增量挖掘）。"""
-    final = set(scope)
-    added: list[str] = []
-    for b in mode.builders:
-        if b.layer not in final:
-            continue
-        for dep in b.needs:
-            if dep not in final and not layer_assets_exist(dep, nf, version):
-                final.add(dep)
-                added.append(f"{b.layer} 依赖 {dep}（该层资产不存在，已自动补选）")
-    ordered = [b.layer for b in mode.builders if b.layer in final]
-    return ordered, added
+def missing_deps(extractor: "extractors_reg.ExtractorDef", nf: str, version: str) -> list:
+    """阻断式依赖检查：目标 (nf,version) 槽位缺的层（用户决策 2026-08-26——
+    不自动补齐，人来编排「先命令后特性」）。"""
+    return [L for L in extractor.needs if not layer_assets_exist(L, nf, version)]
 
 
 # ---------- 步骤① 解压转换留存 ----------
@@ -297,12 +293,42 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
             shutil.rmtree(str(_win_long(t)), ignore_errors=True)
 
 
-# ---------- 步骤② 图谱挖掘 ----------
+# ---------- 步骤② 抽取任务（沙箱构建 → 闸门） ----------
 
-def run_mine(job_id: str, nf: str, version: str, mode_id: str,
-             selected_dirs: dict, scope: list, force: bool) -> None:
-    """后台执行体：门槛校验 → 目录校验 → 依赖强制 → force 清理（按勾选层）→
-    按模式构建器调度 → two_pass 二遍 → rebuild → 四层摘要（D20）。"""
+def find_last_cmd_dirs(nf: str, version: str) -> "dict | None":
+    """最近一次成功 cmd 抽取任务记录的源目录（feature 自动重跑命令构建器用）。
+    排除已回退任务；无记录返回 None（旧数据/首抽——调用方 warn+skip）。"""
+    for j in jobs.recent_done("product_doc_mine"):
+        r = j.result or {}
+        if (r.get("script") == "cmd" and r.get("target_nf") == nf
+                and r.get("target_version") == version and not r.get("reverted_at")):
+            d = r.get("dirs") or {}
+            if d.get("mml"):
+                return {"bundle_nf": r.get("bundle_nf", ""),
+                        "bundle_version": r.get("bundle_version", ""), "dirs": d}
+    return None
+
+
+def _run_builder(job_id: str, b: "extractors_reg.Builder", dirs: dict,
+                 nf: str, version: str, storage: Path) -> None:
+    """跑单个构建器（规范拷贝件，CLI 编排）：--nf/--version 用**目标**网元，
+    --storage 指向沙箱 assets 根。"""
+    args: list = ["--nf", nf, "--version", version, "--storage", str(storage)]
+    for role, flags in (b.src_args or {}).items():
+        for v in dirs.get(role, []):          # 角色值可为多目录（mml 单次全量传入）
+            for f in flags:
+                args += [f, v]
+    _run(HERE / b.script, *args, job_id=job_id)
+
+
+def run_mine(job_id: str, spec: dict) -> None:
+    """后台执行体（抽取任务化 2026-08-26）：
+
+    spec = {bundle_nf, bundle_version, target_nf, target_version, extractor, dirs}。
+    校验（包 done/依赖阻断/角色目录）→ 沙箱（预拷目标现有层）→ 主构建器 →
+    feature 自动重跑命令构建器（two_pass 跨任务版，用最近成功 cmd 任务的目录）→
+    diff 报告 → ``awaiting``（闸门三选走 routers 的 gate 端点；互斥随本函数返回释放）。
+    """
     steps: list = []
     warnings: list = []
 
@@ -315,100 +341,106 @@ def run_mine(job_id: str, nf: str, version: str, mode_id: str,
             steps.append({"name": name, "status": status, "detail": detail})
         jobs.update_job(job_id, steps=list(steps))
 
+    bundle_nf = spec.get("bundle_nf", "")
+    bundle_version = spec.get("bundle_version", "")
+    target_nf = spec.get("target_nf", "")
+    target_version = spec.get("target_version", "")
+
     try:
-        # 门槛（用户约束：解压完成才能挖）
-        bundle = bundles.get_bundle(nf, version)
+        # 门槛（用户约束：解压完成才能抽）
+        bundle = bundles.get_bundle(bundle_nf, bundle_version)
         if bundle is None:
-            raise ValueError(f"产品文档包 {nf}_{version} 不存在——请先在上传页完成解压")
+            raise ValueError(f"产品文档包 {bundle_nf}_{bundle_version} 不存在——请先在上传页完成解压")
         if bundle["status"] != "done":
-            raise ValueError(f"包 {nf}_{version} 状态为 {bundle['status']}，未就绪")
+            raise ValueError(f"包 {bundle_nf}_{bundle_version} 状态为 {bundle['status']}，未就绪")
 
-        mode = modes_reg.get_mode(mode_id)
-        if mode is None:
-            raise ValueError(f"解析模式不存在: {mode_id}（可选 {list(modes_reg.MODES)}）")
+        ex = extractors_reg.get_extractor(spec.get("extractor", ""))
+        if ex is None:
+            raise ValueError(f"抽取器不存在: {spec.get('extractor')!r}"
+                             f"（可选 {list(extractors_reg.EXTRACTORS)}）")
 
-        step("校验", detail=f"{mode.name} · 范围 {'+'.join(scope)}")
-        root = bundles.bundle_dir(nf, version)
-        dirs = validate_selected_dirs(root, selected_dirs)               # D1 纵深
-        final_scope, added = expand_scope(scope, mode, nf, version)      # 依赖强制
-        if added:
-            warnings.extend(added)
-            jobs.update_job(job_id, warnings=list(warnings))
-        step("校验", "done", f"范围 {final_scope}" + ("；依赖已自动补选" if added else ""))
+        step("校验", detail=f"{ex.name} · 目标 {target_nf}@{target_version}")
+        dirs = validate_selected_dirs(bundles.bundle_dir(bundle_nf, bundle_version),
+                                      spec.get("dirs") or {})            # D1 纵深
+        for role in ex.required_roles:
+            if not dirs.get(role):
+                raise ValueError(f"抽取器「{ex.name}」必须选择源目录角色: {role}")
+        # 依赖阻断（权威复检；router 入口已拦一道）
+        missing = missing_deps(ex, target_nf, target_version)
+        if missing:
+            raise ValueError(f"目标 {target_nf}@{target_version} 缺少依赖层资产: "
+                             f"{'+'.join(missing)}——请先完成对应抽取任务（不自动补齐）")
+        step("校验", "done", f"{ex.name} · 目标 {target_nf}@{target_version}")
 
-        # force：只清勾选层（依赖强制后的 final）
-        if force:
-            step("覆盖清理")
-            removed = 0
-            for layer in final_scope:
-                d = config.ASSETS_DIR / layer / nf / version
-                if d.exists():
-                    removed += sum(1 for _ in d.rglob("*.md"))
-                    shutil.rmtree(str(_win_long(d)))
-            step("覆盖清理", "done", f"已清理旧资产 {removed} 个 md")
+        # spec 早写进 result（崩溃可查 + 供 feature 重跑检索最近 cmd 任务）。
+        # dirs 存包内相对路径（validate 时重解析重校验——随 DATA_DIR/包替换仍有效）
+        bundle_root = bundles.bundle_dir(bundle_nf, bundle_version).resolve()
+        rel_dirs = {role: [p.relative_to(bundle_root).as_posix() for p in ps]
+                    for role, ps in dirs.items()}
+        base_result = {
+            "stage": "running", "script": ex.id, "script_name": ex.name,
+            "bundle": f"{bundle_nf}_{bundle_version}",
+            "bundle_nf": bundle_nf, "bundle_version": bundle_version,
+            "target_nf": target_nf, "target_version": target_version,
+            "dirs": rel_dirs,
+        }
+        jobs.update_job(job_id, result=base_result)
 
-        counts: dict[str, int] = {}
+        # 沙箱：预拷 reads 并集 ∩ 目标已存在层（分次累积/跨层读闭环）
+        step("沙箱准备")
+        copy_set = sorted({L for b in (*ex.builders, *ex.rerun_after)
+                           for L in b.reads})
+        copied = gate.create_sandbox(job_id, copy_set, target_nf, target_version)
+        step("沙箱准备", "done", (f"预拷 {len(copied)} 层（{'+'.join(copied)}）"
+                                   if copied else "目标槽位为空，全新抽取"))
 
-        def run_builder(b: "modes_reg.Builder", label: str) -> None:
+        storage = gate.gate_storage(job_id)
+        written: list = []
+
+        def run_builder(b: "extractors_reg.Builder", label: str, run_dirs: dict) -> None:
             step(label)
-            args: list = ["--nf", nf, "--version", version, "--storage", config.ASSETS_DIR]
-            for role, flags in (b.src_args or {}).items():
-                for v in dirs.get(role, []):          # v0.23.0：角色值可为多目录
-                    for f in flags:
-                        args += [f, v]
-            _run(HERE / b.script, *args, job_id=job_id)
-            m = _manifest(b.layer, nf, version)
-            counts[b.layer] = m.get(_COUNT_KEY.get(b.layer, ""), 0) or 0
-            step(label, "done", f"{b.layer} {counts[b.layer]} 个"
-                 + ("" if m else "；⚠ manifest 缺失"))                   # D20
-            if not m:
-                warnings.append(f"{b.layer} 构建后 manifest 缺失（计数未知，请核查）")
+            _run_builder(job_id, b, run_dirs, target_nf, target_version, storage)
+            if b.layer not in written:
+                written.append(b.layer)
+            step(label, "done", f"{b.layer} 构建 OK")
+
+        for b in ex.builders:
+            run_builder(b, f"构建 {b.layer}", dirs)
+
+        # feature 自动重跑命令构建器（用户决策：保持 two_pass 语义不拆分）——
+        # 命令 md 的特性引用只在 Feature 资产已存在时写入；feature 抽取后须
+        # 用「最近一次成功 cmd 任务」的源目录重跑命令+配置对象补引用，其
+        # Command/ConfigObject 文件变化进入闸门报告供审。
+        if ex.rerun_after:
+            step("重跑命令（补特性引用）")
+            last = find_last_cmd_dirs(target_nf, target_version)
+            if last is None:
+                msg = (f"未找到 {target_nf}@{target_version} 的命令抽取任务记录"
+                       f"（旧数据/首抽）——已跳过命令层特性引用修复，可手动重跑一次命令抽取")
+                warnings.append(msg)
                 jobs.update_job(job_id, warnings=list(warnings))
+                step("重跑命令（补特性引用）", "done", "⚠ 跳过（无命令任务记录）")
+            else:
+                try:
+                    last_dirs = validate_selected_dirs(
+                        bundles.bundle_dir(last["bundle_nf"], last["bundle_version"]),
+                        last["dirs"])
+                    for b in ex.rerun_after:
+                        run_builder(b, f"重跑 {b.layer}（补特性引用）", last_dirs)
+                    step("重跑命令（补特性引用）", "done",
+                         f"按最近 cmd 任务（{last['bundle_nf']}_{last['bundle_version']}）")
+                except ValueError as e:
+                    warnings.append(f"命令层特性引用修复跳过：{e}")
+                    jobs.update_job(job_id, warnings=list(warnings))
+                    step("重跑命令（补特性引用）", "done", f"⚠ 跳过（{e}）")
 
-        for b in mode.builders:
-            if b.layer in final_scope:
-                run_builder(b, f"构建 {b.layer}")
+        step("差异报告")
+        report = gate.diff_report(job_id, written, target_nf, target_version)
+        step("差异报告", "done",
+             f"新增 {report['new_total']} · 相同 {report['identical_total']} · 差异 {report['modified_total']}")
 
-        # D5 修复：Feature 重建后 Command 层特性引用此前被剥（feature_codes 空）→
-        # two_pass 模式第二遍补 Command/ConfigObject（幂等）
-        if mode.two_pass and "Feature" in final_scope and "Command" in final_scope:
-            for b in mode.builders:
-                if b.layer in ("Command", "ConfigObject") and b.layer in final_scope:
-                    run_builder(b, f"第二遍 {b.layer}（补特性引用）")
-
-        # 增量索引（与 fs 写端点同一套 reindex 语义）：只重索引本次勾选层目录 +
-        # 清理前缀下已消失的旧文件（force 清理产生的空洞）——秒级、规模无关
-        step("增量索引")
-        from ..service import get_service, import_lock
-        with import_lock:
-            ix = get_service().reindex_prefixes(
-                [f"{layer}/{nf}/{version}" for layer in final_scope])
-        step("增量索引", "done",
-             f"重索引 {ix['indexed']} / 清理 {ix['removed']}（增量，秒级）")
-
-        # 更新包元信息（记录最近挖掘模式）
-        meta = bundles.read_meta(bundles.bundle_dir(nf, version)) or {}
-        meta["mode_id"] = mode.id
-        meta["mined_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        bundles.write_meta(bundles.bundle_dir(nf, version), meta)
-
-        jobs.update_job(job_id, status="done",
-                        result={"layers": counts, "total": sum(counts.values()),
-                                "bundle": f"{nf}_{version}", "mode": mode.name},
-                        added=sum(counts.values()), warnings=warnings)
+        jobs.update_job(job_id, status="awaiting", result={**base_result, **report},
+                        warnings=list(warnings))
     except Exception as e:  # noqa: BLE001
+        gate.cleanup(job_id)  # 失败即清沙箱（正式资产从未被碰）
         _fail(job_id, None, e)
-
-
-_COUNT_KEY = {"Command": "command_count", "ConfigObject": "object_count",
-              "License": "license_count", "Feature": "feature_count"}
-
-
-def _manifest(layer: str, nf: str, version: str) -> dict:
-    p = config.ASSETS_DIR / layer / nf / version / "_build_manifest.json"
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}

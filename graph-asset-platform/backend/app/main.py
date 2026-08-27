@@ -50,6 +50,12 @@ async def lifespan(app: FastAPI):
     orphans = bundles_mod.sweep_orphan_tmp()
     if orphans:
         print(f"[startup] 已清扫孤儿临时目录/文件 {orphans} 个", flush=True)
+    # 抽取闸门沙箱清扫：processing 任务已标 failed → 其沙箱为孤儿可清；
+    # awaiting（待闸门确认）跨重启存活不动（2026-08-26 抽取任务化）
+    from .pipeline import gate as gate_mod
+    gates = gate_mod.sweep_orphan_gates()
+    if gates:
+        print(f"[startup] 已清理孤儿抽取沙箱 {gates} 个", flush=True)
     # 测试子系统索引（独立于图谱，隔离）
     t_svc = get_test_service()
     print(

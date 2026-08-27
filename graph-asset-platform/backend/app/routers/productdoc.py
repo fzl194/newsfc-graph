@@ -1,14 +1,19 @@
 """productdoc router：两步流水线端点（上传页签三模式的后两模式）。
 
 步骤① ``POST /import/product-doc``：上传 .hwics → **只解压转换留存**（output 包）。
-步骤② ``POST /import/mine``：从已解压包挖掘图谱资产（模式+目录+范围）。
-辅助：``GET /import/modes``（模式下拉）、``GET /import/bundles``（包列表）、
-``GET /import/bundles/{nf}/{version}/locate``（定位推荐+候选）、
-jobs 列表/详情/删除。
+步骤② **抽取任务**（2026-08-26 任务化+入图闸门重构）：
+- ``GET /import/extractors``：抽取器下拉（注册表枚举，含 needs/roles）；
+- ``GET /import/target-assets``：目标 (nf,version) 四层资产存在性（依赖检查 UI）；
+- ``GET /import/bundles[...]``：包列表 / 包内目录定位（按目标网元名匹配）；
+- ``POST /import/extract``：发起任务（依赖**阻断** 400 / 同目标 awaiting 409）→
+  后台沙箱构建 → awaiting；
+- ``POST /import/extract/{job}/confirm|cancel``：闸门三选（覆盖/只新增/撤销）；
+- ``POST /import/extract/{job}/revert``：按任务移除本次产出（sha 守卫）；
+- jobs 列表/详情/删除。
 
-权限：中间件门控 upload（/api/v1/import*，=上传页签）；两类任务均**二次校验
-assets**（解压写 output 属数据目录、挖掘直接写资产库——与既有纵深防御一致）。
-安全底线（评审清单 2026-08-19 批准）：D1 nf/version 白名单；D4 流式落盘+2GB 上限；
+权限：中间件门控 upload（/api/v1/import*，=上传页签）；写端点均**二次校验
+assets**（解压写 output 属数据目录、抽取/闸门/回退直接写资产库——与既有纵深一致）。
+安全底线（评审清单 2026-08-19 沿用）：D1 nf/version 白名单；D4 流式落盘+2GB 上限；
 D6 各类任务互斥锁（检查→登记原子化）。
 """
 import os
@@ -19,9 +24,10 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Reque
 from pydantic import BaseModel
 
 from .. import config, jobs
-from ..pipeline import bundles, modes as modes_reg
-from ..pipeline.runner import (
-    expand_scope, locate_candidates, run_extract, run_mine)
+from ..pipeline import bundles, gate
+from ..pipeline import extractors as extractors_reg
+from ..pipeline.runner import locate_candidates, run_extract, run_mine
+from ..repos import extract_files_repo
 from ..telemetry.recorder import record
 from ..users.service import check_perm
 
@@ -58,7 +64,7 @@ async def upload_product_doc(
     version: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """上传产品文档归档 → 异步**解压转换留存**（不构建；构建走 /import/mine）。"""
+    """上传产品文档归档 → 异步**解压转换留存**（不构建；抽取走 /import/extract）。"""
     nf, version = nf.strip(), version.strip()
     _check_names(nf, version)
     suffix = Path(file.filename or "").suffix.lower()
@@ -113,12 +119,20 @@ def _run_extract_and_release(job_id: str, tmp: Path, nf: str, version: str, by: 
         jobs.release_mutex("product_doc_extract")
 
 
-# ---------- 步骤②：图谱挖掘 ----------
+# ---------- 步骤②：抽取任务（沙箱→闸门） ----------
 
-@router.get("/import/modes")
-def list_modes():
-    """解析模式下拉（注册表枚举；新模式注册即出现）。"""
-    return modes_reg.list_modes()
+@router.get("/import/extractors")
+def list_extractors():
+    """抽取器下拉（注册表枚举；新抽取器注册即出现）。needs=阻断依赖层。"""
+    return extractors_reg.list_extractors()
+
+
+@router.get("/import/target-assets")
+def target_assets(nf: str, version: str, request: Request):
+    """目标 (nf,version) 四层资产存在性——前端实时依赖检查（缺层禁提交）。"""
+    _check_names(nf, version)
+    _require_assets(request)
+    return bundles.assets_flags(nf, version)
 
 
 @router.get("/import/bundles")
@@ -128,95 +142,196 @@ def list_bundles():
 
 
 @router.get("/import/bundles/{nf}/{version}/locate")
-def locate(nf: str, version: str, request: Request, mode: str = "5gc"):
-    """包内源目录定位：自动推荐 + 全部候选（用户确认/改选，防猜错）。"""
+def locate(nf: str, version: str, request: Request,
+           extractor: str = "cmd", target_nf: str = ""):
+    """包内源目录定位：自动推荐 + 全部候选（用户确认/改选，防猜错）。
+    target_nf=**目标网元**（默认同包名）——逻辑网元名与包名不同时仍能严格匹配。"""
     _check_names(nf, version)
     _require_assets(request)
     bundle = bundles.get_bundle(nf, version)
     if bundle is None:
         raise HTTPException(status_code=404, detail=f"产品文档包不存在: {nf}_{version}")
-    m = modes_reg.get_mode(mode)
-    if m is None:
-        raise HTTPException(status_code=400, detail=f"解析模式不存在: {mode}")
-    return locate_candidates(bundles.bundle_dir(nf, version), m, nf)
+    x = extractors_reg.get_extractor(extractor)
+    if x is None:
+        raise HTTPException(status_code=400, detail=f"抽取器不存在: {extractor}")
+    return locate_candidates(bundles.bundle_dir(nf, version), x,
+                             (target_nf or nf).strip())
 
 
-class MineIn(BaseModel):
-    nf: str
-    version: str
-    mode: str = "5gc"
-    # 角色→包内相对路径（来自 locate 候选/逐层浏览）。v0.23.0：mml 支持 list
-    # （新产品文档命令拆多目录，多选）；其余角色仍单值（str 或单元素 list 均可）
+class ExtractIn(BaseModel):
+    bundle_nf: str
+    bundle_version: str
+    target_nf: str
+    target_version: str
+    extractor: str
+    # 角色→包内相对路径（来自 locate 候选/逐层浏览）。mml 支持 list（多目录，
+    # 构建器要求全部目录单次调用传入——跨批参见边才不丢）
     dirs: dict[str, "str | list[str]"] = {}
-    scope: list[str] = ["Command", "ConfigObject", "License", "Feature"]
-    force: bool = False
 
 
-@router.post("/import/mine")
-def mine(req: MineIn, request: Request, background: BackgroundTasks):
-    """从已解压包挖掘。门槛：包必须解压完成（用户约束 2026-08-19）；
-    依赖强制：勾选层的 needs 层资产不存在时自动补选（响应带 scope + notes）。"""
-    nf, version = req.nf.strip(), req.version.strip()
-    _check_names(nf, version)
+@router.post("/import/extract")
+def extract(req: ExtractIn, request: Request, background: BackgroundTasks):
+    """发起抽取任务：依赖**阻断**（缺层 400 报明细，不自动补齐——人来编排
+    「先命令后特性」）；同目标已有 awaiting 任务 409（沙箱/报告单份）。"""
+    bnf, bver = req.bundle_nf.strip(), req.bundle_version.strip()
+    tnf, tver = req.target_nf.strip(), req.target_version.strip()
+    _check_names(bnf, bver)
+    _check_names(tnf, tver)
     _require_assets(request)
-    mode_id = req.mode or "5gc"
-    scope = req.scope or ["Command", "ConfigObject", "License", "Feature"]
-    dirs = req.dirs or {}
-    force = req.force
 
-    m = modes_reg.get_mode(mode_id)
-    if m is None:
-        raise HTTPException(status_code=400,
-                            detail=f"解析模式不存在: {mode_id}")
-    valid_layers = {b.layer for b in m.builders}
-    bad = [s for s in scope if s not in valid_layers]
-    if bad:
-        raise HTTPException(status_code=400, detail=f"无效抽取范围: {bad}（可选 {sorted(valid_layers)}）")
-    bundle = bundles.get_bundle(nf, version)
+    x = extractors_reg.get_extractor(req.extractor)
+    if x is None:
+        raise HTTPException(status_code=400, detail=f"抽取器不存在: {req.extractor}")
+    bundle = bundles.get_bundle(bnf, bver)
     if bundle is None:
         raise HTTPException(status_code=404,
-                            detail=f"产品文档包 {nf}_{version} 不存在——请先在上传页完成解压")
+                            detail=f"产品文档包 {bnf}_{bver} 不存在——请先在上传页完成解压")
     if bundle["status"] != "done":
         raise HTTPException(status_code=400,
-                            detail=f"包 {nf}_{version} 未解压完成（{bundle['status']}）")
+                            detail=f"包 {bnf}_{bver} 未解压完成（{bundle['status']}）")
 
-    # 依赖强制（服务端权威；前端同规则锁 UI）
-    final_scope, added_notes = expand_scope(scope, m, nf, version)
+    # 依赖阻断（服务端权威；前端同规则预检禁提交）
+    missing = [L for L in x.needs
+               if not bundles.assets_flags(tnf, tver).get(L)]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": f"目标 {tnf}@{tver} 缺少依赖层资产: {'+'.join(missing)}"
+                              f"——请先完成对应抽取任务（本任务不自动补齐依赖）",
+                    "missing": missing})
 
-    # v0.23.0：命令范围勾选时，命令源目录（可多选）至少一个
     def _role_vals(role: str) -> list:
         v = req.dirs.get(role) or []
         return v if isinstance(v, list) else [v]
-    if "Command" in final_scope and not _role_vals("mml"):
-        raise HTTPException(status_code=400,
-                            detail="勾选命令范围时，命令源目录至少选择一个（可多选）")
+    lack_roles = [r for r in x.required_roles
+                  if not [p for p in _role_vals(r) if p and p.strip()]]
+    if lack_roles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"抽取器「{x.name}」必须选择源目录角色: {'、'.join(lack_roles)}")
 
+    clash = jobs.awaiting_for("product_doc_mine", tnf, tver)
+    if clash is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"目标 {tnf}@{tver} 已有待确认的抽取任务"
+                              f"（{clash.job_id}）——请先在闸门中确认或撤销",
+                    "job_id": clash.job_id})
     if not jobs.acquire_mutex("product_doc_mine"):
         running = jobs.has_processing("product_doc_mine")
         raise HTTPException(
             status_code=409,
-            detail={"message": "已有挖掘任务在跑"
+            detail={"message": "已有抽取任务在跑"
                     + (f"（{running.nf} {running.version} · {running.job_id}）" if running else ""),
                     "job_id": running.job_id if running else ""})
     try:
-        job = jobs.create_job(kind="product_doc_mine", nf=nf, version=version)
-        background.add_task(_run_mine_and_release, job.job_id, nf, version,
-                            mode_id, dirs, final_scope, force)
+        job = jobs.create_job(kind="product_doc_mine", nf=tnf, version=tver)
+        spec = {"bundle_nf": bnf, "bundle_version": bver,
+                "target_nf": tnf, "target_version": tver,
+                "extractor": req.extractor, "dirs": dict(req.dirs)}
+        background.add_task(_run_mine_and_release, job.job_id, spec)
     except Exception:
         jobs.release_mutex("product_doc_mine")
         raise
-    record("/import/mine", f"{nf}@{version}", "", user=request.state.user,
+    record("/import/extract", f"{tnf}@{tver}", "", user=request.state.user,
            caller=request.state.caller, level="object",
            operator=getattr(request.state, "operator", ""))
-    return {"job_id": job.job_id, "scope": final_scope, "notes": added_notes,
-            "force": force}
+    return {"job_id": job.job_id, "target_nf": tnf, "target_version": tver,
+            "extractor": req.extractor}
 
 
-def _run_mine_and_release(job_id, nf, version, mode_id, dirs, scope, force) -> None:
+def _run_mine_and_release(job_id: str, spec: dict) -> None:
+    """后台包装：沙箱构建→awaiting 后即释放互斥（闸门等待不占锁；确认/撤销/
+    回退端点各自短取锁）。"""
     try:
-        run_mine(job_id, nf, version, mode_id, dirs, scope, force)
+        run_mine(job_id, spec)
     finally:
         jobs.release_mutex("product_doc_mine")
+
+
+def _get_mine_job_or_404(job_id: str):
+    j = jobs.get_job(job_id)
+    if j is None or j.kind != "product_doc_mine":
+        raise HTTPException(status_code=404, detail=f"抽取任务不存在: {job_id}")
+    return j
+
+
+class ConfirmIn(BaseModel):
+    action: str  # overwrite | new_only
+
+
+@router.post("/import/extract/{job_id}/confirm")
+def confirm(job_id: str, req: ConfirmIn, request: Request):
+    """闸门确认：把沙箱变更落正式资产+索引+产物清单（同步端点，秒级）。
+    action=overwrite（重复覆盖，旧版备份供回退）| new_only（重复保留现有）。"""
+    _require_assets(request)
+    if req.action not in ("overwrite", "new_only"):
+        raise HTTPException(status_code=400, detail="action 仅支持 overwrite | new_only")
+    j = _get_mine_job_or_404(job_id)
+    if j.status != "awaiting":
+        raise HTTPException(status_code=409,
+                            detail=f"任务状态为 {j.status}，仅待确认（awaiting）任务可确认")
+    if not jobs.acquire_mutex("product_doc_mine"):
+        raise HTTPException(status_code=409, detail="已有抽取任务在跑，稍后确认")
+    try:
+        out = gate.apply_gate(job_id, req.action)
+    finally:
+        jobs.release_mutex("product_doc_mine")
+    record("/import/extract/confirm", job_id, "", user=request.state.user,
+           caller=request.state.caller, level="object",
+           operator=getattr(request.state, "operator", ""))
+    return {"ok": True, "job_id": job_id, **out}
+
+
+@router.post("/import/extract/{job_id}/cancel")
+def cancel(job_id: str, request: Request):
+    """闸门撤销：沙箱全删（正式资产从未被碰），任务终态 cancelled。"""
+    _require_assets(request)
+    j = _get_mine_job_or_404(job_id)
+    if j.status != "awaiting":
+        raise HTTPException(status_code=409,
+                            detail=f"任务状态为 {j.status}，仅待确认（awaiting）任务可撤销")
+    if not jobs.acquire_mutex("product_doc_mine"):
+        raise HTTPException(status_code=409, detail="已有抽取任务在跑，稍后撤销")
+    try:
+        gate.cancel_gate(job_id)
+    finally:
+        jobs.release_mutex("product_doc_mine")
+    record("/import/extract/cancel", job_id, "", user=request.state.user,
+           caller=request.state.caller, level="object",
+           operator=getattr(request.state, "operator", ""))
+    return {"ok": True, "job_id": job_id}
+
+
+@router.post("/import/extract/{job_id}/revert")
+def revert(job_id: str, request: Request):
+    """按任务移除本次抽取内容：新增→软删进回收站；覆盖→还原旧版备份。
+    sha 守卫：已被后续任务改动的文件跳过防误删。"""
+    _require_assets(request)
+    j = _get_mine_job_or_404(job_id)
+    if j.status != "done":
+        raise HTTPException(status_code=400,
+                            detail=f"仅已完成任务可回退（当前 {j.status}）")
+    if (j.result or {}).get("reverted_at"):
+        raise HTTPException(status_code=400, detail="该任务已回退过")
+    if extract_files_repo.count_for_job(_svc_db(), job_id) == 0:
+        raise HTTPException(status_code=400,
+                            detail="该任务无产物清单（旧任务或空产出），无法回退")
+    if not jobs.acquire_mutex("product_doc_mine"):
+        raise HTTPException(status_code=409, detail="已有抽取任务在跑，稍后回退")
+    try:
+        out = gate.revert_job(job_id, deleted_by=getattr(request.state, "user", ""))
+    finally:
+        jobs.release_mutex("product_doc_mine")
+    record("/import/extract/revert", job_id, "", user=request.state.user,
+           caller=request.state.caller, level="object",
+           operator=getattr(request.state, "operator", ""))
+    return {"ok": True, "job_id": job_id, **out}
+
+
+def _svc_db():
+    from ..service import get_service
+    return get_service().db
 
 
 # ---------- 任务历史 ----------
@@ -237,15 +352,30 @@ def get_job(job_id: str):
 
 @router.delete("/import/jobs/{job_id}")
 def delete_job(job_id: str, request: Request):
-    """删除历史任务（完成/失败可删；解析进行中不可删——用户决策）。"""
+    """删除历史任务（完成/失败/已撤销可删；进行中/待确认不可删——用户决策）。
+    删除抽取任务连带清沙箱备份与产物清单（**回退权随之丧失**）。"""
     _require_assets(request)
     j = jobs.get_job(job_id)
     if j is None:
         raise HTTPException(status_code=404, detail=f"job 不存在: {job_id}")
-    if j.status == "processing":
-        raise HTTPException(status_code=400, detail="任务解析进行中，不允许删除")
+    if j.status in ("processing", "awaiting"):
+        state = "解析进行中" if j.status == "processing" else "待闸门确认"
+        raise HTTPException(status_code=400, detail=f"任务{state}，不允许删除")
     if not jobs.delete_job(job_id):
         raise HTTPException(status_code=500, detail="删除失败")
+    if j.kind == "product_doc_mine":
+        # 与 confirm/revert 互斥（评审修复 2026-08-26）：防止回退进行中清掉 originals
+        if not jobs.acquire_mutex("product_doc_mine"):
+            raise HTTPException(status_code=409, detail="抽取任务闸门操作进行中，稍后删除")
+        try:
+            gate.cleanup(job_id)  # originals 备份（回退权丧失——UI 删除确认提示）
+            try:
+                extract_files_repo.delete_for_job(_svc_db(), job_id)
+                _svc_db().commit()
+            except Exception as e:  # noqa: BLE001 清单清理失败不阻断删任务，但留痕
+                print(f"[jobs] 删除任务 {job_id} 时清理产物清单失败: {e}", flush=True)
+        finally:
+            jobs.release_mutex("product_doc_mine")
     record("/import/jobs/delete", job_id, "", user=request.state.user,
            caller=request.state.caller, level="object",
            operator=getattr(request.state, "operator", ""))

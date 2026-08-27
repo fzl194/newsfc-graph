@@ -220,22 +220,57 @@
           </ul>
         </section>
 
-        <!-- ② 抽取配置 -->
+        <!-- ② 抽取配置（目标网元/版本可改——图谱逻辑网元名由你定） -->
         <section v-if="sel" class="card mine-card">
           <div class="mine-head">
-            <span class="mine-title">抽取配置 · {{ sel.nf }} {{ sel.version }}</span>
+            <span class="mine-title">抽取配置 · 包 {{ sel.nf }} {{ sel.version }}</span>
             <button class="ghost-btn2" @click="refreshLocate">重新定位</button>
+          </div>
+
+          <div class="pdoc-grid mine-grid">
+            <div class="field">
+              <label>目标网元 nf <span class="req">*</span></label>
+              <el-input v-model="targetNf" placeholder="默认同包名，可改" class="full" :disabled="mineBusy" />
+              <span v-if="nfHints.length" class="hint mono">图谱现有：{{ nfHints.join(', ') }}</span>
+            </div>
+            <div class="field">
+              <label>目标版本 version <span class="req">*</span></label>
+              <el-input v-model="targetVersion" placeholder="默认同包版本，可改" class="full" :disabled="mineBusy" />
+            </div>
+            <div class="field">
+              <label>抽取脚本 <span class="req">*</span></label>
+              <el-select v-model="extractorSel" class="full" :disabled="mineBusy">
+                <el-option v-for="x in extractorOptions" :key="x.id" :label="x.name" :value="x.id" />
+              </el-select>
+              <span class="hint">单脚本单任务；新脚本后台注册后此处自动出现</span>
+            </div>
+          </div>
+
+          <div v-if="currentExtractor" class="dep-row">
+            <template v-if="missingNeeds.length">
+              <span class="dep-missing">
+                ⚠ 目标 {{ targetNf }}@{{ targetVersion }} 缺少依赖层：{{ missingNeeds.join('、') }}
+                ——先完成对应抽取任务（不会自动补齐）
+              </span>
+            </template>
+            <span v-else-if="currentExtractor.needs.length" class="dep-ok">
+              ✓ 依赖已就绪（{{ currentExtractor.needs.join('、') }} 资产存在）
+            </span>
+            <span v-if="currentExtractor.rerun" class="dep-note">
+              · 特性抽取完成后自动重跑命令构建器补引用（变化一并进差异报告）
+            </span>
           </div>
 
           <div v-if="locating" class="hint">定位中…</div>
           <template v-else-if="locate">
             <div v-for="(role, key) in locate" :key="key" class="field loc-field">
               <label>
-                {{ ROLE_LABEL[key as string] || key }} 源目录 <span class="req">*</span>
+                {{ ROLE_LABEL[key as string] || key }} 源目录
+                <span v-if="requiredRoles.includes(key as string)" class="req">*</span>
                 <span v-if="role.note" class="loc-note">⚠ {{ role.note }}</span>
               </label>
               <div class="loc-row">
-                <!-- v0.23.0：命令源目录可多选（新产品文档命令拆分多目录）；其余角色单选 -->
+                <!-- 命令源目录可多选（命令拆多目录须单任务全选，跨批参见边才不丢） -->
                 <el-select
                   v-if="key === 'mml'"
                   v-model="dirs[key as string]"
@@ -275,30 +310,6 @@
             </div>
           </template>
 
-          <div class="pdoc-grid mine-grid">
-            <div class="field">
-              <label>解析模式 <span class="req">*</span></label>
-              <el-select v-model="modeSel" class="full">
-                <el-option v-for="m in modeOptions" :key="m.id" :label="m.name" :value="m.id" />
-              </el-select>
-              <span class="hint">模式与网元由你匹配；新脚本注册后此处自动出现</span>
-            </div>
-            <div class="field">
-              <label>抽取范围（默认全选；勾选特性/配置对象会自动带上其依赖层）</label>
-              <div class="scope-row">
-                <label v-for="l in SCOPE_LAYERS" :key="l" class="scope-item">
-                  <input
-                    type="checkbox"
-                    :checked="scope[l]"
-                    :disabled="mineBusy"
-                    @change="scope[l] = ($event.target as HTMLInputElement).checked"
-                  />
-                  {{ l }}
-                </label>
-              </div>
-            </div>
-          </div>
-
           <DirPickerDialog
             v-model:visible="pickerVisible"
             :bundle-dir="sel?.dir ?? ''"
@@ -306,18 +317,13 @@
             @pick="onPickerPick"
           />
 
-          <label v-if="hasExistingAssets" class="pd-force">
-            <input v-model="mineForce" type="checkbox" :disabled="mineBusy" />
-            覆盖重建（清空勾选层的旧资产后全量重建；同网元+版本已检测到现有资产）
-          </label>
-
           <div class="actions">
             <button
               class="primary-btn big"
               :disabled="!mineCanSubmit || mineBusy || hasRunning('product_doc_mine')"
-              @click="doMine"
+              @click="doExtractTask"
             >
-              {{ mineBusy || hasRunning('product_doc_mine') ? '挖掘中…' : `确认抽取（${finalScope.length} 层）` }}
+              {{ mineBusy || hasRunning('product_doc_mine') ? '抽取中…' : `开始抽取 → 门禁确认` }}
             </button>
           </div>
           <div v-if="mineErrorMsg" class="error-banner mono">{{ mineErrorMsg }}</div>
@@ -326,7 +332,7 @@
         <JobPanel
           :job="mineJob"
           :stats-labels="MINE_STAT_LABELS"
-          done-hint="图谱资产已入库 →「图谱浏览」查看；边/引用基线见《图谱边定义.md》"
+          done-hint="已入库；如质量不行可在下方历史任务「移除产出」按任务回退"
           @refresh-history="loadHistory"
         />
         <JobHistory
@@ -334,37 +340,49 @@
           :active-id="mineJob?.job_id"
           @view="(j) => viewJob(j, 'mine')"
           @remove="removeJob"
+          @revert="revertMineJob"
         />
       </template>
+
+      <!-- 入库闸门（el-dialog，位置无关）：awaiting 时弹出——三选后才落正式资产 -->
+      <GateDialog
+        :visible="gateVisible"
+        :job="gateJob"
+        @update:visible="gateVisible = $event"
+        @resolved="onGateResolved"
+      />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElButton, ElInput, ElSelect, ElOption, ElMessage } from 'element-plus'
+import { ElButton, ElInput, ElSelect, ElOption, ElMessage, ElMessageBox } from 'element-plus'
 import {
   stats,
   uploadToDir,
   uploadProductDoc,
   listBundles,
-  listModes,
+  listExtractors,
+  targetAssets,
   locateBundle,
-  startMine,
+  startExtract,
+  revertExtract,
   getImportJob,
   listImportJobs,
   deleteImportJob,
   type FsUploadResult,
   type ImportJob,
   type DocBundle,
-  type ModeOption,
+  type ExtractorOption,
   type LocateResult,
   type Stats,
 } from '../api'
 import JobPanel from '../components/JobPanel.vue'
 import JobHistory from '../components/JobHistory.vue'
 import DirPickerDialog from '../components/DirPickerDialog.vue'
+import GateDialog from '../components/GateDialog.vue'
 
 const route = useRoute()
 
@@ -408,6 +426,9 @@ onMounted(async () => {
   if (runningExtract) { exJob.value = runningExtract; exBusy.value = true; pollJob(runningExtract.job_id, 'extract') }
   const runningMine = history.value.find((j) => j.kind === 'product_doc_mine' && j.status === 'processing')
   if (runningMine) { mineJob.value = runningMine; mineBusy.value = true; pollJob(runningMine.job_id, 'mine') }
+  // 有待闸门确认的抽取任务 → 重开闸门弹窗（awaiting 跨重启存活）
+  const awaitingMine = history.value.find((j) => j.kind === 'product_doc_mine' && j.status === 'awaiting')
+  if (awaitingMine) { mineJob.value = awaitingMine; openGate(awaitingMine) }
 })
 
 const nfHints = computed(() => globalStats.value?.nfs ?? [])
@@ -503,6 +524,15 @@ function hasRunning(kind: 'product_doc_extract' | 'product_doc_mine'): boolean {
   return history.value.some((j) => j.kind === kind && j.status === 'processing')
 }
 async function removeJob(j: ImportJob): Promise<void> {
+  // 删除有产物清单的抽取任务 → 回退权随之丧失（originals 备份被清），先确认
+  const r = (j.result ?? {}) as Record<string, unknown>
+  if (j.kind === 'product_doc_mine' && j.status === 'done' && r.script && !r.reverted_at) {
+    try {
+      await ElMessageBox.confirm(
+        '删除后该任务的「移除产出」回退能力随之丧失（旧版备份一并清理）。继续？',
+        '删除抽取任务', { type: 'warning' })
+    } catch { return }
+  }
   try {
     await deleteImportJob(j.job_id)
     ElMessage.success(`已删除任务 ${j.job_id}`)
@@ -521,32 +551,39 @@ function fmtSize(n: number): string {
 }
 
 // 通用轮询（D13：连续 5 次失败或 404 即终态，不再无限重试）
+// 每 kind 独立定时器（2026-08-26 修复：解压+抽取同时进行时单定时器互相踢掉，
+// 先起的那个面板会卡在"进行中"且 busy 不复位）
 type PollKind = 'extract' | 'mine'
 const pollFailCount: Record<PollKind, number> = { extract: 0, mine: 0 }
-let pollTimer: ReturnType<typeof setInterval> | null = null
+const pollTimers: Record<PollKind, ReturnType<typeof setInterval> | null> = { extract: null, mine: null }
 
-function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+function stopPolling(kind?: PollKind) {
+  const kinds: PollKind[] = kind ? [kind] : ['extract', 'mine']
+  for (const k of kinds) {
+    if (pollTimers[k]) { clearInterval(pollTimers[k]!); pollTimers[k] = null }
+  }
 }
-onBeforeUnmount(stopPolling)
+onBeforeUnmount(() => stopPolling())
 watch(mode, () => stopPolling()) // 切模式即停当前轮询（历史可点回恢复）
 
 function pollJob(jobId: string, kind: PollKind) {
-  stopPolling()
+  stopPolling(kind)
   pollFailCount[kind] = 0
-  pollTimer = setInterval(async () => {
+  pollTimers[kind] = setInterval(async () => {
     try {
       const j = await getImportJob(jobId)
       pollFailCount[kind] = 0
       if (kind === 'extract') exJob.value = j
       else mineJob.value = j
       if (j.status !== 'processing') {
-        stopPolling()
+        stopPolling(kind)
         if (kind === 'extract') exBusy.value = false
         else mineBusy.value = false
         void loadHistory()
-        if (j.status === 'done') {
-          ElMessage.success(kind === 'extract' ? '解压完成' : '图谱抽取完成')
+        if (j.status === 'awaiting' && kind === 'mine') {
+          openGate(j) // 沙箱构建完成 → 闸门三选（弹窗在 GateDialog）
+        } else if (j.status === 'done') {
+          ElMessage.success(kind === 'extract' ? '解压完成' : '抽取入库完成')
           ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
           if (kind === 'mine') void loadBundles() // 刷新资产存在标志
         }
@@ -555,7 +592,7 @@ function pollJob(jobId: string, kind: PollKind) {
       const status = (e as { status?: number }).status
       pollFailCount[kind] += 1
       if (status === 404 || pollFailCount[kind] >= 5) {
-        stopPolling()
+        stopPolling(kind)
         if (kind === 'extract') exBusy.value = false
         else mineBusy.value = false
         ElMessage.warning('任务状态查询失败（后端可能已重启），请刷新页面或查看历史')
@@ -571,6 +608,8 @@ function viewJob(j: ImportJob, kind: PollKind) {
     if (kind === 'extract') exBusy.value = true
     else mineBusy.value = true
     pollJob(j.job_id, kind)
+  } else if (kind === 'mine' && j.status === 'awaiting') {
+    openGate(j) // 从历史点回待确认任务 → 重开闸门
   }
 }
 
@@ -622,34 +661,40 @@ async function doExtract() {
   }
 }
 
-// ============ 模式三：自动抽取（步骤②） ============
+// ============ 模式三：抽取任务（步骤②：沙箱构建 → 闸门三选 → 入库/回退） ============
 
 const ROLE_LABEL: Record<string, string> = { mml: '命令', feature: '特性', license: 'License' }
-const SCOPE_LAYERS = ['Command', 'ConfigObject', 'License', 'Feature'] as const
-type ScopeLayer = (typeof SCOPE_LAYERS)[number]
-// 依赖声明（与后端模式注册表一致；用于前端锁定 UI）
-const NEEDS: Record<string, string[]> = {
-  ConfigObject: ['Command'],
-  Feature: ['Command', 'License'],
-}
 
 const bundleList = ref<DocBundle[]>([])
 const bundlesLoading = ref(false)
 const sel = ref<DocBundle | null>(null)
 const locating = ref(false)
 const locate = ref<LocateResult | null>(null)
-// 角色选目录（统一数组存储）：mml 可多目录（v0.23.0 命令拆分多分册），其余单目录
+// 角色选目录（统一数组存储）：mml 可多目录（命令拆分多分册须单任务全选），其余单目录
 const dirs = ref<Record<string, string[]>>({})
 
 function setSingleDir(role: string, v: string): void {
   dirs.value[role] = v ? [v] : []
 }
-const modeOptions = ref<ModeOption[]>([])
-const modeSel = ref('5gc')
-const scope = reactive<Record<ScopeLayer, boolean>>({
-  Command: true, ConfigObject: true, License: true, Feature: true,
-})
-const mineForce = ref(false)
+
+// 目标网元/版本（默认=包的物理网元；图谱里的逻辑网元名由用户定，必可改）
+const targetNf = ref('')
+const targetVersion = ref('')
+
+// 抽取器（后台预制注册；单脚本单任务）
+const extractorOptions = ref<ExtractorOption[]>([])
+const extractorSel = ref('')
+const currentExtractor = computed(
+  () => extractorOptions.value.find((x) => x.id === extractorSel.value) ?? null)
+const requiredRoles = computed(() => currentExtractor.value?.required_roles ?? [])
+
+// 目标资产存在性 → 依赖阻断提示（后端权威；前端同规则预检禁提交）
+const targetAssetsMap = ref<Record<string, boolean>>({})
+const missingNeeds = computed(() =>
+  currentExtractor.value
+    ? currentExtractor.value.needs.filter((l) => !targetAssetsMap.value[l])
+    : [])
+
 const mineBusy = ref(false)
 const mineJob = ref<ImportJob | null>(null)
 const mineErrorMsg = ref('')
@@ -678,17 +723,31 @@ async function loadBundles(): Promise<void> {
   }
 }
 
-async function loadModeOptions(): Promise<void> {
-  try { modeOptions.value = await listModes() } catch { modeOptions.value = [] }
+async function loadExtractors(): Promise<void> {
+  try {
+    extractorOptions.value = await listExtractors()
+    if (!extractorSel.value && extractorOptions.value.length) {
+      extractorSel.value = extractorOptions.value[0].id
+    }
+  } catch { extractorOptions.value = [] }
+}
+
+async function refreshTargetAssets(): Promise<void> {
+  if (!targetNf.value.trim() || !targetVersion.value.trim()) { targetAssetsMap.value = {}; return }
+  try {
+    targetAssetsMap.value = await targetAssets(targetNf.value.trim(), targetVersion.value.trim())
+  } catch { targetAssetsMap.value = {} } // 命名非法等 → 不阻塞输入，提交时后端拦
 }
 
 async function selectBundle(b: DocBundle): Promise<void> {
   if (b.status !== 'done') return
   sel.value = b
-  await refreshLocate()
+  targetNf.value = b.nf          // 默认同包名（可改——逻辑网元）
+  targetVersion.value = b.version
+  await Promise.all([refreshLocate(), refreshTargetAssets()])
 }
 
-// 定位请求序号（竞态防护）：快速切换包时丢弃过期响应，防止"点 PCF 显示 UDM 目录"
+// 定位请求序号（竞态防护）：快速切换包/改目标网元时丢弃过期响应
 let locateSeq = 0
 
 async function refreshLocate(): Promise<void> {
@@ -698,7 +757,9 @@ async function refreshLocate(): Promise<void> {
   locating.value = true
   locate.value = null
   try {
-    const res = await locateBundle(bundle.nf, bundle.version, modeSel.value)
+    // 目录名严格匹配用**目标网元**（解耦核心：包 UDG 也能按 AMF 定位目录）
+    const res = await locateBundle(
+      bundle.nf, bundle.version, extractorSel.value || 'cmd', targetNf.value || bundle.nf)
     if (seq !== locateSeq || sel.value?.dir !== bundle.dir) return
     locate.value = res
     const next: Record<string, string[]> = {}
@@ -714,20 +775,10 @@ async function refreshLocate(): Promise<void> {
   }
 }
 
-// 依赖默认勾选（用户反馈 2026-08-19：不做锁定高亮，选特性/配置对象时默认带上依赖即可；
-// 后端 expand_scope 仍权威兜底——资产缺失的依赖层强制补选）
-function enforceScope(): void {
-  for (const l of SCOPE_LAYERS) {
-    if (!scope[l]) continue
-    for (const dep of NEEDS[l] ?? []) {
-      if (!sel.value?.assets[dep]) {
-        scope[dep as ScopeLayer] = true
-      }
-    }
-  }
-}
-watch(scope, enforceScope, { deep: true })
-watch(() => sel.value, enforceScope)
+// 改目标网元 → 重新定位（目录匹配）+ 依赖检查；切抽取器 → 角色集变化重新定位
+watch(targetNf, () => { void refreshLocate(); void refreshTargetAssets() })
+watch(targetVersion, () => { void refreshTargetAssets() })
+watch(extractorSel, () => { void refreshLocate() })
 
 // 逐层浏览选目录（用户反馈：候选下拉不够，需能逐层进入）
 const pickerVisible = ref(false)
@@ -750,34 +801,30 @@ function onPickerPick(rel: string): void {
   }
 }
 
-const finalScope = computed(() => SCOPE_LAYERS.filter((l) => scope[l]))
-const hasExistingAssets = computed(() =>
-  !!sel.value && finalScope.value.some((l) => sel.value!.assets[l]))
-
 const mineCanSubmit = computed(() => {
-  if (!sel.value || !finalScope.value.length) return false
-  // 三个源目录角色至少 mml/feature 被 Build 使用时不强制——由后端校验缺失参数；
-  // 前端宽松放行（后端 run 校验 dirs 完整性），仅要求定位已加载
-  return !!locate.value
+  if (!sel.value || !extractorSel.value) return false
+  if (!targetNf.value.trim() || !targetVersion.value.trim()) return false
+  if (missingNeeds.value.length) return false            // 依赖阻断（后端权威复检）
+  return !!locate.value                                   // 定位已加载（目录完整性后端校验）
 })
 
-async function doMine(): Promise<void> {
+async function doExtractTask(): Promise<void> {
   if (!mineCanSubmit.value || !sel.value) return
   mineBusy.value = true
   mineJob.value = null
   mineErrorMsg.value = ''
   try {
-    const r = await startMine({
-      nf: sel.value.nf,
-      version: sel.value.version,
-      mode: modeSel.value,
+    const r = await startExtract({
+      bundle_nf: sel.value.nf,
+      bundle_version: sel.value.version,
+      target_nf: targetNf.value.trim(),
+      target_version: targetVersion.value.trim(),
+      extractor: extractorSel.value,
       dirs: { ...dirs.value },
-      scope: [...finalScope.value],
-      force: mineForce.value,
     })
     mineJob.value = await getImportJob(r.job_id)
     void loadHistory()
-    pollJob(r.job_id, 'mine')
+    pollJob(r.job_id, 'mine')   // awaiting 时轮询自动停并开闸门弹窗
   } catch (e: unknown) {
     mineBusy.value = false
     const detail = (e as { detail?: unknown }).detail
@@ -789,9 +836,65 @@ async function doMine(): Promise<void> {
   }
 }
 
+// ---- 入库闸门（awaiting → 三选） ----
+
+const gateVisible = ref(false)
+const gateJob = ref<ImportJob | null>(null)
+
+function openGate(j: ImportJob): void {
+  gateJob.value = j
+  gateVisible.value = true
+}
+
+async function onGateResolved(action: 'overwrite' | 'new_only' | 'cancel'): Promise<void> {
+  if (action === 'cancel') {
+    ElMessage.info('已撤销——产出未入库，正式资产无任何改动')
+  } else {
+    ElMessage.success(action === 'overwrite'
+      ? '已入库（重复已覆盖，旧版自动备份可回退）'
+      : '已入库（只新增，重复保留现有版本）')
+  }
+  const jid = gateJob.value?.job_id
+  gateJob.value = null
+  await loadHistory()
+  void loadBundles()                                     // 刷新包行资产标志
+  ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
+  if (jid) {
+    try { mineJob.value = await getImportJob(jid) } catch { /* 已删除等 */ }
+  }
+}
+
+// ---- 按任务移除产出（revert） ----
+
+async function revertMineJob(j: ImportJob): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '将软删除本次新增的文件（进回收站）、还原本次覆盖的文件；已被后续任务改动的自动跳过。继续？',
+      '移除本次产出', { type: 'warning' })
+  } catch { return }
+  try {
+    const r = await revertExtract(j.job_id)
+    ElMessage.success(
+      `已移除产出：软删 ${r.soft_deleted} / 还原 ${r.restored}`
+      + (r.skipped.length ? ` / 跳过 ${r.skipped.length}（已被改动）` : ''))
+    await loadHistory()
+    void loadBundles()
+    ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
+    if (mineJob.value?.job_id === j.job_id) {
+      try { mineJob.value = await getImportJob(j.job_id) } catch { /* 已删除 */ }
+    }
+  } catch (e: unknown) {
+    const detail = (e as { detail?: unknown }).detail
+    if (typeof detail === 'string') ElMessage.error(detail)
+    else if (detail && typeof detail === 'object' && 'message' in detail) {
+      ElMessage.error(String((detail as { message: unknown }).message))
+    } else ElMessage.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
 watch(mode, async (m) => {
   if (m === 'mine') {
-    await Promise.all([loadBundles(), loadModeOptions()])
+    await Promise.all([loadBundles(), loadExtractors()])
   }
 }, { immediate: false })
 </script>
@@ -862,12 +965,14 @@ watch(mode, async (m) => {
 .slide-up-enter-active { transition: all var(--dur) var(--ease); }
 .slide-up-enter-from { opacity: 0; transform: translateY(8px); }
 
-/* ---- 产品文档解压 / 自动抽取 ---- */
+/* ---- 产品文档解压 / 抽取任务 ---- */
 .pdoc-card, .mine-card { display: flex; flex-direction: column; gap: var(--space-4); }
 .pdoc-grid { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-4); }
 .pdoc-drop { padding: var(--space-6); }
-.pd-force { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); cursor: pointer; }
-.pd-force input { accent-color: var(--accent); }
+.dep-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); font-size: 12px; background: var(--bg-sunken); border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); }
+.dep-missing { color: var(--danger); font-weight: 600; }
+.dep-ok { color: var(--success); }
+.dep-note { color: var(--text-faint); }
 .mine-head { display: flex; align-items: center; justify-content: space-between; }
 .mine-title { font-family: var(--display); font-weight: 600; font-size: 13.5px; }
 .ghost-btn2 { font-size: 12px; border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--text-muted); border-radius: var(--radius-sm); padding: 3px 10px; cursor: pointer; }
@@ -889,9 +994,4 @@ watch(mode, async (m) => {
 .loc-row { display: flex; gap: var(--space-2); align-items: center; }
 .loc-row .full { flex: 1; }
 .mine-grid { border-top: 1px solid var(--border-faint); padding-top: var(--space-4); }
-.scope-row { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); padding: 4px 0; }
-.scope-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text); cursor: pointer; }
-.scope-item input { accent-color: var(--accent); }
-.scope-item.locked { color: var(--accent); cursor: not-allowed; }
-.scope-item.locked input { cursor: not-allowed; }
 </style>

@@ -416,11 +416,11 @@ export interface ImportJobStep {
 export interface ImportJob {
   job_id: string
   kind: string // import | product_doc_extract | product_doc_mine
-  status: string // processing | done | failed
+  status: string // processing | awaiting | done | failed | cancelled
   nf: string
   version: string
   steps: ImportJobStep[]
-  result: Record<string, number | null | Record<string, number>>
+  result: Record<string, unknown>
   warnings: string[]
   error: string
   added: number
@@ -460,13 +460,24 @@ export interface DocBundle {
 export const listBundles = (): Promise<DocBundle[]> =>
   _req<DocBundle[]>(`${BASE}/import/bundles`)
 
-export interface ModeOption {
+/** 抽取器（后台预制注册；needs=阻断依赖层；roles=源目录角色；rerun=主构建后自动重跑）。 */
+export interface ExtractorOption {
   id: string
   name: string
+  needs: string[]
+  roles: string[]
+  required_roles: string[]
+  rerun: boolean
 }
 
-export const listModes = (): Promise<ModeOption[]> =>
-  _req<ModeOption[]>(`${BASE}/import/modes`)
+export const listExtractors = (): Promise<ExtractorOption[]> =>
+  _req<ExtractorOption[]>(`${BASE}/import/extractors`)
+
+/** 目标 (nf,version) 四层资产存在性（依赖检查：缺层禁提交）。 */
+export const targetAssets = (nf: string, version: string): Promise<Record<string, boolean>> =>
+  _req<Record<string, boolean>>(
+    `${BASE}/import/target-assets${qs({ nf, version })}`,
+  )
 
 export interface LocateRole {
   recommended: string | null
@@ -476,25 +487,71 @@ export interface LocateRole {
 
 export type LocateResult = Record<string, LocateRole>
 
-export const locateBundle = (nf: string, version: string, mode: string): Promise<LocateResult> =>
+/** 包内源目录定位：extractor 决定角色集；target_nf 参与目录名严格匹配（逻辑网元）。 */
+export const locateBundle = (
+  nf: string,
+  version: string,
+  extractor: string,
+  targetNf: string,
+): Promise<LocateResult> =>
   _req<LocateResult>(
-    `${BASE}/import/bundles/${encodeURIComponent(nf)}/${encodeURIComponent(version)}/locate${qs({ mode })}`,
+    `${BASE}/import/bundles/${encodeURIComponent(nf)}/${encodeURIComponent(version)}/locate${qs({ extractor, target_nf: targetNf })}`,
   )
 
-/** 步骤②：图谱挖掘（响应 scope=依赖强制后的最终范围，notes=补选说明）。 */
-export const startMine = (b: {
-  nf: string
-  version: string
-  mode: string
+/** 步骤②：发起抽取任务（沙箱构建→awaiting 闸门；目标网元/版本可异于包）。 */
+export const startExtract = (b: {
+  bundle_nf: string
+  bundle_version: string
+  target_nf: string
+  target_version: string
+  extractor: string
   dirs: Record<string, string | string[]>
-  scope: string[]
-  force: boolean
-}): Promise<{ job_id: string; scope: string[]; notes: string[]; force: boolean }> =>
-  _req(`${BASE}/import/mine`, {
+}): Promise<{ job_id: string; target_nf: string; target_version: string; extractor: string }> =>
+  _req(`${BASE}/import/extract`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(b),
   })
+
+/** 闸门差异条目（awaiting 时 job.result.modified）。 */
+export interface GateModified {
+  path: string
+  plus?: number
+  minus?: number
+  binary?: boolean
+  old_bytes?: number
+  new_bytes?: number
+}
+
+/** 闸门确认（overwrite=重复覆盖[旧版备份可回退] | new_only=重复保留现有）。 */
+export const confirmExtract = (
+  id: string,
+  action: 'overwrite' | 'new_only',
+): Promise<{
+  ok: boolean
+  job_id: string
+  stats: Record<string, number>
+  reindex: { indexed: number; removed: number }
+}> =>
+  _req(`${BASE}/import/extract/${id}/confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  })
+
+/** 闸门撤销（沙箱全删，正式资产从未被碰；任务终态 cancelled）。 */
+export const cancelExtract = (id: string): Promise<{ ok: boolean; job_id: string }> =>
+  _req(`${BASE}/import/extract/${id}/cancel`, { method: 'POST' })
+
+/** 按任务移除本次产出（add→软删回收站；modify→还原旧版；sha 守卫防误删）。 */
+export const revertExtract = (id: string): Promise<{
+  ok: boolean
+  job_id: string
+  soft_deleted: number
+  restored: number
+  skipped: string[]
+  reindex: { indexed: number; removed: number }
+}> => _req(`${BASE}/import/extract/${id}/revert`, { method: 'POST' })
 
 export const getImportJob = (id: string): Promise<ImportJob> =>
   _req<ImportJob>(`${BASE}/import/jobs/${id}`)

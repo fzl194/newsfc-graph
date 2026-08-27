@@ -62,13 +62,18 @@ def file_sha256(p: Path, chunk: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def _assets_flags(nf: str, version: str) -> dict:
-    """该 nf+version 四层图谱资产是否已存在（前端「依赖强制锁定」UI 数据源）。"""
+def assets_flags(nf: str, version: str) -> dict:
+    """该 nf+version 四层图谱资产是否已存在（抽取页依赖检查/包列表 UI 数据源；
+    抽取任务化后按**目标** nf/version 查询——GET /import/target-assets）。
+    长前缀枚举：>260 层目录普通 rglob 静默漏扫 → 依赖检查误报缺层。"""
     out: dict[str, bool] = {}
     for layer in ("Command", "ConfigObject", "Feature", "License"):
-        d = config.ASSETS_DIR / layer / nf / version
+        d = _win_long(config.ASSETS_DIR / layer / nf / version)
         out[layer] = d.is_dir() and next(d.rglob("*.md"), None) is not None
     return out
+
+
+_assets_flags = assets_flags  # 旧内部名（list_bundles 内用）
 
 
 def list_bundles() -> list:

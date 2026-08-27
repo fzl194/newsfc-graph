@@ -2,6 +2,8 @@ import shutil
 import uuid
 from pathlib import Path
 
+from .config import win_long as _win_long  # 超长路径（>260）fs 操作 helper
+
 
 class Store:
     """统一资产库读写：在 <data>/assets/ 下按相对路径读写 md 文件。
@@ -85,14 +87,15 @@ class Store:
             raise ValueError(f"非法 trash_id: {trash_id}")
 
     def soft_delete(self, rel: str) -> str:
-        """软删除：move 到 ``.trash/{uuid}/{原相对路径}``，返回 trash_id。内容完好可还原。"""
+        """软删除：move 到 ``.trash/{uuid}/{原相对路径}``，返回 trash_id。内容完好可还原。
+        全程长前缀：>260 的资产文件普通 exists/move 静默失败（2026-08-26 评审修复）。"""
         src = self._resolve(rel)
-        if not src.exists():
+        if not _win_long(src).exists():
             raise FileNotFoundError(rel)
         trash_id = uuid.uuid4().hex[:12]
         dst = self.trash / trash_id / Path(rel.replace("\\", "/"))
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
+        _win_long(dst).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_win_long(src)), str(_win_long(dst)))
         return trash_id
 
     def restore_from_trash(self, trash_id: str, rel: str) -> None:
@@ -101,23 +104,23 @@ class Store:
         if ".." in rel:
             raise ValueError(f"非法路径: {rel}")
         src = self.trash / trash_id / rel
-        if not src.exists():
+        if not _win_long(src).exists():
             raise FileNotFoundError(f"回收站条目不存在: {trash_id}")
         dst = self._resolve(rel)  # 校验未逃逸 assets 根
-        if dst.exists():
+        if _win_long(dst).exists():
             raise FileExistsError(f"原路径已被占用: {rel}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
+        _win_long(dst).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_win_long(src)), str(_win_long(dst)))
         leftover = self.trash / trash_id  # 清残留空目录
-        if leftover.exists() and not any(leftover.rglob("*")):
-            shutil.rmtree(leftover)
+        if _win_long(leftover).exists() and not any(_win_long(leftover).rglob("*")):
+            shutil.rmtree(str(_win_long(leftover)))
 
     def purge_trash(self, trash_id: str) -> bool:
         """永久删除单个回收站条目（物理删除，不可恢复）。"""
         self._check_trash_id(trash_id)
         p = self.trash / trash_id
-        if p.exists():
-            shutil.rmtree(p)
+        if _win_long(p).exists():
+            shutil.rmtree(str(_win_long(p)))
             return True
         return False
 
