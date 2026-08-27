@@ -80,7 +80,8 @@ def test_reindex_survives_concurrent_telemetry(tmp_data_dir, monkeypatch):
         stop.set()
         t.join(timeout=5)
 
-    assert ix["indexed"] == 40 and ix["removed"] == 0
+    # setup 已建库，mtime 未变的前缀对账应零重写，仍需能与打点并发。
+    assert ix["indexed"] == 0 and ix["removed"] == 0
     # 打点异步落库（v3 队列化）→ flush 后再断言
     assert tel_recorder.flush(timeout=10)
     # 索引完整（对象/FTS 对账）+ 打点行落库且经共享连接可见

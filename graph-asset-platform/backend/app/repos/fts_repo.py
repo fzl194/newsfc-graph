@@ -28,6 +28,16 @@ def escape_phrase(q: str) -> str:
 def upsert(conn: sqlite3.Connection, *, obj_id: str, version, body: str) -> None:
     version = "" if version is None else version
     delete(conn, obj_id, version)
+    insert(conn, obj_id=obj_id, version=version, body=body)
+
+
+def insert(conn: sqlite3.Connection, *, obj_id: str, version, body: str) -> None:
+    """纯插入 FTS + map。
+
+    调用方已删除旧键时必须用本函数，不可再走 ``upsert`` 的删除步骤；
+    否则 map 被第一次删掉后，第二次 delete 会退化为 UNINDEXED 全表扫。
+    """
+    version = "" if version is None else version
     cur = conn.execute(
         "INSERT INTO md_fts(obj_id, version, body) VALUES(?,?,?)",
         (obj_id, version, body),
@@ -42,6 +52,15 @@ def upsert(conn: sqlite3.Connection, *, obj_id: str, version, body: str) -> None
 def delete(conn: sqlite3.Connection, obj_id: str, version) -> None:
     """按 (obj_id,version) 删一行：map 命中走 rowid；缺失（存量/直写行）回退
     UNINDEXED 全扫删——正确性网底，慢但准。"""
+    if delete_mapped(conn, obj_id, version):
+        return
+    version = "" if version is None else version
+    conn.execute(
+        "DELETE FROM md_fts WHERE obj_id=? AND version=?", (obj_id, version))
+
+
+def delete_mapped(conn: sqlite3.Connection, obj_id: str, version) -> bool:
+    """仅在 map 命中时按 rowid 删除；不命中直接返回 False，绝不全表扫。"""
     version = "" if version is None else version
     rid = conn.execute(
         "SELECT fts_rowid FROM md_fts_map WHERE obj_id=? AND version=?",
@@ -51,9 +70,8 @@ def delete(conn: sqlite3.Connection, obj_id: str, version) -> None:
         conn.execute("DELETE FROM md_fts WHERE rowid=?", (rid[0],))
         conn.execute(
             "DELETE FROM md_fts_map WHERE obj_id=? AND version=?", (obj_id, version))
-        return
-    conn.execute(
-        "DELETE FROM md_fts WHERE obj_id=? AND version=?", (obj_id, version))
+        return True
+    return False
 
 
 def delete_many(conn: sqlite3.Connection, pairs: list) -> None:

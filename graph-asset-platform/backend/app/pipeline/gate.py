@@ -16,7 +16,9 @@
 import difflib
 import hashlib
 import json
+import os
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,7 +77,15 @@ def _iter_files(base: Path):
 def _copy(src: Path, dst: Path) -> None:
     d = _win_long(dst)
     d.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(_win_long(src)), str(d))
+    temporary = d.with_name(f".{d.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        shutil.copy2(str(_win_long(src)), str(temporary))
+        os.replace(str(temporary), str(d))
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def cleanup(job_id: str) -> None:
@@ -104,6 +114,13 @@ def sweep_orphan_gates() -> int:
         if j is None or j.status in ("failed", "cancelled"):
             shutil.rmtree(str(_win_long(d)), ignore_errors=True)
             n += 1
+        elif j.status == "done":
+            # done 已在 cleanup 前耐久提交；若当时清理被中断，
+            # 启动时只删可恢复的 storage，保留 originals 供 revert。
+            storage = d / "storage"
+            if _win_long(storage).exists():
+                shutil.rmtree(str(_win_long(storage)), ignore_errors=True)
+                n += 1
     return n
 
 
@@ -218,9 +235,20 @@ def apply_gate(job_id: str, action: str) -> dict:
     （sha=沙箱内容=应用后内容），故**先写清单后拷贝**——拷贝中途崩溃重试时，
     已落盘文件分类为 identical，其上次清单行 merge 保留；未落盘文件重分类照常
     补拷。任何路径下清单都覆盖全部应落盘文件，revert 不会丢覆盖面。
+
+    分类、清单、复制和索引必须共用同一个 ``import_lock`` 临界区；否则
+    ``new_only`` 分类为 new 后，并发写者刚创建的文件可能仍被沙箱覆盖。
     """
+    from ..service import import_lock
+
+    with import_lock:
+        return _apply_gate_locked(job_id, action)
+
+
+def _apply_gate_locked(job_id: str, action: str) -> dict:
+    """``apply_gate`` 的临界区实现；调用方已经持有 ``import_lock``。"""
     from ..repos import extract_files_repo
-    from ..service import get_service, import_lock
+    from ..service import get_service
     svc = get_service()
     j = jobs.get_job(job_id)
     res = dict(j.result or {})
@@ -236,7 +264,16 @@ def apply_gate(job_id: str, action: str) -> dict:
         sand = gate_storage(job_id) / layer / nf / ver
         live_dir = config.ASSETS_DIR / layer / nf / ver
         for rel, kind, _detail in _classify(sand, live_dir):
-            plan.append((layer, rel, kind, _sha(sand / rel) if kind != "sidecar" else ""))
+            sha_sandbox = _sha(sand / rel)
+            if kind == "sidecar":
+                live = live_dir / rel
+                if not _win_long(live).exists():
+                    kind = "sidecar_new"
+                elif _sha(live) == sha_sandbox:
+                    kind = "sidecar_identical"
+                else:
+                    kind = "sidecar_modified"
+            plan.append((layer, rel, kind, sha_sandbox))
 
     # ---- 清单先行（可完整推导）：当前分类行 ∪ 上次失败尝试的行 ----
     # 上次 apply 写过清单（成功后任务已 done 不可重试——只可能来自失败重试）
@@ -244,26 +281,32 @@ def apply_gate(job_id: str, action: str) -> dict:
     rows_map: dict = {}
     for layer, rel, kind, sha_p in plan:
         rel_full = f"{layer}/{nf}/{ver}/{rel}"
-        if kind == "sidecar":
-            continue                                          # sidecar 不入清单
-        if kind == "new":
+        if kind in ("new", "sidecar_new"):
             rows_map[rel_full] = (rel_full, "add", sha_p, layer)
-        elif kind == "modified" and action == "overwrite":
+        elif kind in ("modified", "sidecar_modified") and action == "overwrite":
             rows_map[rel_full] = (rel_full, "modify", sha_p, layer)
     for p, r in prev.items():                                 # 失败重试：已落盘文件保行
         rows_map.setdefault(p, (p, r["op"], r["sha256"], r["layer"]))
-    with import_lock:
-        extract_files_repo.replace_for_job(svc.db, job_id, list(rows_map.values()))
-        svc.db.commit()
+    extract_files_repo.replace_for_job(svc.db, job_id, list(rows_map.values()))
+    svc.db.commit()
 
     # ---- Pass B：执行拷贝（清单已在库——中断重试自愈）----
     for layer, rel, kind, _sha_p in plan:
         sand = gate_storage(job_id) / layer / nf / ver
         live_dir = config.ASSETS_DIR / layer / nf / ver
         rel_full = f"{layer}/{nf}/{ver}/{rel}"
-        if kind == "sidecar":
+        if kind == "sidecar_new":
             _copy(sand / rel, live_dir / rel)
             stats["sidecars"] += 1
+        elif kind == "sidecar_modified":
+            if action == "overwrite":
+                _copy(live_dir / rel, gate_originals(job_id) / rel_full)
+                _copy(sand / rel, live_dir / rel)
+                stats["sidecars"] += 1
+            else:
+                stats["skipped_existing"] += 1
+        elif kind == "sidecar_identical":
+            stats["skipped_identical"] += 1
         elif kind == "new":
             _copy(sand / rel, live_dir / rel)
             stats["added"] += 1
@@ -276,32 +319,37 @@ def apply_gate(job_id: str, action: str) -> dict:
             _copy(sand / rel, live_dir / rel)
             stats["modified"] += 1
 
+    # 重试时文件已经 identical，变更计数必须以耐久清单为准，
+    # 不能以本次拷贝次数为准（否则 added 会变 0）。
+    stats["added"] = sum(1 for row in rows_map.values()
+                         if row[1] == "add" and not Path(row[0]).name.startswith("_"))
+    stats["modified"] = sum(1 for row in rows_map.values()
+                            if row[1] == "modify" and not Path(row[0]).name.startswith("_"))
     counts, missing = _manifest_counts(job_id, written, nf, ver)
     extra_warnings += [f"{L} 构建后 manifest 缺失（计数未知，请核查）" for L in missing]
-    with import_lock:
-        try:
-            ix = svc.reindex_prefixes([f"{L}/{nf}/{ver}" for L in written])
-        except Exception as e:  # noqa: BLE001 资产已落盘+清单已写——标 done 带告警（留在 awaiting 重试会因全 identical 空转）
-            ix = {"indexed": 0, "removed": 0}
-            extra_warnings.append(f"增量索引失败（{e}）——资产已入库，索引将由启动对账/下次抽取补齐")
-        # 包元信息（最近抽取器；包可能已被替换/删除——尽力而为）
-        try:
-            bd = bundles.bundle_dir(res.get("bundle_nf", ""), res.get("bundle_version", ""))
-            meta = bundles.read_meta(bd)
-            if meta is not None:
-                meta["mode_id"] = res.get("script", "")
-                meta["mined_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                bundles.write_meta(bd, meta)
-        except Exception:  # noqa: BLE001
-            pass
-    # 沙箱大头可清（originals 留给 revert）
-    shutil.rmtree(str(_win_long(gate_storage(job_id))), ignore_errors=True)
-
+    # 只对本任务清单中的真实变更 md 对账，不再全扫 Command/
+    # ConfigObject/Feature 前缀。索引失败必须保持 awaiting 可重试，
+    # 不得带告警假装 done。
+    ix = svc.reindex_paths(rows_map.keys())
+    # 包元信息（最近抽取器；包可能已被替换/删除——尽力而为）
+    try:
+        bd = bundles.bundle_dir(res.get("bundle_nf", ""), res.get("bundle_version", ""))
+        meta = bundles.read_meta(bd)
+        if meta is not None:
+            meta["mode_id"] = res.get("script", "")
+            meta["mined_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            bundles.write_meta(bd, meta)
+    except Exception:  # noqa: BLE001
+        pass
+    # **耐久完成点**：必须先于 storage 清理。若 DB 不可写，
+    # update_job 显式抛错，sandbox/manifest/originals 均保留，可重试/撤销。
     jobs.update_job(job_id, status="done",
                     result={**res, "stage": "applied", "applied": stats,
                             "layers": counts, "total": sum(counts.values())},
                     warnings=list(j.warnings or []) + extra_warnings,
                     added=stats["added"] + stats["modified"])
+    # 沙箱大头是可恢复型垃圾；清理失败不能回滚已持久化的 done。
+    shutil.rmtree(str(_win_long(gate_storage(job_id))), ignore_errors=True)
     return {"stats": stats, "layers": counts, "reindex": ix}
 
 
@@ -310,36 +358,41 @@ def cancel_gate(job_id: str) -> None:
 
     apply 失败重试路径可能已**部分落盘**（清单先行设计）→ 按清单 sha 守卫回滚
     已落盘文件（add→删除，modify→还原 originals），再清沙箱与清单行。
-    泄漏文件从未被索引（reindex 在拷贝之后），无需动 DB。
+    每次重试都对完整清单精确索引对账：即使上次已改完文件、仅索引提交失败，
+    本次也能清掉幽灵节点或恢复旧节点。
     """
     from ..repos import extract_files_repo
-    from ..service import get_service
+    from ..service import get_service, import_lock
     svc = get_service()
-    try:
+    with import_lock:
         rows = extract_files_repo.list_for_job(svc.db, job_id)
-    except Exception:  # noqa: BLE001
-        rows = []
-    for r in rows:
-        live = config.ASSETS_DIR / r["path"]
-        try:
-            cur = _sha(live) if _win_long(live).exists() else None
-        except OSError:
-            cur = None
-        if cur is None or cur != r["sha256"]:
-            continue  # 未落盘（清单先行的正常形态）或已被外部改动——不动
-        if r["op"] == "add":
-            _win_long(live).unlink()
-        else:  # modify → 还原旧版
-            orig = gate_originals(job_id) / r["path"]
-            if _win_long(orig).exists():
+        for r in rows:
+            live = config.ASSETS_DIR / r["path"]
+            try:
+                cur = _sha(live) if _win_long(live).exists() else None
+            except OSError:
+                cur = None
+            if cur is None or cur != r["sha256"]:
+                continue  # 未落盘或已被外部改动——不动
+            if r["op"] == "add":
+                _win_long(live).unlink()
+            else:  # modify → 还原旧版
+                orig = gate_originals(job_id) / r["path"]
+                if not _win_long(orig).exists():
+                    continue
                 _copy(orig, live)
+        # apply 可能已分块提交过索引。必须总是对完整 manifest 补偿，不能只用
+        # 本轮改动列表：前一轮可能已还原文件、却在 reindex 中断。
+        svc.reindex_paths(r["path"] for r in rows)
+    # 终态先落库，再删可恢复资料。
+    jobs.update_job(job_id, status="cancelled")
     cleanup(job_id)
     try:
-        extract_files_repo.delete_for_job(svc.db, job_id)
-        svc.db.commit()
-    except Exception:  # noqa: BLE001 孤儿清单行无害（job 已 cancelled 不可回退）
-        pass
-    jobs.update_job(job_id, status="cancelled")
+        with import_lock:
+            extract_files_repo.delete_for_job(svc.db, job_id)
+            svc.db.commit()
+    except Exception as exc:  # noqa: BLE001 已 cancelled，清单只是可清理垃圾
+        print(f"[gate] 任务 {job_id} 取消后清单清理失败: {exc}", flush=True)
 
 
 # ---------- 按任务回退 ----------
@@ -354,13 +407,13 @@ def revert_job(job_id: str, deleted_by: str = "") -> dict:
     res = dict(j.result or {})
     svc = get_service()
     out = {"soft_deleted": 0, "restored": 0, "skipped": []}
-    prefixes: set = set()
 
     def _skip(path: str, why: str) -> None:
         out["skipped"].append(f"{path}（{why}）")
 
     with import_lock:
-        for r in extract_files_repo.list_for_job(svc.db, job_id):
+        rows = extract_files_repo.list_for_job(svc.db, job_id)
+        for r in rows:
             live = config.ASSETS_DIR / r["path"]
             try:
                 cur = _sha(live) if _win_long(live).exists() else None
@@ -373,93 +426,133 @@ def revert_job(job_id: str, deleted_by: str = "") -> dict:
                 _skip(r["path"], "已被后续任务/手工修改，跳过防误删")
                 continue
             try:
+                is_sidecar = Path(r["path"]).name.startswith("_")
                 if r["op"] == "add":
-                    trash_id = svc.store.soft_delete(r["path"])
-                    trash_repo.insert(
-                        svc.db, trash_id=trash_id, original_path=r["path"],
-                        is_dir=False, md_count=1 if r["path"].endswith(".md") else 0,
-                        deleted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        deleted_by=deleted_by)
-                    out["soft_deleted"] += 1
+                    if is_sidecar:
+                        _win_long(live).unlink()
+                    else:
+                        trash_id = svc.store.soft_delete(r["path"])
+                        trash_repo.insert(
+                            svc.db, trash_id=trash_id, original_path=r["path"],
+                            is_dir=False, md_count=1 if r["path"].endswith(".md") else 0,
+                            deleted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            deleted_by=deleted_by)
+                        out["soft_deleted"] += 1
                 else:  # modify → 还原旧版
                     orig = gate_originals(job_id) / r["path"]
                     if not _win_long(orig).exists():
                         _skip(r["path"], "旧版备份缺失")
                         continue
                     _copy(orig, live)
-                    out["restored"] += 1
+                    if not is_sidecar:
+                        out["restored"] += 1
             except (OSError, ValueError) as e:
                 _skip(r["path"], f"操作失败: {e}")
                 continue
-            prefixes.add("/".join(r["path"].split("/")[:3]))  # Layer/nf/version
-
         svc.db.commit()
-        if prefixes:
-            out["reindex"] = svc.reindex_prefixes(sorted(prefixes))
-        else:
-            out["reindex"] = {"indexed": 0, "removed": 0}
-        extract_files_repo.delete_for_job(svc.db, job_id)
-        svc.db.commit()
+        # 同 cancel：索引补偿失败后的重试必须覆盖完整清单，即便本轮因 sha
+        # 守卫未再次修改文件，也要让 objects/FTS 与当前 live 状态收敛。
+        out["reindex"] = svc.reindex_paths(r["path"] for r in rows)
 
-    cleanup(job_id)  # originals 已消费
+    # 终态先于 originals/清单清理；落库失败时仍可幂等重试。
     jobs.update_job(job_id, status="done", result={
         **res, "stage": "applied", "reverted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "revert": {"soft_deleted": out["soft_deleted"], "restored": out["restored"],
                    "skipped": out["skipped"]}})
+    with import_lock:
+        extract_files_repo.delete_for_job(svc.db, job_id)
+        svc.db.commit()
+    cleanup(job_id)  # originals 已消费
     return out
+
+
+def _reconcile_applying(job, res: dict, svc, extract_files_repo, fts_repo) -> None:
+    """在 ``import_lock`` 内原子核验 applying 的资产、清单和索引快照。"""
+    manifest = extract_files_repo.list_for_job(svc.db, job.job_id)
+    storage_exists = _win_long(gate_storage(job.job_id)).exists()
+    all_applied = bool(manifest) and not storage_exists
+    for row in manifest:
+        live = config.ASSETS_DIR / row["path"]
+        try:
+            if not _win_long(live).is_file() or _sha(live) != row["sha256"]:
+                all_applied = False
+                break
+        except OSError:
+            all_applied = False
+            break
+        if row["path"].lower().endswith(".md") and not svc.db.execute(
+            "SELECT 1 FROM objects WHERE source_path=? LIMIT 1", (row["path"],)
+        ).fetchone():
+            all_applied = False
+            break
+    if all_applied:
+        all_applied = fts_repo.integrity_ok(svc.db)
+    if all_applied:
+        stats = dict(res.get("applied") or {})
+        stats.update(
+            added=sum(1 for row in manifest if row["op"] == "add"
+                      and not Path(row["path"]).name.startswith("_")),
+            modified=sum(1 for row in manifest if row["op"] == "modify"
+                         and not Path(row["path"]).name.startswith("_")),
+        )
+        stats.setdefault("skipped_identical", 0)
+        stats.setdefault("skipped_existing", 0)
+        stats.setdefault("sidecars", 0)
+        res.update(stage="applied", applied=stats)
+        jobs.update_job(
+            job.job_id, status="done", result=res,
+            added=stats["added"] + stats["modified"],
+            warnings=[*job.warnings,
+                      "对账确认资产/索引/清单已完成，已自动修复任务终态"],
+        )
+    elif storage_exists:
+        res["stage"] = "gate"
+        res["confirm_error"] = "入库执行中断——可重新确认或撤销"
+        jobs.update_job(job.job_id, status="awaiting", result=res)
+    else:
+        jobs.update_job(
+            job.job_id, status="failed", result=res,
+            error="入库中断且 sandbox 缺失，清单/资产/索引无法完整对账，请人工核查",
+        )
 
 
 def reconcile_interrupted() -> int:
     """重启对账（main.py 在 ``sweep_interrupted`` **之前**调用）：中断于确认/回退
     **执行中**（status=processing + result.stage ∈ applying/reverting）的抽取任务复位。
 
-    - applying → awaiting：清单先行+sha 守卫使重试安全；也可撤销（cancel 会按
-      清单回滚已落盘部分）；
+    - applying 且资产/索引/清单均已完成 → done；仍有 sandbox → awaiting，
+      清单先行+sha 守卫使重试或撤销安全；无法完整验证 → failed；
     - reverting → done + 告警：reverted_at 未写、清单行未消费（末尾才删），
       每文件守卫使重新发起「移除产出」安全。
 
     真正的抽取运行中断（stage=running）不在本函数范围——仍由 sweep_interrupted
     标 failed。返回复位数。
     """
-    import time as _time
-    db = jobs._db()
-    try:
-        rows = db.execute(
-            "SELECT job_id, result, warnings FROM import_jobs "
-            "WHERE kind='product_doc_mine' AND status='processing'").fetchall()
-    except Exception:  # noqa: BLE001
-        return 0
+    from ..repos import extract_files_repo, fts_repo
+    from ..service import get_service, import_lock
+
+    svc = get_service()
+    candidates = jobs.find_jobs("product_doc_mine", ("processing",))
     n = 0
-    for r in rows:
-        try:
-            res = json.loads(r["result"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if res.get("stage") == "applying":
-            res["stage"] = "gate"
-            res["confirm_error"] = "后端重启，入库执行中断——可重新确认或撤销"
-            db.execute("UPDATE import_jobs SET status='awaiting', result=? WHERE job_id=?",
-                       (json.dumps(res, ensure_ascii=False), r["job_id"]))
+    for job in candidates:
+        res = dict(job.result or {})
+        if res.get("stage") == "gate_ready":
+            jobs.update_job(
+                job.job_id, status="awaiting", result={**res, "stage": "gate"},
+                warnings=[*job.warnings, "差异报告已完成，已自动恢复待确认状态"],
+            )
+            n += 1
+        elif res.get("stage") == "applying":
+            # 调用方已持 kind mutex；随后统一取 import_lock，与 apply/cancel/revert
+            # 锁序一致，保证文件、manifest、objects/FTS 来自同一快照。
+            with import_lock:
+                _reconcile_applying(job, res, svc, extract_files_repo, fts_repo)
             n += 1
         elif res.get("stage") == "reverting":
-            try:
-                warns = json.loads(r["warnings"] or "[]")
-            except (json.JSONDecodeError, TypeError):
-                warns = []
-            warns.append("后端重启，回退执行中断——可重新发起「移除产出」")
-            res["revert_error"] = "后端重启，回退执行中断"
-            db.execute(
-                "UPDATE import_jobs SET status='done', result=?, warnings=?, finished_at=? "
-                "WHERE job_id=?",
-                (json.dumps(res, ensure_ascii=False), json.dumps(warns, ensure_ascii=False),
-                 _time.time(), r["job_id"]))
+            res["revert_error"] = "回退执行中断"
+            jobs.update_job(
+                job.job_id, status="done", result=res,
+                warnings=[*job.warnings, "回退执行中断——可重新发起「移除产出」"],
+            )
             n += 1
-    db.commit()
-    # 内存副本同步（重启后 registry 为空；测试/同进程场景用）
-    with jobs._lock:
-        for jid in [r["job_id"] for r in rows]:
-            if jid in jobs._registry:
-                fresh = db.execute("SELECT * FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
-                if fresh:
-                    jobs._registry[jid] = jobs._from_row(fresh)
     return n

@@ -218,6 +218,22 @@ class TestExtractStep1Endpoint:
         j = client.get(f"/api/v1/import/jobs/{jid}").json()
         assert j["kind"] == "product_doc_extract" and j["status"] == "done"
 
+    def test_job_persistence_failure_returns_503_and_removes_upload(self, monkeypatch):
+        import app.config as config
+        from app import jobs as jobs_mod
+
+        def fail_create(**_kwargs):
+            raise jobs_mod.JobPersistenceError("database path should stay private")
+
+        monkeypatch.setattr(jobs_mod, "create_job", fail_create)
+        response = self._post()
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "任务状态库暂时不可用，请稍后重试"
+        assert not list(config.DATA_DIR.glob(".pdoc_up_*"))
+        assert jobs_mod.acquire_mutex("product_doc_extract")
+        jobs_mod.release_mutex("product_doc_extract")
+
     def test_mutex_rejects_second(self, monkeypatch):
         from app import jobs as jobs_mod
         assert jobs_mod.acquire_mutex("product_doc_extract")
@@ -311,6 +327,29 @@ class TestExtractEndpoint:
         finally:
             jobs_mod.update_job(j.job_id, status="cancelled")
             jobs_mod.delete_job(j.job_id)
+
+    def test_serial_guard_rechecks_pending_after_mutex(self, monkeypatch):
+        """锁外检查后才出现 awaiting 任务时，锁内复检必须阻止第二任务创建。"""
+        from app import jobs as jobs_mod
+        import app.routers.productdoc as pd
+
+        clash = jobs_mod.create_job(kind="product_doc_mine", nf="OTHER", version="9.9")
+        jobs_mod.update_job(clash.job_id, status="awaiting")
+        calls = {"n": 0}
+
+        def delayed_pending(kind):
+            calls["n"] += 1
+            return None if calls["n"] == 1 else clash
+
+        monkeypatch.setattr(pd, "_reconcile_idle_jobs", lambda: None)
+        monkeypatch.setattr(jobs_mod, "pending_for", delayed_pending)
+        response = self._extract()
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["job_id"] == clash.job_id
+        assert calls["n"] == 2
+        assert jobs_mod.acquire_mutex("product_doc_mine")
+        jobs_mod.release_mutex("product_doc_mine")
 
     def test_serial_guard_cleared_after_cancel(self, monkeypatch):
         from app import jobs as jobs_mod
@@ -550,3 +589,27 @@ class TestReindexPrefixes:
     def test_empty_prefix_guard(self, tmp_data_dir, monkeypatch):
         s = _svc(tmp_data_dir, monkeypatch)
         assert s.reindex_prefixes(["", " / "]) == {"indexed": 0, "removed": 0}
+
+    def test_unchanged_files_are_not_reparsed(self, tmp_data_dir, monkeypatch):
+        """重复前缀对账只处理 mtime 变化文件，不重写整个 trigram 索引。"""
+        s = _svc(tmp_data_dir, monkeypatch)
+        directory = tmp_data_dir / "Command" / "X" / "1.0"
+        directory.mkdir(parents=True)
+        unchanged = directory / "unchanged.md"
+        changed = directory / "changed.md"
+        unchanged.write_text(CMD_MD.format(nf="X", ver="1.0", name="SHOW A"), encoding="utf-8")
+        changed.write_text(CMD_MD.format(nf="X", ver="1.0", name="SHOW B"), encoding="utf-8")
+        assert s.reindex_prefixes(["Command/X/1.0"])["indexed"] == 2
+
+        changed.write_text(CMD_MD.format(nf="X", ver="1.0", name="SHOW B2"), encoding="utf-8")
+        touched = []
+        original = s.reindex_path
+
+        def track(rel, *args, **kwargs):
+            touched.append(rel)
+            return original(rel, *args, **kwargs)
+
+        monkeypatch.setattr(s, "reindex_path", track)
+        result = s.reindex_prefixes(["Command/X/1.0"])
+        assert result == {"indexed": 1, "removed": 0}
+        assert touched == ["Command/X/1.0/changed.md"]

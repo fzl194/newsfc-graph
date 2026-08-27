@@ -167,6 +167,18 @@ class Store:
             for p in self.root.rglob("*.md")
         ]
 
+    def list_md_under(self, rel: str) -> list:
+        """仅枚举已校验相对前缀下的 md，避免前缀索引先扫整个资产库。"""
+        directory = _win_long(self._resolve(rel))
+        if not directory.is_dir():
+            return []
+        root = _win_long(self._root_resolved)
+        return sorted(
+            path.relative_to(root).as_posix()
+            for path in directory.rglob("*.md")
+            if path.is_file()
+        )
+
     def list_children(self, rel: str = "") -> list:
         """列 rel 目录的直接子项（目录在前、文件在后，各自字母序）。
 

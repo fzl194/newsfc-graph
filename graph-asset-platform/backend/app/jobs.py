@@ -60,7 +60,10 @@ class ImportJob:
 
 
 _registry: dict[str, ImportJob] = {}
-_lock = threading.Lock()
+# sqlite3.Connection 即使 check_same_thread=False 也不能被多线程同时调用。
+# registry 与 jobs 专用连接共用一把可重入锁，保证“持久化成功后才发布
+# 内存快照”，也防止 SELECT/commit 之间的连接竞态。
+_lock = threading.RLock()
 
 # 各类任务的全局互斥锁（检查→登记 原子化，修 TOCTOU；评审清单 D6）
 _mutex_locks = {k: threading.Lock() for k in _KINDS}
@@ -70,11 +73,25 @@ _mutex_locks = {k: threading.Lock() for k in _KINDS}
 
 _conn: "sqlite3.Connection | None" = None
 
+
+class JobPersistenceError(RuntimeError):
+    """任务状态无法可靠持久化。
+
+    关键状态不得再静默降级为“仅内存成功”；调用方必须中止后续清理，
+    保留 sandbox/manifest 供重试或对账。
+    """
+
+
+# busy_timeout 已在 SQLite 内等待 1s；这里再做有界退避，吸收 WAL 写者
+# 刚好连续抢锁的短时饥饿。测试可 monkeypatch 为 (0, 0)。
+_PERSIST_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+
 _TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS import_jobs(
   job_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
   nf TEXT DEFAULT '', version TEXT DEFAULT '',
   status TEXT NOT NULL, added INTEGER DEFAULT 0,
+  updated INTEGER DEFAULT 0, skipped INTEGER DEFAULT 0,
   steps TEXT DEFAULT '[]', result TEXT DEFAULT '{}', warnings TEXT DEFAULT '[]',
   error TEXT DEFAULT '', started_at REAL NOT NULL, finished_at REAL DEFAULT 0,
   child_pids TEXT DEFAULT '[]'
@@ -86,46 +103,97 @@ CREATE INDEX IF NOT EXISTS idx_import_jobs_started ON import_jobs(started_at);
 def _db() -> sqlite3.Connection:
     """jobs 专用连接（与 service/telemetry 共享连接隔离）；测试注入 ``jobs._conn``。"""
     global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=NORMAL")  # 与 db.get_db 同策略（WAL 免逐条 fsync）
-        _conn.execute("PRAGMA busy_timeout=5000")
-        _conn.executescript(_TABLE_SQL)
-        _conn.commit()
-    return _conn
+    with _lock:
+        if _conn is None:
+            _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+            _conn.row_factory = sqlite3.Row
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute("PRAGMA synchronous=NORMAL")  # 与 db.get_db 同策略（WAL 免逐条 fsync）
+            _conn.execute("PRAGMA busy_timeout=1000")
+            _conn.executescript(_TABLE_SQL)
+            columns = {row[1] for row in _conn.execute("PRAGMA table_info(import_jobs)")}
+            if "updated" not in columns:
+                _conn.execute("ALTER TABLE import_jobs ADD COLUMN updated INTEGER DEFAULT 0")
+            if "skipped" not in columns:
+                _conn.execute("ALTER TABLE import_jobs ADD COLUMN skipped INTEGER DEFAULT 0")
+            _conn.commit()
+        return _conn
+
+
+def _is_busy(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in msg or "busy" in msg
+    )
+
+
+def _rollback_quietly(db) -> None:
+    try:
+        db.rollback()
+    except Exception:  # noqa: BLE001 -- 保留原始持久化错误
+        pass
 
 
 def _persist(j: ImportJob) -> None:
-    """落库（UPSERT）。持久化失败记 stderr 不抛——内存态仍在，仅历史缺失。"""
-    try:
+    """落库（UPSERT）；locked/busy 有界重试，失败显式抛错。"""
+    with _lock:
         db = _db()
-        db.execute(
-            "INSERT OR REPLACE INTO import_jobs(job_id,kind,nf,version,status,added,"
-            "steps,result,warnings,error,started_at,finished_at,child_pids) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (j.job_id, j.kind, j.nf, j.version, j.status, j.added,
-             json.dumps(j.steps, ensure_ascii=False),
-             json.dumps(j.result, ensure_ascii=False),
-             json.dumps(j.warnings, ensure_ascii=False),
-             j.error, j.started_at, j.finished_at,
-             json.dumps(j.child_pids)))
-        db.commit()
-    except sqlite3.Error as e:
-        print(f"[jobs] 持久化失败 {j.job_id}: {e}", file=sys.stderr)
+        attempts = len(_PERSIST_RETRY_DELAYS) + 1
+        for attempt in range(attempts):
+            try:
+                db.execute(
+                    "INSERT INTO import_jobs(job_id,kind,nf,version,status,added,updated,skipped,"
+                    "steps,result,warnings,error,started_at,finished_at,child_pids) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(job_id) DO UPDATE SET "
+                    "kind=excluded.kind,nf=excluded.nf,version=excluded.version,"
+                    "status=excluded.status,added=excluded.added,updated=excluded.updated,"
+                    "skipped=excluded.skipped,steps=excluded.steps,result=excluded.result,"
+                    "warnings=excluded.warnings,error=excluded.error,"
+                    "started_at=excluded.started_at,finished_at=excluded.finished_at,"
+                    "child_pids=excluded.child_pids",
+                    (j.job_id, j.kind, j.nf, j.version, j.status, j.added,
+                     j.updated, j.skipped,
+                     json.dumps(j.steps, ensure_ascii=False),
+                     json.dumps(j.result, ensure_ascii=False),
+                     json.dumps(j.warnings, ensure_ascii=False),
+                     j.error, j.started_at, j.finished_at,
+                     json.dumps(j.child_pids)))
+                db.commit()
+                return
+            except Exception as exc:  # sqlite 极端竞态曾逃逸 SystemError
+                _rollback_quietly(db)
+                if _is_busy(exc) and attempt < attempts - 1:
+                    time.sleep(_PERSIST_RETRY_DELAYS[attempt])
+                    continue
+                print(
+                    f"[jobs] CRITICAL 持久化失败 job={j.job_id} "
+                    f"status={j.status} attempts={attempt + 1}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                raise JobPersistenceError(
+                    f"任务 {j.job_id} 状态持久化失败: {exc}"
+                ) from exc
 
 
 def _from_row(r: sqlite3.Row) -> ImportJob:
+    keys = set(r.keys())
     return ImportJob(
         job_id=r["job_id"], kind=r["kind"], nf=r["nf"] or "", version=r["version"] or "",
         status=r["status"], added=r["added"] or 0,
+        updated=(r["updated"] or 0) if "updated" in keys else 0,
+        skipped=(r["skipped"] or 0) if "skipped" in keys else 0,
         steps=json.loads(r["steps"] or "[]"),
         result=json.loads(r["result"] or "{}"),
         warnings=json.loads(r["warnings"] or "[]"),
         error=r["error"] or "", started_at=r["started_at"], finished_at=r["finished_at"] or 0.0,
         child_pids=json.loads(r["child_pids"] or "[]"),
     )
+
+
+def _clone(j: ImportJob) -> ImportJob:
+    return ImportJob(**asdict(j))
 
 
 def acquire_mutex(kind: str) -> bool:
@@ -144,12 +212,12 @@ def release_mutex(kind: str) -> None:
 
 
 def create_job(kind: str = "import", nf: str = "", version: str = "") -> ImportJob:
-    """新建 processing 状态的 job（内存 + DB）。调用方应已持有该 kind 的互斥锁。"""
+    """新建 job：DB commit 成功后才发布到内存 registry。"""
     j = ImportJob(job_id=uuid.uuid4().hex[:12], kind=kind, nf=nf, version=version)
     with _lock:
+        _persist(j)
         _registry[j.job_id] = j
-    _persist(j)
-    return j
+        return _clone(j)
 
 
 def update_job(jid: str, **kw) -> None:
@@ -167,45 +235,50 @@ def update_job(jid: str, **kw) -> None:
             if row is None:
                 return
             j = _from_row(row)
-            _registry[jid] = j
+        next_values = asdict(j)
         for k, v in kw.items():
-            setattr(j, k, v)
+            if k in next_values:
+                next_values[k] = v
         if kw.get("status") in ("done", "failed", "cancelled"):
-            j.finished_at = time.time()
-        snapshot = asdict(j)
-    _persist(ImportJob(**snapshot))
+            next_values["finished_at"] = time.time()
+        next_job = ImportJob(**next_values)
+        _persist(next_job)
+        _registry[jid] = next_job
 
 
 def get_job(jid: str) -> Optional[ImportJob]:
     with _lock:
         j = _registry.get(jid)
-    if j is not None:
-        return j
-    try:
-        row = _db().execute(
-            "SELECT * FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
-    except sqlite3.Error:
-        return None
-    return _from_row(row) if row else None
+        if j is not None:
+            return _clone(j)
+        try:
+            row = _db().execute(
+                "SELECT * FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        loaded = _from_row(row)
+        _registry[jid] = loaded
+        return _clone(loaded)
 
 
 def list_jobs(limit: int = 100) -> list:
-    try:
-        rows = _db().execute(
-            "SELECT * FROM import_jobs ORDER BY started_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-    except sqlite3.Error:
-        rows = []
     with _lock:
-        reg = dict(_registry)
-    out = []
-    for r in rows:
-        j = reg.get(r["job_id"])
-        out.append(j if j is not None else _from_row(r))
-    seen = {r["job_id"] for r in rows}
-    extra = [j for jid, j in reg.items() if jid not in seen]
-    out.extend(sorted(extra, key=lambda j: j.started_at, reverse=True))
-    return out[:limit]
+        try:
+            rows = _db().execute(
+                "SELECT * FROM import_jobs ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        except sqlite3.Error:
+            return [_clone(j) for j in sorted(
+                _registry.values(), key=lambda item: item.started_at, reverse=True
+            )[:limit]]
+        out = []
+        for row in rows:
+            loaded = _from_row(row)
+            _registry[loaded.job_id] = loaded
+            out.append(_clone(loaded))
+        return out
 
 
 def delete_job(jid: str) -> bool:
@@ -213,36 +286,39 @@ def delete_job(jid: str) -> bool:
     用户决策；awaiting 需先在闸门三选落地）。"""
     with _lock:
         j = _registry.get(jid)
-    if j is not None and j.status in ("processing", "awaiting"):
-        return False
-    try:
-        db = _db()
-        row = db.execute("SELECT status FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
-        if row and row["status"] in ("processing", "awaiting"):
-            return False  # DB 权威态（内存缓存缺失，如重启后）
-        cur = db.execute("DELETE FROM import_jobs WHERE job_id=?", (jid,))
-        db.commit()
-    except sqlite3.Error:
-        return False
-    if cur.rowcount == 0 and j is None:
-        return False
-    with _lock:
+        if j is not None and j.status in ("processing", "awaiting"):
+            return False
+        try:
+            db = _db()
+            row = db.execute("SELECT status FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
+            if row and row["status"] in ("processing", "awaiting"):
+                return False
+            cur = db.execute("DELETE FROM import_jobs WHERE job_id=?", (jid,))
+            db.commit()
+        except sqlite3.Error:
+            return False
+        if cur.rowcount == 0 and j is None:
+            return False
         _registry.pop(jid, None)
-    return True
+        return True
 
 
 def has_processing(kind: str) -> Optional[ImportJob]:
     with _lock:
         for j in _registry.values():
             if j.kind == kind and j.status == "processing":
-                return j
-    try:
-        row = _db().execute(
-            "SELECT * FROM import_jobs WHERE kind=? AND status='processing' "
-            "ORDER BY started_at DESC LIMIT 1", (kind,)).fetchone()
-    except sqlite3.Error:
-        return None
-    return _from_row(row) if row else None
+                return _clone(j)
+        try:
+            row = _db().execute(
+                "SELECT * FROM import_jobs WHERE kind=? AND status='processing' "
+                "ORDER BY started_at DESC LIMIT 1", (kind,)).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        loaded = _from_row(row)
+        _registry[loaded.job_id] = loaded
+        return _clone(loaded)
 
 
 def pending_for(kind: str) -> Optional[ImportJob]:
@@ -252,26 +328,67 @@ def pending_for(kind: str) -> Optional[ImportJob]:
     with _lock:
         for j in _registry.values():
             if j.kind == kind and j.status in ("processing", "awaiting"):
-                return j
-    try:
-        row = _db().execute(
-            "SELECT * FROM import_jobs WHERE kind=? AND status IN ('processing','awaiting') "
-            "ORDER BY started_at DESC LIMIT 1", (kind,)).fetchone()
-    except sqlite3.Error:
-        return None
-    return _from_row(row) if row else None
+                return _clone(j)
+        try:
+            row = _db().execute(
+                "SELECT * FROM import_jobs WHERE kind=? AND status IN ('processing','awaiting') "
+                "ORDER BY started_at DESC LIMIT 1", (kind,)).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        loaded = _from_row(row)
+        _registry[loaded.job_id] = loaded
+        return _clone(loaded)
 
 
 def recent_done(kind: str, limit: int = 200) -> list:
     """最近完成（含已回退标记）的任务，finished_at 倒序——抽取任务重跑检索用
     （如 feature 任务找同目标最近一次成功 cmd 任务记录的源目录）。"""
-    try:
-        rows = _db().execute(
-            "SELECT * FROM import_jobs WHERE kind=? AND status='done' "
-            "ORDER BY finished_at DESC LIMIT ?", (kind, limit)).fetchall()
-    except sqlite3.Error:
-        return []
-    return [_from_row(r) for r in rows]
+    with _lock:
+        try:
+            rows = _db().execute(
+                "SELECT * FROM import_jobs WHERE kind=? AND status='done' "
+                "ORDER BY finished_at DESC LIMIT ?", (kind, limit)).fetchall()
+        except sqlite3.Error:
+            return []
+        out = []
+        for row in rows:
+            loaded = _from_row(row)
+            _registry[loaded.job_id] = loaded
+            out.append(_clone(loaded))
+        return out
+
+
+def find_jobs(kind: str = "", statuses: tuple[str, ...] = (), limit: int = 10000) -> list:
+    """按 kind/status 读取持久化快照，供启动/在线对账使用。"""
+    clauses, params = [], []
+    if kind:
+        clauses.append("kind=?")
+        params.append(kind)
+    if statuses:
+        clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+        params.extend(statuses)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with _lock:
+        try:
+            rows = _db().execute(
+                f"SELECT * FROM import_jobs{where} ORDER BY started_at DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        out = []
+        for row in rows:
+            loaded = _from_row(row)
+            _registry[loaded.job_id] = loaded
+            out.append(_clone(loaded))
+        return out
+
+
+def mutex_locked(kind: str) -> bool:
+    lock = _mutex_locks.get(kind)
+    return lock.locked() if lock else False
 
 
 def _kill_pid_tree(pid: int) -> None:
@@ -288,30 +405,39 @@ def _kill_pid_tree(pid: int) -> None:
         pass
 
 
-def sweep_interrupted() -> int:
+def sweep_interrupted(kinds: tuple[str, ...] = ()) -> int:
     """启动清账：①终止上个进程遗留的子进程树（D16）→ ②processing 标记 failed。
     幂等；返回清账条数。"""
-    n = 0
-    try:
-        db = _db()
-        rows = db.execute(
-            "SELECT job_id, child_pids FROM import_jobs WHERE status='processing'").fetchall()
-        for r in rows:
-            for pid in json.loads(r["child_pids"] or "[]"):
-                _kill_pid_tree(int(pid))
-        cur = db.execute(
-            "UPDATE import_jobs SET status='failed', finished_at=?, child_pids='[]', "
-            "error=COALESCE(NULLIF(error,''), '后端重启，任务中断：后台线程已消亡；"
-            "已写入的资产保留，可覆盖重建续跑') WHERE status='processing'",
-            (time.time(),))
-        db.commit()
-        n = cur.rowcount
-    except sqlite3.Error:
-        return 0
-    if n:
-        with _lock:
-            for j in list(_registry.values()):
-                if j.status == "processing":
-                    j.status = "failed"
-                    j.finished_at = time.time()
-    return n
+    with _lock:
+        try:
+            db = _db()
+            where = "status='processing'"
+            params: list = []
+            if kinds:
+                where += " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
+                params.extend(kinds)
+            rows = db.execute(
+                f"SELECT job_id, child_pids FROM import_jobs WHERE {where}", params
+            ).fetchall()
+            for row in rows:
+                for pid in json.loads(row["child_pids"] or "[]"):
+                    _kill_pid_tree(int(pid))
+            now = time.time()
+            cur = db.execute(
+                f"UPDATE import_jobs SET status='failed', finished_at=?, child_pids='[]', "
+                "error=COALESCE(NULLIF(error,''), '后端重启或后台线程中断；"
+                "已写入的资产保留，可覆盖重建续跑') "
+                f"WHERE {where}", (now, *params))
+            db.commit()
+            n = cur.rowcount
+            for row in rows:
+                cached = _registry.get(row["job_id"])
+                if cached is not None:
+                    values = asdict(cached)
+                    values.update(status="failed", finished_at=now, child_pids=[])
+                    if not values["error"]:
+                        values["error"] = "后端重启或后台线程中断；已写入的资产保留，可覆盖重建续跑"
+                    _registry[row["job_id"]] = ImportJob(**values)
+            return n
+        except sqlite3.Error:
+            return 0

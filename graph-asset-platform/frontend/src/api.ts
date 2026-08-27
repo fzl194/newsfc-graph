@@ -550,6 +550,10 @@ export const getImportJob = (id: string): Promise<ImportJob> =>
 export const listImportJobs = (): Promise<ImportJob[]> =>
   _req<ImportJob[]>(`${BASE}/import/jobs`)
 
+/** 显式修复中断的后台任务（受 can_assets 保护；GET 任务查询保持只读）。 */
+export const reconcileImportJobs = (): Promise<{ reconciled: number }> =>
+  _req(`${BASE}/import/jobs/reconcile`, { method: 'POST' })
+
 /** 删除历史任务（解析进行中后端 400 拒绝）。 */
 export const deleteImportJob = (id: string): Promise<{ ok: boolean; job_id: string }> =>
   _req(`${BASE}/import/jobs/${id}`, { method: 'DELETE' })

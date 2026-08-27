@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "10"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS import_jobs(
   job_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
   nf TEXT DEFAULT '', version TEXT DEFAULT '',
   status TEXT NOT NULL, added INTEGER DEFAULT 0,
+  updated INTEGER DEFAULT 0, skipped INTEGER DEFAULT 0,
   steps TEXT DEFAULT '[]', result TEXT DEFAULT '{}', warnings TEXT DEFAULT '[]',
   error TEXT DEFAULT '', started_at REAL NOT NULL, finished_at REAL DEFAULT 0,
   child_pids TEXT DEFAULT '[]'
@@ -166,6 +167,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     jcols = {r[1] for r in conn.execute("PRAGMA table_info(import_jobs)")}
     if jcols and "child_pids" not in jcols:
         conn.execute("ALTER TABLE import_jobs ADD COLUMN child_pids TEXT DEFAULT '[]'")
+    # v10：ImportJob.updated/skipped 原只存内存，重启后丢失。
+    if jcols and "updated" not in jcols:
+        conn.execute("ALTER TABLE import_jobs ADD COLUMN updated INTEGER DEFAULT 0")
+    if jcols and "skipped" not in jcols:
+        conn.execute("ALTER TABLE import_jobs ADD COLUMN skipped INTEGER DEFAULT 0")
     # v4 迁移（MCP 服务化 2026-08-24）：① telemetry.session_id（会话ID 打点新列，
     # 历史行为 ''）② md_fts 存量回填（旧库 objects 有数据而 FTS 空表 → 一次性灌入）。
     tcols = {r[1] for r in conn.execute("PRAGMA table_info(telemetry)")}

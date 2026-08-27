@@ -278,13 +278,23 @@ def run_extract(job_id: str, hwics_path: Path, nf: str, version: str,
             "mode_id": "",
         }
         bundles.write_meta(tmp_out, meta)
+        final_result = {
+            "stage": "extract_finalizing", "md_count": md_count,
+            "convert_failed": len(convert_fail), "bundle": f"{nf}_{version}",
+            "source_sha256": sha,
+        }
+        # 原子替换前先落耐久 checkpoint；替换后若最终 done 写失败，
+        # 可用 bundle.json.source_sha256 对账自动补终态。
+        jobs.update_job(job_id, result=final_result, added=md_count, warnings=warnings)
         bundles.atomic_replace(nf, version, tmp_out)                    # D10：成功才替换
         step("留存登记", "done", f"output/{nf}_{version}/（旧包已进回收站如有）")
 
         jobs.update_job(job_id, status="done",
-                        result={"md_count": md_count, "convert_failed": len(convert_fail),
-                                "bundle": f"{nf}_{version}"},
+                        result={**final_result, "stage": "extracted"},
                         added=md_count, warnings=warnings)
+    except jobs.JobPersistenceError:
+        # 关键状态落库失败不得被业务失败分支覆写；交给包装器/对账。
+        raise
     except Exception as e:  # noqa: BLE001
         _fail(job_id, hwics_path if hwics_path.exists() else None, e)
         # 转换失败时清理半成品 tmp（正式包未动——原子替换语义）
@@ -439,8 +449,14 @@ def run_mine(job_id: str, spec: dict) -> None:
         step("差异报告", "done",
              f"新增 {report['new_total']} · 相同 {report['identical_total']} · 差异 {report['modified_total']}")
 
-        jobs.update_job(job_id, status="awaiting", result={**base_result, **report},
+        ready_result = {**base_result, **report, "stage": "gate_ready"}
+        # diff 已完成的耐久 checkpoint；后一笔 awaiting 失败可在线补齐。
+        jobs.update_job(job_id, result=ready_result, warnings=list(warnings))
+        jobs.update_job(job_id, status="awaiting",
+                        result={**ready_result, "stage": "gate"},
                         warnings=list(warnings))
+    except jobs.JobPersistenceError:
+        raise
     except Exception as e:  # noqa: BLE001
         gate.cleanup(job_id)  # 失败即清沙箱（正式资产从未被碰）
         _fail(job_id, None, e)

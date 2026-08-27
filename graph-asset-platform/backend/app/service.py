@@ -130,7 +130,7 @@ class Service:
         """从 DB 重载内存 Index（写操作末尾调用）。"""
         self.index = Index.load_from_db(self.db, self.registry)
 
-    def reindex_path(self, rel: str) -> None:
+    def reindex_path(self, rel: str, *, commit: bool = True) -> None:
         """单文件 parse → UPSERT DB（objects/edges/md_fts）。不重载内存（调用方 reload_index）。
 
         id/type/version 变了的旧节点按 source_path 清除（``objects_repo.delete_by_source``）；
@@ -142,6 +142,7 @@ class Service:
         from .repos import edges_repo, fts_repo, objects_repo
         # 删旧节点 + 其边 + FTS 旧行（source_path 维度，稳）
         old_pairs = list(objects_repo.delete_by_source(self.db, rel))
+        old_keys = {(oid, "" if over is None else over) for oid, over in old_pairs}
         for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
         fts_repo.delete_many(self.db, old_pairs)
@@ -150,19 +151,30 @@ class Service:
             text = self.store.read(rel)
             fm, body, edge_sec = parse_md(text)
         except Exception:
-            _commit(self.db)
+            if commit:
+                _commit(self.db)
             return
         id_ = fm.get("id")
         typ = fm.get("type")
         if not id_ or not typ or not self.registry.known(typ):
-            _commit(self.db)
+            if commit:
+                _commit(self.db)
             return
         try:
             nf, _t, _l = split_id(id_)
         except ValueError:
-            _commit(self.db)
+            if commit:
+                _commit(self.db)
             return
         version = fm.get("version")
+        normalized_version = "" if version is None else version
+        # 同源旧键已在上面删除。仅当另一个 source_path 已占用新键时，才需要
+        # 清理它的旧 FTS；全新键不能调用 legacy UNINDEXED 删除，否则每个新
+        # 文件都会退化成一次 FTS 全表扫描。
+        new_key_existed = self.db.execute(
+            "SELECT 1 FROM objects WHERE id=? AND version=? LIMIT 1",
+            (id_, normalized_version),
+        ).fetchone() is not None
         entry = self.registry.get(typ) or {}
         mtime = self.store.abspath(rel).stat().st_mtime
         edges = list(parse_edges(edge_sec, from_id=id_, from_version=version))
@@ -175,46 +187,96 @@ class Service:
             body_md=body, raw_md=text, mtime=mtime,
         )
         edges_repo.replace_for_node(self.db, id_, version, edges)
-        fts_repo.upsert(self.db, obj_id=id_, version=version, body=body)
-        _commit(self.db)
+        # 同源旧键已由 delete_many 删掉，直接 insert-only；若文件改成了
+        # 另一个已存键，才单独清理该键，避免 FTS 重复。
+        if (id_, normalized_version) not in old_keys and new_key_existed:
+            fts_repo.delete(self.db, id_, version)
+        fts_repo.insert(self.db, obj_id=id_, version=version, body=body)
+        if commit:
+            _commit(self.db)
 
-    def unindex_path(self, rel: str) -> None:
+    def unindex_path(self, rel: str, *, commit: bool = True) -> None:
         """删该 source_path 的 DB 节点 + 边 + FTS 行（md 被删时）。"""
         from .repos import edges_repo, fts_repo, objects_repo
         old_pairs = list(objects_repo.delete_by_source(self.db, rel))
         for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
         fts_repo.delete_many(self.db, old_pairs)
-        _commit(self.db)
+        if commit:
+            _commit(self.db)
+
+    def reindex_paths(self, paths, *, chunk_size: int = 250) -> dict:
+        """精确对账一组资产路径：存在的 md 重建，已删除的 md 解索引。
+
+        每 ``chunk_size`` 个文件提交一次，既避免逐文件事务，也不长时间
+        饿死 jobs/telemetry 的独立 SQLite 写者。
+        """
+        unique = sorted({str(path).replace("\\", "/") for path in paths
+                         if str(path).lower().endswith(".md")})
+        if not unique:
+            return {"indexed": 0, "removed": 0}
+        indexed = removed = pending = 0
+        try:
+            for rel in unique:
+                if self.store.exists(rel):
+                    self.reindex_path(rel, commit=False)
+                    indexed += 1
+                else:
+                    self.unindex_path(rel, commit=False)
+                    removed += 1
+                pending += 1
+                if pending >= chunk_size:
+                    _commit(self.db)
+                    pending = 0
+            if pending:
+                _commit(self.db)
+        except Exception:
+            self.db.rollback()
+            raise
+        self.reload_index()
+        return {"indexed": indexed, "removed": removed}
 
     def reindex_prefixes(self, prefixes: list) -> dict:
         """**按前缀增量索引**（与 reindex_path 同一套 DB/锁/解析语义，目录级）。
 
         挖掘（自动抽取）/批量覆盖共用；替代全量 rebuild——耗时与**变更量**成正比，
         与库总规模无关（百万级 md 下全量重建不可行）：
-        - 磁盘上这些前缀下的全部 md → 逐个 reindex_path（内容变更 UPSERT）
+        - 只对 mtime 变化或 DB 尚未登记的 md 执行 reindex_path
         - DB 中前缀下已不在磁盘的 source_path → unindex_path（force 清理/删除）
         - 最后 reload_index
 
         prefixes 如 ``["Command/UDG/20.15.2", "Feature/UDG/20.15.2"]``；
         **调用方须持 import_lock**（与 fs 写端点一致）。返回 {"indexed", "removed"}。
         """
-        pfx = tuple(p.rstrip("/") + "/" for p in prefixes if p and p.strip("/"))
-        if not pfx:
+        normalized = sorted({p.strip().strip("/") for p in prefixes
+                             if p and p.strip(" / ")})
+        if not normalized:
             return {"indexed": 0, "removed": 0}
-        disk = [rel for rel in self.store.list_md() if rel.startswith(pfx)]
+        disk = sorted({rel for prefix in normalized
+                       for rel in self.store.list_md_under(prefix)})
         disk_set = set(disk)
+        db_mtime = {}
+        for prefix in normalized:
+            # '/' 的下一个码位是 '0'：该半开区间可覆盖 prefix/ 下的任意
+            # Unicode 文件名，不受 ``\uffff`` 无法覆盖非 BMP 字符的限制。
+            low, high = prefix + "/", prefix + "0"
+            rows = self.db.execute(
+                "SELECT source_path, MAX(mtime) AS m FROM objects "
+                "WHERE source_path>=? AND source_path<? GROUP BY source_path",
+                (low, high),
+            ).fetchall()
+            db_mtime.update({row["source_path"]: row["m"] for row in rows})
+        changed = []
         for rel in disk:
-            self.reindex_path(rel)
-        removed = 0
-        rows = self.db.execute("SELECT DISTINCT source_path FROM objects").fetchall()
-        for r in rows:
-            p = r["source_path"] or ""
-            if p.startswith(pfx) and p not in disk_set:
-                self.unindex_path(p)
-                removed += 1
-        self.reload_index()
-        return {"indexed": len(disk), "removed": removed}
+            try:
+                current = self.store.abspath(rel).stat().st_mtime
+            except OSError:
+                continue
+            previous = db_mtime.get(rel)
+            if previous is None or abs(current - previous) > 0.001:
+                changed.append(rel)
+        deleted = [rel for rel in db_mtime if rel not in disk_set]
+        return self.reindex_paths([*changed, *deleted])
 
     def rebuild(self) -> None:
         """全量 reindex 兜底：扫 md 重建 DB + 内存（手动触发，慢；用于数据不一致时）。"""

@@ -352,6 +352,7 @@ import {
   startExtract,
   getImportJob,
   listImportJobs,
+  reconcileImportJobs,
   deleteImportJob,
   type FsUploadResult,
   type ImportJob,
@@ -494,6 +495,8 @@ async function doUpload() {
 
 const history = ref<ImportJob[]>([])
 async function loadHistory(): Promise<void> {
+  // 恢复是显式、鉴权的写操作；GET /import/jobs 始终保持只读。
+  try { await reconcileImportJobs() } catch { /* 无资产权限或暂无可恢复任务时仍可读历史 */ }
   try { history.value = await listImportJobs() } catch { history.value = [] }
 }
 function historyFor(kind: 'product_doc_extract' | 'product_doc_mine'): ImportJob[] {

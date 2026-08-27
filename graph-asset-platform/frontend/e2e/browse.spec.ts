@@ -43,11 +43,11 @@ test.describe('图谱浏览 · 版本切换', () => {
     await page.locator('.cell-id', { hasText: 'UDG@MMLCommand@ACT DEMO' }).first().click()
     await expect(page.locator('.badge-ver')).toHaveText('20.15.2')
     // 详情内切到 20.16.2 → 中栏版本 badge 跟随
+    // Element Plus 的 teleport 下拉在动画期间会短暂 detach；用原生键盘交互
+    // 避免定位到正在退出的旧浮层，行为也更贴近可访问性用户。
     await page.locator('.ver-select').click()
-    await page
-      .locator('.el-select-dropdown:visible .el-select-dropdown__item', { hasText: '20.16.2' })
-      .first()
-      .click()
+    await page.keyboard.press('ArrowDown')
+    await page.keyboard.press('Enter')
     await expect(page.locator('.badge-ver')).toHaveText('20.16.2')
   })
 

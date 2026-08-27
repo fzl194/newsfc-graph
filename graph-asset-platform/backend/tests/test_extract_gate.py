@@ -5,6 +5,7 @@ confirm（覆盖/只新增）→ 产物清单/索引 → revert（sha 守卫）�
 --nf/--version 用目标值、mml 多目录单次调用）。真实构建脚本流程靠手工验收。
 """
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -201,11 +202,11 @@ def test_cmd_gate_report_then_confirm_overwrite(env, monkeypatch, tmp_data_dir):
     assert "新正文" in live_mod.read_text(encoding="utf-8")
     assert (tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md").exists()
     assert (tmp_data_dir / "Command/UDG/20.15.2/assets/pic.png").read_bytes() == b"\x89PNG-new-longer"
-    # 产物清单：add+modify（identical 不入）；sidecar 应用了但不入清单
+    # 产物清单：add+modify（identical 不入）；sidecar 也入清单供失败回滚。
     rows = {(r2["path"], r2["op"]) for r2 in _rows(j.job_id)}
     assert any(p.endswith("ADD NEW.md") and op == "add" for p, op in rows)
     assert any(p.endswith("MOD ME.md") and op == "modify" for p, op in rows)
-    assert not any("_build_manifest" in p for p, _ in rows)
+    assert any("_build_manifest" in p and op == "add" for p, op in rows)
     # 旧版备份存在（revert 还原源）；沙箱大头已清
     orig = gate.gate_originals(j.job_id) / "Command/UDG/20.15.2/UDG@MMLCommand@MOD ME.md"
     assert "旧正文" in orig.read_text(encoding="utf-8")
@@ -216,6 +217,12 @@ def test_cmd_gate_report_then_confirm_overwrite(env, monkeypatch, tmp_data_dir):
     j2 = _get_job(j.job_id)
     assert j2["status"] == "done" and j2["result"]["layers"]["Command"] == 3
     assert j2["result"]["stage"] == "applied"
+    # 模拟重启后只读 DB：终态/计数仍正确，且串行守卫已解除。
+    from app import jobs as jobs_mod
+    jobs_mod._registry.clear()
+    durable = jobs_mod.get_job(j.job_id)
+    assert durable.status == "done" and durable.added == 3
+    assert jobs_mod.pending_for("product_doc_mine") is None
 
 
 def _get_job(job_id):
@@ -237,7 +244,8 @@ def test_confirm_new_only_keeps_existing(env, monkeypatch, tmp_data_dir):
     assert st["added"] == 1 and st["modified"] == 0 and st["skipped_existing"] == 1
     assert "旧正文" in live_mod.read_text(encoding="utf-8")     # 重复保留现有
     rows = _rows(j.job_id)
-    assert len(rows) == 1 and rows[0]["op"] == "add"
+    assert len(rows) == 3
+    assert all(row["op"] == "add" for row in rows)             # 新 md + sidecar
 
 
 # ---------- cancel ----------
@@ -282,6 +290,18 @@ def test_restart_after_confirm_keeps_originals_for_revert(env, monkeypatch, tmp_
     assert _get_job(j.job_id)["result"]["revert"]["restored"] == 1  # 回退照常可用
 
 
+def test_sweep_done_removes_leftover_storage_but_keeps_originals(env, monkeypatch):
+    """done 后 cleanup 中断的 storage 可清理，originals 不可误删。"""
+    job = _confirmed_task(env, monkeypatch)
+    gate.gate_storage(job.job_id).mkdir(parents=True)
+    (gate.gate_storage(job.job_id) / "leftover").write_text("x", encoding="utf-8")
+    assert gate.gate_originals(job.job_id).exists()
+
+    assert gate.sweep_orphan_gates() >= 1
+    assert not gate.gate_storage(job.job_id).exists()
+    assert gate.gate_originals(job.job_id).exists()
+
+
 def test_confirm_copy_failure_retry_completes_manifest(env, monkeypatch, tmp_data_dir):
     """apply 后台执行拷贝中断（清单先行已写）→ 任务自动回 awaiting 带告警 →
     重试：已落盘文件 identical 但清单行保留，覆盖面完整——revert 不丢覆盖。"""
@@ -302,7 +322,7 @@ def test_confirm_copy_failure_retry_completes_manifest(env, monkeypatch, tmp_dat
     j1 = _get_job(j.job_id)                                      # 后台失败已回 awaiting
     assert j1["status"] == "awaiting"
     assert any("入库执行失败" in w for w in j1["warnings"])
-    assert len(_rows(j.job_id)) == 2                             # 清单先行：完整
+    assert len(_rows(j.job_id)) == 4                             # 清单先行：含两层 sidecar
 
     monkeypatch.setattr(gate, "_copy", orig_copy)
     r2 = client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
@@ -311,9 +331,314 @@ def test_confirm_copy_failure_retry_completes_manifest(env, monkeypatch, tmp_dat
     assert j2["status"] == "done"
     rows = _rows(j.job_id)
     ops = {r["op"] for r in rows}
-    assert len(rows) == 2 and ops == {"add", "modify"}           # 重试后清单仍完整
+    assert len(rows) == 4 and ops == {"add", "modify"}           # 重试后清单仍完整
     mod_p = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@MOD ME.md"
     assert "新正文" in mod_p.read_text(encoding="utf-8")         # 重试补完了拷贝
+
+
+def test_apply_persists_done_before_storage_cleanup(env, monkeypatch):
+    """storage 清理遇到 BaseException 也不得丢掉已完成的终态。"""
+    from app import jobs as jobs_mod
+
+    job = env.start(monkeypatch, env.stub_cmd())
+    jobs_mod.update_job(job.job_id, status="processing",
+                        result={**job.result, "stage": "applying"})
+
+    def interrupted_cleanup(*_args, **_kwargs):
+        raise SystemExit("synthetic cleanup interruption")
+
+    monkeypatch.setattr(gate.shutil, "rmtree", interrupted_cleanup)
+    with pytest.raises(SystemExit):
+        gate.apply_gate(job.job_id, "overwrite")
+
+    jobs_mod._registry.clear()
+    restored = jobs_mod.get_job(job.job_id)
+    assert restored.status == "done"
+    assert restored.result["stage"] == "applied"
+    assert restored.added == 2
+
+
+def test_apply_wrapper_records_baseexception_before_reraising(env, monkeypatch):
+    """SystemExit/KeyboardInterrupt 越过 Exception 时也要先恢复任务态。"""
+    from app import jobs as jobs_mod
+    from app.routers import productdoc
+
+    job = env.start(monkeypatch, env.stub_cmd())
+    jobs_mod.update_job(job.job_id, status="processing",
+                        result={**job.result, "stage": "applying"})
+    assert jobs_mod.acquire_mutex("product_doc_mine")
+    monkeypatch.setattr(gate, "apply_gate",
+                        lambda *_args: (_ for _ in ()).throw(SystemExit("boom")))
+
+    with pytest.raises(SystemExit):
+        productdoc._apply_and_release(job.job_id, "overwrite")
+
+    restored = jobs_mod.get_job(job.job_id)
+    assert restored.status == "awaiting"
+    assert restored.result["stage"] == "gate"
+    assert "SystemExit" in restored.result["confirm_error"]
+    assert jobs_mod.acquire_mutex("product_doc_mine")
+    jobs_mod.release_mutex("product_doc_mine")
+
+
+@pytest.mark.parametrize(
+    ("kind", "wrapper", "target_name", "args"),
+    [
+        ("product_doc_extract", "_run_extract_and_release", "run_extract",
+         (Path("missing.hwics"), "UNC", "20.16.2", "tester")),
+        ("product_doc_mine", "_run_mine_and_release", "run_mine", ({},)),
+    ],
+)
+def test_runner_wrappers_record_baseexception(
+        env, monkeypatch, kind, wrapper, target_name, args):
+    """解压/抽取后台线程遇 BaseException 也必须落 failed 并释放互斥。"""
+    from app import jobs as jobs_mod
+    from app.routers import productdoc
+
+    job = jobs_mod.create_job(kind=kind, nf="UNC", version="20.16.2")
+    assert jobs_mod.acquire_mutex(kind)
+    monkeypatch.setattr(
+        productdoc, target_name,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("boom")),
+    )
+    with pytest.raises(SystemExit):
+        getattr(productdoc, wrapper)(job.job_id, *args)
+    restored = jobs_mod.get_job(job.job_id)
+    assert restored.status == "failed"
+    assert "SystemExit" in restored.error
+    assert jobs_mod.acquire_mutex(kind)
+    jobs_mod.release_mutex(kind)
+
+
+def test_index_failure_keeps_gate_retryable(env, monkeypatch):
+    """文件已拷贝但索引失败时不得假装 done，sandbox/清单必须保留。"""
+    from app.service import get_service
+
+    job = env.start(monkeypatch, env.stub_cmd())
+    monkeypatch.setattr(
+        get_service(), "reindex_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fts failed")),
+    )
+    response = client.post(
+        f"/api/v1/import/extract/{job.job_id}/confirm", json={"action": "overwrite"}
+    )
+    assert response.status_code == 200
+    restored = _get_job(job.job_id)
+    assert restored["status"] == "awaiting"
+    assert "fts failed" in restored["result"]["confirm_error"]
+    assert gate.gate_storage(job.job_id).exists()
+    assert _rows(job.job_id)
+
+
+def test_new_only_serializes_classification_and_copy_with_asset_writer(
+        env, monkeypatch, tmp_data_dir):
+    """并发资产写者不得在 new_only 分类后插入文件却又被沙箱覆盖。"""
+    from app.service import get_service, import_lock
+
+    job = env.start(monkeypatch, env.stub_cmd(new=("RACE",), same=(), mod=()))
+    service = get_service()
+    rel = "Command/UDG/20.15.2/UDG@MMLCommand@RACE.md"
+    live = tmp_data_dir / rel
+    original_classify = gate._classify
+    classified = threading.Event()
+    writer_acquired = threading.Event()
+
+    def observed_classify(*args, **kwargs):
+        yield from original_classify(*args, **kwargs)
+        classified.set()
+        # 旧实现此时没有 import_lock，写者可插入；修复后写者须等 apply 完成。
+        writer_acquired.wait(timeout=0.2)
+
+    def competing_writer():
+        assert classified.wait(timeout=2)
+        with import_lock:
+            writer_acquired.set()
+            live.parent.mkdir(parents=True, exist_ok=True)
+            live.write_text(
+                CMD_MD.format(nf="UDG", ver="20.15.2", name="RACE") + "外部写入\n",
+                encoding="utf-8",
+            )
+            service.reindex_paths([rel])
+
+    monkeypatch.setattr(gate, "_classify", observed_classify)
+    writer = threading.Thread(target=competing_writer)
+    writer.start()
+    gate.apply_gate(job.job_id, "new_only")
+    writer.join(timeout=3)
+
+    assert not writer.is_alive()
+    assert "外部写入" in live.read_text(encoding="utf-8")
+
+
+def test_reconcile_completed_stale_apply_marks_done(env, monkeypatch):
+    """兼容修复前遗留：live/索引/清单已完成且 storage 已删应补 done。"""
+    from app import jobs as jobs_mod
+    import app.service as service_mod
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    result = dict(jobs_mod.get_job(confirmed.job_id).result)
+    result["stage"] = "applying"
+    jobs_mod.update_job(confirmed.job_id, status="processing", result=result,
+                        added=0, finished_at=0)
+    jobs_mod._registry.clear()
+
+    class TrackingLock:
+        entered = False
+
+        def __enter__(self):
+            self.entered = True
+
+        def __exit__(self, *_args):
+            return False
+
+    lock = TrackingLock()
+    monkeypatch.setattr(service_mod, "import_lock", lock)
+
+    assert gate.reconcile_interrupted() >= 1
+    assert lock.entered
+    restored = jobs_mod.get_job(confirmed.job_id)
+    assert restored.status == "done"
+    assert restored.result["stage"] == "applied"
+    assert restored.added == 2
+    assert jobs_mod.pending_for("product_doc_mine") is None
+
+
+def test_get_job_is_read_only_for_stale_apply(env, monkeypatch):
+    """GET 任务轮询必须无写副作用，不得隐式执行孤儿清扫/终止 PID。"""
+    from app import jobs as jobs_mod
+    from app.routers import productdoc
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    result = dict(jobs_mod.get_job(confirmed.job_id).result)
+    jobs_mod.update_job(
+        confirmed.job_id, status="processing",
+        result={**result, "stage": "applying"}, added=0, finished_at=0,
+    )
+    jobs_mod._registry.clear()
+    monkeypatch.setattr(
+        productdoc, "_reconcile_idle_jobs",
+        lambda: (_ for _ in ()).throw(AssertionError("GET must stay read-only")),
+    )
+
+    response = client.get(f"/api/v1/import/jobs/{confirmed.job_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "processing"
+
+
+def test_explicit_reconcile_endpoint_recovers_completed_stale_apply(env, monkeypatch):
+    """受资产权限保护的显式 POST 对账可在线解锁孤儿 applying。"""
+    from app import jobs as jobs_mod
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    result = dict(jobs_mod.get_job(confirmed.job_id).result)
+    jobs_mod.update_job(
+        confirmed.job_id, status="processing",
+        result={**result, "stage": "applying"}, added=0, finished_at=0,
+    )
+    jobs_mod._registry.clear()
+
+    reconciled = client.post("/api/v1/import/jobs/reconcile")
+    assert reconciled.status_code == 200
+    assert reconciled.json()["reconciled"] >= 1
+    response = client.get(f"/api/v1/import/jobs/{confirmed.job_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "done"
+    assert response.json()["added"] == 2
+    assert jobs_mod.pending_for("product_doc_mine") is None
+
+
+def test_job_poll_recovers_extract_finalizing_checkpoint(env):
+    """bundle.json 已 done 时，轮询将遗留 extract_finalizing 补成 done。"""
+    from app import jobs as jobs_mod
+    from app.pipeline import bundles
+
+    source_sha = "abc123"
+    bundle_dir = bundles.bundle_dir("UDG", "20.15.2")
+    bundles.write_meta(bundle_dir, {
+        "nf": "UDG", "version": "20.15.2", "status": "done",
+        "source_sha256": source_sha, "md_count": 17,
+    })
+    job = jobs_mod.create_job(kind="product_doc_extract", nf="UDG", version="20.15.2")
+    jobs_mod.update_job(job.job_id, result={
+        "stage": "extract_finalizing", "source_sha256": source_sha,
+        "md_count": 17, "bundle": "UDG_20.15.2",
+    })
+    jobs_mod._registry.clear()
+
+    assert client.post("/api/v1/import/jobs/reconcile").status_code == 200
+    response = client.get(f"/api/v1/import/jobs/{job.job_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "done"
+    assert response.json()["added"] == 17
+    assert response.json()["result"]["stage"] == "extracted"
+
+
+def test_job_poll_recovers_gate_ready_checkpoint(env):
+    """diff 已持久化而 awaiting 丢写时，轮询自动补齐闸门态。"""
+    from app import jobs as jobs_mod
+
+    job = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+    jobs_mod.update_job(job.job_id, result={
+        "stage": "gate_ready", "target_nf": "UDG", "target_version": "20.15.2",
+        "layers": ["Command"], "new_total": 1, "modified_total": 0,
+    })
+    jobs_mod._registry.clear()
+
+    assert client.post("/api/v1/import/jobs/reconcile").status_code == 200
+    response = client.get(f"/api/v1/import/jobs/{job.job_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "awaiting"
+    assert response.json()["result"]["stage"] == "gate"
+
+
+def test_cancel_after_applied_state_reindexes_rollback(env, monkeypatch, tmp_data_dir):
+    """即使文件曾经完成索引，cancel 回滚也必须同步 objects/FTS。"""
+    from app import jobs as jobs_mod
+    from app.repos import fts_repo
+    from app.service import get_service
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    current = jobs_mod.get_job(confirmed.job_id)
+    jobs_mod.update_job(confirmed.job_id, status="awaiting",
+                        result={**current.result, "stage": "gate"})
+
+    response = client.post(f"/api/v1/import/extract/{confirmed.job_id}/cancel")
+    assert response.status_code == 200, response.text
+    service = get_service()
+    added = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md"
+    assert not added.exists()
+    assert service.index.node("UDG@MMLCommand@ADD NEW", "20.15.2") is None
+    assert service.index.node("UDG@MMLCommand@MOD ME", "20.15.2") is not None
+    assert fts_repo.integrity_ok(service.db)
+
+
+def test_cancel_retry_reconciles_full_manifest_after_index_failure(
+        env, monkeypatch, tmp_data_dir):
+    """文件已回滚但首次索引补偿失败，重试仍须按完整清单清掉幽灵节点。"""
+    from app import jobs as jobs_mod
+    from app.service import get_service
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    current = jobs_mod.get_job(confirmed.job_id)
+    jobs_mod.update_job(confirmed.job_id, status="awaiting",
+                        result={**current.result, "stage": "gate"})
+    service = get_service()
+    original_reindex = service.reindex_paths
+    monkeypatch.setattr(
+        service, "reindex_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("index down")),
+    )
+
+    with pytest.raises(RuntimeError, match="index down"):
+        client.post(f"/api/v1/import/extract/{confirmed.job_id}/cancel")
+    added = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md"
+    assert not added.exists()
+    assert service.index.node("UDG@MMLCommand@ADD NEW", "20.15.2") is not None
+
+    monkeypatch.setattr(service, "reindex_paths", original_reindex)
+    response = client.post(f"/api/v1/import/extract/{confirmed.job_id}/cancel")
+    assert response.status_code == 200, response.text
+    assert service.index.node("UDG@MMLCommand@ADD NEW", "20.15.2") is None
 
 
 def test_cancel_after_partial_apply_rolls_back_files(env, monkeypatch, tmp_data_dir):
@@ -340,6 +665,7 @@ def test_cancel_after_partial_apply_rolls_back_files(env, monkeypatch, tmp_data_
     r2 = client.post(f"/api/v1/import/extract/{j.job_id}/cancel")
     assert r2.status_code == 200
     assert not add_p.exists()                                    # 撤销回滚了泄漏文件
+    assert not (tmp_data_dir / "Command/UDG/20.15.2/_build_manifest.json").exists()
     assert _rows(j.job_id) == []
     assert _get_job(j.job_id)["status"] == "cancelled"
 
@@ -436,6 +762,31 @@ def test_revert_full(env, monkeypatch, tmp_data_dir):
     assert client.post(f"/api/v1/import/extract/{j.job_id}/revert").status_code == 400
 
 
+def test_revert_retry_reconciles_full_manifest_after_index_failure(
+        env, monkeypatch, tmp_data_dir):
+    """文件已移除/恢复但首次索引失败，重试不得把旧 objects/FTS 留在库中。"""
+    from app.service import get_service
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    service = get_service()
+    original_reindex = service.reindex_paths
+    monkeypatch.setattr(
+        service, "reindex_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("index down")),
+    )
+
+    first = client.post(f"/api/v1/import/extract/{confirmed.job_id}/revert")
+    assert first.status_code == 200, first.text
+    added = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md"
+    assert not added.exists()
+    assert service.index.node("UDG@MMLCommand@ADD NEW", "20.15.2") is not None
+
+    monkeypatch.setattr(service, "reindex_paths", original_reindex)
+    second = client.post(f"/api/v1/import/extract/{confirmed.job_id}/revert")
+    assert second.status_code == 200, second.text
+    assert service.index.node("UDG@MMLCommand@ADD NEW", "20.15.2") is None
+
+
 def test_revert_sha_guard_skips_overwritten(env, monkeypatch, tmp_data_dir):
     j = _confirmed_task(env, monkeypatch)
     add_p = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md"
@@ -461,6 +812,7 @@ def test_reconcile_applying_back_to_awaiting(env, monkeypatch):
         "stage": "gate", "target_nf": "UDG", "target_version": "20.15.2"})
     jobs_mod.update_job(job.job_id, status="processing",
                         result={"stage": "applying", "target_nf": "UDG"})
+    gate.gate_storage(job.job_id).mkdir(parents=True)            # 可重试证据仍在
     jobs_mod._registry.clear()                                  # 模拟重启（DB-only）
     assert gate.reconcile_interrupted() >= 1
     j = jobs_mod.get_job(job.job_id)
@@ -527,11 +879,30 @@ def test_processing_job_sandbox_swept(env, monkeypatch, tmp_data_dir):
 def test_delete_job_purges_gate_and_manifest(env, monkeypatch):
     j = _confirmed_task(env, monkeypatch)
     assert gate.gate_originals(j.job_id).exists()
-    assert len(_rows(j.job_id)) == 2
+    assert len(_rows(j.job_id)) == 4
     r = client.delete(f"/api/v1/import/jobs/{j.job_id}")
     assert r.status_code == 200
     assert not gate.gate_dir(j.job_id).exists()
     assert _rows(j.job_id) == []                                # 回退权随历史删除丧失
+
+
+def test_delete_job_mutex_conflict_preserves_history_and_revert_data(env, monkeypatch):
+    """闸门操作占锁时删除应无副作用，不能先删历史再返回 409。"""
+    from app import jobs as jobs_mod
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    assert gate.gate_dir(confirmed.job_id).exists()
+    assert _rows(confirmed.job_id)
+    assert jobs_mod.acquire_mutex("product_doc_mine")
+    try:
+        response = client.delete(f"/api/v1/import/jobs/{confirmed.job_id}")
+    finally:
+        jobs_mod.release_mutex("product_doc_mine")
+
+    assert response.status_code == 409
+    assert jobs_mod.get_job(confirmed.job_id) is not None
+    assert gate.gate_dir(confirmed.job_id).exists()
+    assert _rows(confirmed.job_id)
 
 
 def test_delete_awaiting_rejected(env, monkeypatch):

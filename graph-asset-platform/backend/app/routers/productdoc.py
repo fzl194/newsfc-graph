@@ -54,6 +54,11 @@ def _check_names(nf: str, version: str) -> None:
                    f"（仅允许字母数字 _ . -，长度≤32）")
 
 
+def _persistence_unavailable(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=503,
+                         detail="任务状态库暂时不可用，请稍后重试")
+
+
 # ---------- 步骤①：上传解压 ----------
 
 @router.post("/import/product-doc")
@@ -74,8 +79,10 @@ async def upload_product_doc(
             detail=f"仅支持产品文档归档（{'/'.join(sorted(_ALLOWED_UPLOAD_SUFFIXES))}）")
     _require_assets(request)
 
+    _reconcile_idle_jobs()
     if not jobs.acquire_mutex("product_doc_extract"):  # D6：同类单任务
         raise HTTPException(status_code=409, detail="已有解压任务在跑，完成后再试")
+    tmp = ""
     try:
         # D4：流式落盘（8MB 分块）+ 2GB 上限；放 DATA_DIR 同盘（同盘 move 瞬时，
         # 且规避 exporter 跨盘 relpath——见 runner 注释）
@@ -102,7 +109,14 @@ async def upload_product_doc(
         job = jobs.create_job(kind="product_doc_extract", nf=nf, version=version)
         background.add_task(_run_extract_and_release, job.job_id, Path(tmp), nf, version,
                             getattr(request.state, "user", ""))
+    except jobs.JobPersistenceError as exc:
+        if tmp:
+            Path(tmp).unlink(missing_ok=True)
+        jobs.release_mutex("product_doc_extract")
+        raise _persistence_unavailable(exc) from exc
     except Exception:
+        if tmp:
+            Path(tmp).unlink(missing_ok=True)
         jobs.release_mutex("product_doc_extract")
         raise
     record("/import/product-doc", f"{nf}@{version}", "", user=request.state.user,
@@ -115,6 +129,10 @@ def _run_extract_and_release(job_id: str, tmp: Path, nf: str, version: str, by: 
     """后台包装：执行完（成败皆）释放该类互斥锁。"""
     try:
         run_extract(job_id, tmp, nf, version, uploaded_by=by)
+    except BaseException as exc:  # Exception 由 runner 处理；此处兜 BaseException
+        if not _reconcile_extract_checkpoint(job_id):
+            _record_background_abort(job_id, exc, status="failed", label="解压转换")
+        raise
     finally:
         jobs.release_mutex("product_doc_extract")
 
@@ -211,6 +229,7 @@ def extract(req: ExtractIn, request: Request, background: BackgroundTasks):
             status_code=400,
             detail=f"抽取器「{x.name}」必须选择源目录角色: {'、'.join(lack_roles)}")
 
+    _reconcile_idle_jobs()
     clash = jobs.pending_for("product_doc_mine")
     if clash is not None:
         state = "待入库确认" if clash.status == "awaiting" else "执行中（抽取/入库/回退）"
@@ -227,11 +246,25 @@ def extract(req: ExtractIn, request: Request, background: BackgroundTasks):
                     + (f"（{running.nf} {running.version} · {running.job_id}）" if running else ""),
                     "job_id": running.job_id if running else ""})
     try:
+        # 锁外检查与取锁之间，前一个构建可能刚转 awaiting 并释放锁；必须
+        # 在临界区内复检，才能保证“构建→确认/撤销”整个流程只存在一个任务。
+        clash = jobs.pending_for("product_doc_mine")
+        if clash is not None:
+            state = "待入库确认" if clash.status == "awaiting" else "执行中（抽取/入库/回退）"
+            raise HTTPException(
+                status_code=409,
+                detail={"message": f"存在未完结的抽取任务（{state} · {clash.job_id}）"
+                                  f"——全流程串行：先完成确认/撤销或等其结束",
+                        "job_id": clash.job_id},
+            )
         job = jobs.create_job(kind="product_doc_mine", nf=tnf, version=tver)
         spec = {"bundle_nf": bnf, "bundle_version": bver,
                 "target_nf": tnf, "target_version": tver,
                 "extractor": req.extractor, "dirs": dict(req.dirs)}
         background.add_task(_run_mine_and_release, job.job_id, spec)
+    except jobs.JobPersistenceError as exc:
+        jobs.release_mutex("product_doc_mine")
+        raise _persistence_unavailable(exc) from exc
     except Exception:
         jobs.release_mutex("product_doc_mine")
         raise
@@ -247,6 +280,23 @@ def _run_mine_and_release(job_id: str, spec: dict) -> None:
     回退端点各自短取锁）。"""
     try:
         run_mine(job_id, spec)
+    except BaseException as exc:
+        current = jobs.get_job(job_id)
+        if current and (current.result or {}).get("stage") == "gate_ready":
+            try:
+                jobs.update_job(
+                    job_id, status="awaiting",
+                    result={**current.result, "stage": "gate"},
+                    warnings=[*current.warnings,
+                              f"抽取已完成，闸门状态自动恢复（{type(exc).__name__}）"],
+                )
+            except Exception as persist_error:
+                print(f"[jobs] CRITICAL gate_ready 无法恢复 awaiting "
+                      f"job={job_id}: {persist_error}", flush=True)
+        else:
+            gate.cleanup(job_id)
+            _record_background_abort(job_id, exc, status="failed", label="抽取构建")
+        raise
     finally:
         jobs.release_mutex("product_doc_mine")
 
@@ -278,11 +328,22 @@ def confirm(job_id: str, req: ConfirmIn, request: Request, background: Backgroun
     if not jobs.acquire_mutex("product_doc_mine"):
         raise HTTPException(status_code=409, detail="已有抽取任务在执行（抽取/入库/回退），稍后再试")
     try:
+        # 锁外校验与锁获取之间任务可能已被别的请求推进；锁内重新读取，避免
+        # 用旧快照把终态改回 processing。
+        j = _get_mine_job_or_404(job_id)
+        if j.status != "awaiting":
+            raise HTTPException(
+                status_code=409,
+                detail=f"任务状态为 {j.status}，仅待确认（awaiting）任务可确认",
+            )
         steps = list(j.steps or []) + [{"name": "入库", "status": "processing", "detail": ""}]
         jobs.update_job(job_id, status="processing",
                         result={**(j.result or {}), "stage": "applying"},
                         steps=steps)
         background.add_task(_apply_and_release, job_id, req.action)
+    except jobs.JobPersistenceError as exc:
+        jobs.release_mutex("product_doc_mine")
+        raise _persistence_unavailable(exc) from exc
     except Exception:
         jobs.release_mutex("product_doc_mine")
         raise
@@ -297,13 +358,23 @@ def _apply_and_release(job_id: str, action: str) -> None:
     使重试自愈；亦可撤销——cancel 会按清单回滚已落盘部分）。"""
     try:
         gate.apply_gate(job_id, action)
-    except Exception as e:  # noqa: BLE001
+    except BaseException as e:  # 线程控制异常也必须先落可恢复态
         j = jobs.get_job(job_id)
-        res = dict((j.result if j else None) or {})
-        res["confirm_error"] = str(e)
-        jobs.update_job(job_id, status="awaiting", result=res,
-                        warnings=[*((j.warnings if j else None) or []),
-                                  f"入库执行失败：{e}——可重试确认或撤销"])
+        # done 已在 storage 清理前耐久提交；清理阶段中断不得回退为 awaiting。
+        if j is None or j.status != "done":
+            res = dict((j.result if j else None) or {})
+            res["stage"] = "gate"
+            res["confirm_error"] = f"{type(e).__name__}: {e}"
+            try:
+                jobs.update_job(job_id, status="awaiting", result=res,
+                                warnings=[*((j.warnings if j else None) or []),
+                                          f"入库执行失败：{type(e).__name__}: {e}"
+                                          "——可重试确认或撤销"])
+            except Exception as persist_error:  # DB 持续不可写：保留 sandbox 等对账
+                print(f"[jobs] CRITICAL 入库失败态无法落库 job={job_id}: "
+                      f"{persist_error}", flush=True)
+        if not isinstance(e, Exception):
+            raise
     finally:
         jobs.release_mutex("product_doc_mine")
 
@@ -320,7 +391,15 @@ def cancel(job_id: str, request: Request):
     if not jobs.acquire_mutex("product_doc_mine"):
         raise HTTPException(status_code=409, detail="已有抽取任务在执行，稍后撤销")
     try:
+        j = _get_mine_job_or_404(job_id)
+        if j.status != "awaiting":
+            raise HTTPException(
+                status_code=409,
+                detail=f"任务状态为 {j.status}，仅待确认（awaiting）任务可撤销",
+            )
         gate.cancel_gate(job_id)
+    except jobs.JobPersistenceError as exc:
+        raise _persistence_unavailable(exc) from exc
     finally:
         jobs.release_mutex("product_doc_mine")
     record("/import/extract/cancel", job_id, "", user=request.state.user,
@@ -347,12 +426,20 @@ def revert(job_id: str, request: Request, background: BackgroundTasks):
     if not jobs.acquire_mutex("product_doc_mine"):
         raise HTTPException(status_code=409, detail="已有抽取任务在执行，稍后回退")
     try:
+        j = _get_mine_job_or_404(job_id)
+        if j.status != "done" or (j.result or {}).get("reverted_at"):
+            raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试")
+        if extract_files_repo.count_for_job(_svc_db(), job_id) == 0:
+            raise HTTPException(status_code=409, detail="任务产物清单已变化，请刷新后重试")
         steps = list(j.steps or []) + [{"name": "回退", "status": "processing", "detail": ""}]
         jobs.update_job(job_id, status="processing",
                         result={**(j.result or {}), "stage": "reverting"},
                         steps=steps)
         background.add_task(_revert_and_release, job_id,
                             getattr(request.state, "user", ""))
+    except jobs.JobPersistenceError as exc:
+        jobs.release_mutex("product_doc_mine")
+        raise _persistence_unavailable(exc) from exc
     except Exception:
         jobs.release_mutex("product_doc_mine")
         raise
@@ -366,15 +453,55 @@ def _revert_and_release(job_id: str, by: str) -> None:
     """后台包装：执行回退（成败皆释放互斥）。失败回 done 带告警。"""
     try:
         gate.revert_job(job_id, deleted_by=by)
-    except Exception as e:  # noqa: BLE001
+    except BaseException as e:
         j = jobs.get_job(job_id)
         res = dict((j.result if j else None) or {})
-        res["revert_error"] = str(e)
-        jobs.update_job(job_id, status="done", result=res,
-                        warnings=[*((j.warnings if j else None) or []),
-                                  f"回退执行失败：{e}——可重新发起「移除产出」"])
+        res["revert_error"] = f"{type(e).__name__}: {e}"
+        try:
+            jobs.update_job(job_id, status="done", result=res,
+                            warnings=[*((j.warnings if j else None) or []),
+                                      f"回退执行失败：{type(e).__name__}: {e}"
+                                      "——可重新发起「移除产出」"])
+        except Exception as persist_error:
+            print(f"[jobs] CRITICAL 回退失败态无法落库 job={job_id}: "
+                  f"{persist_error}", flush=True)
+        if not isinstance(e, Exception):
+            raise
     finally:
         jobs.release_mutex("product_doc_mine")
+
+
+def _record_background_abort(job_id: str, exc: BaseException, *, status: str, label: str) -> None:
+    """后台顶层 BaseException 收口：尽力落失败态，不吞原异常。"""
+    try:
+        jobs.update_job(
+            job_id, status=status,
+            error=f"{label}被中断：{type(exc).__name__}: {exc}",
+        )
+    except Exception as persist_error:
+        print(f"[jobs] CRITICAL {label}中断态无法落库 job={job_id}: "
+              f"{persist_error}", flush=True)
+
+
+def _reconcile_extract_checkpoint(job_id: str) -> bool:
+    """bundle 已原子替换但 done 丢写时，核对 sha 后补齐终态。"""
+    job = jobs.get_job(job_id)
+    result = dict((job.result if job else None) or {})
+    if job is None or result.get("stage") != "extract_finalizing":
+        return False
+    meta = bundles.read_meta(bundles.bundle_dir(job.nf, job.version))
+    if not meta or meta.get("status") != "done":
+        return False
+    if not result.get("source_sha256") or meta.get("source_sha256") != result["source_sha256"]:
+        return False
+    try:
+        jobs.update_job(job_id, status="done", result={**result, "stage": "extracted"},
+                        added=int(result.get("md_count") or 0))
+        return True
+    except Exception as persist_error:
+        print(f"[jobs] CRITICAL 解压 checkpoint 无法补 done job={job_id}: "
+              f"{persist_error}", flush=True)
+        return False
 
 
 def _svc_db():
@@ -386,8 +513,15 @@ def _svc_db():
 
 @router.get("/import/jobs")
 def list_jobs():
-    """历史任务（DB 持久化，跨重启；按 started_at 倒序，默认 100 条）。"""
+    """只读历史任务（DB 持久化，跨重启；按 started_at 倒序，默认 100 条）。"""
     return [j.summary() for j in jobs.list_jobs()]
+
+
+@router.post("/import/jobs/reconcile")
+def reconcile_jobs(request: Request):
+    """显式修复后台孤儿任务；会改状态/清 PID，故要求资产权限且不得藏在 GET 中。"""
+    _require_assets(request)
+    return {"reconciled": _reconcile_idle_jobs()}
 
 
 @router.get("/import/jobs/{job_id}")
@@ -396,6 +530,29 @@ def get_job(job_id: str):
     if j is None:
         raise HTTPException(status_code=404, detail=f"job 不存在: {job_id}")
     return j.summary()
+
+
+def _reconcile_idle_jobs() -> int:
+    """轻量在线孤儿对账：仅在该 kind 互斥锁可非阻塞取得时执行。
+
+    仅由显式、受资产权限保护的写端点调用。返回修复/清扫数量。
+    """
+    reconciled = 0
+    if jobs.acquire_mutex("product_doc_mine"):
+        try:
+            reconciled += gate.reconcile_interrupted()
+            # applying/reverting 已由 gate 处理；余下 processing 是构建线程孤儿。
+            reconciled += jobs.sweep_interrupted(("product_doc_mine",))
+        finally:
+            jobs.release_mutex("product_doc_mine")
+    if jobs.acquire_mutex("product_doc_extract"):
+        try:
+            for job in jobs.find_jobs("product_doc_extract", ("processing",)):
+                reconciled += int(_reconcile_extract_checkpoint(job.job_id))
+            reconciled += jobs.sweep_interrupted(("product_doc_extract",))
+        finally:
+            jobs.release_mutex("product_doc_extract")
+    return reconciled
 
 
 @router.delete("/import/jobs/{job_id}")
@@ -409,21 +566,30 @@ def delete_job(job_id: str, request: Request):
     if j.status in ("processing", "awaiting"):
         state = "解析进行中" if j.status == "processing" else "待闸门确认"
         raise HTTPException(status_code=400, detail=f"任务{state}，不允许删除")
-    if not jobs.delete_job(job_id):
-        raise HTTPException(status_code=500, detail="删除失败")
-    if j.kind == "product_doc_mine":
-        # 与 confirm/revert 互斥（评审修复 2026-08-26）：防止回退进行中清掉 originals
-        if not jobs.acquire_mutex("product_doc_mine"):
-            raise HTTPException(status_code=409, detail="抽取任务闸门操作进行中，稍后删除")
-        try:
+    mutex_kind = j.kind if j.kind in ("product_doc_extract", "product_doc_mine") else ""
+    if mutex_kind and not jobs.acquire_mutex(mutex_kind):
+        raise HTTPException(status_code=409, detail="任务后台/闸门操作进行中，稍后删除")
+    try:
+        # 状态检查与删除在对应后台互斥锁内再次完成；锁冲突或状态变化时零副作用。
+        current = jobs.get_job(job_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail=f"job 不存在: {job_id}")
+        if current.status in ("processing", "awaiting"):
+            state = "解析进行中" if current.status == "processing" else "待闸门确认"
+            raise HTTPException(status_code=400, detail=f"任务{state}，不允许删除")
+        if not jobs.delete_job(job_id):
+            raise HTTPException(status_code=500, detail="删除失败")
+        if current.kind == "product_doc_mine":
             gate.cleanup(job_id)  # originals 备份（回退权丧失——UI 删除确认提示）
             try:
-                extract_files_repo.delete_for_job(_svc_db(), job_id)
-                _svc_db().commit()
+                svc_db = _svc_db()
+                extract_files_repo.delete_for_job(svc_db, job_id)
+                svc_db.commit()
             except Exception as e:  # noqa: BLE001 清单清理失败不阻断删任务，但留痕
                 print(f"[jobs] 删除任务 {job_id} 时清理产物清单失败: {e}", flush=True)
-        finally:
-            jobs.release_mutex("product_doc_mine")
+    finally:
+        if mutex_kind:
+            jobs.release_mutex(mutex_kind)
     record("/import/jobs/delete", job_id, "", user=request.state.user,
            caller=request.state.caller, level="object",
            operator=getattr(request.state, "operator", ""))

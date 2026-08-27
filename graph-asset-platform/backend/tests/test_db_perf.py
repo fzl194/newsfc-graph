@@ -118,3 +118,51 @@ def test_fts_rebuild_chunked_multi_version(tmp_path):
     fts_repo.delete(conn, "A@1", "20.13")
     assert conn.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 9
     assert fts_repo.integrity_ok(conn) is False  # objects 10 行 vs fts 9 行（对账口径）
+
+
+def test_reindex_path_never_falls_back_to_unindexed_fts_delete(
+        tmp_data_dir, monkeypatch):
+    """service 已按 map 删旧行后，插入新行不得再触发 UNINDEXED 全表扫。"""
+    import app.service as service_mod
+    from app.index import Index
+    from app.registry import Registry
+    from app.store import Store
+
+    service = service_mod.Service.__new__(service_mod.Service)
+    service.store = Store(tmp_data_dir)
+    service.registry = Registry.load_default()
+    service.db = dbmod.get_db(tmp_data_dir.parent / "trace.db")
+    dbmod.init_schema(service.db)
+    service.index = Index.load_from_db(service.db, service.registry)
+    path = "Command/UNC/20.11.2/UNC@MMLCommand@ADD A.md"
+    service.store.write(path, """---
+id: UNC@MMLCommand@ADD A
+type: MMLCommand
+nf: UNC
+version: 20.11.2
+---
+# ADD A
+
+旧正文
+""")
+    initial_statements = []
+    service.db.set_trace_callback(initial_statements.append)
+    service.reindex_path(path)
+    service.db.set_trace_callback(None)
+    initial_deletes = [sql.lower() for sql in initial_statements
+                       if sql.lower().startswith("delete from md_fts ")]
+    assert not any("where obj_id=" in sql for sql in initial_deletes)
+    service.store.write(path, service.store.read(path).replace("旧正文", "新正文"))
+
+    statements = []
+    service.db.set_trace_callback(statements.append)
+    service.reindex_path(path)
+    service.db.set_trace_callback(None)
+
+    deletes = [sql.lower() for sql in statements
+               if sql.lower().startswith("delete from md_fts ")]
+    assert sum("where rowid=" in sql for sql in deletes) == 1
+    assert not any("where obj_id=" in sql for sql in deletes)
+    assert service.db.execute("SELECT COUNT(*) FROM md_fts").fetchone()[0] == 1
+    assert service.db.execute("SELECT COUNT(*) FROM md_fts_map").fetchone()[0] == 1
+    assert fts_repo.integrity_ok(service.db)
