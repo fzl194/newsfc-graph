@@ -40,6 +40,12 @@ async def lifespan(app: FastAPI):
         f"耗时 {time.time() - t0:.1f}s → http://127.0.0.1:80/",
         flush=True,
     )
+    # 抽取任务对账（须在 sweep **之前**）：中断于入库/回退执行中的任务复位
+    # （applying→awaiting 可重试/撤销；reverting→done 可重发起回退）
+    from .pipeline import gate as _gate_mod
+    flipped = _gate_mod.reconcile_interrupted()
+    if flipped:
+        print(f"[startup] 已复位 {flipped} 个中断于入库/回退执行中的抽取任务", flush=True)
     # 导入任务清账：①终止上个进程遗留的子进程树 ②processing 标记 failed
     from . import jobs as jobs_mod
     swept = jobs_mod.sweep_interrupted()

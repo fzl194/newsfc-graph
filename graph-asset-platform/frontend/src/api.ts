@@ -523,35 +523,25 @@ export interface GateModified {
   new_bytes?: number
 }
 
-/** 闸门确认（overwrite=重复覆盖[旧版备份可回退] | new_only=重复保留现有）。 */
+/** 闸门确认——**后台异步执行**（立即返回，任务转 processing/applying，完成转 done）。
+ * overwrite=重复覆盖（旧版备份可回退）| new_only=重复保留现有。 */
 export const confirmExtract = (
   id: string,
   action: 'overwrite' | 'new_only',
-): Promise<{
-  ok: boolean
-  job_id: string
-  stats: Record<string, number>
-  reindex: { indexed: number; removed: number }
-}> =>
+): Promise<{ ok: boolean; job_id: string; stage: 'applying' }> =>
   _req(`${BASE}/import/extract/${id}/confirm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action }),
   })
 
-/** 闸门撤销（沙箱全删，正式资产从未被碰；任务终态 cancelled）。 */
+/** 闸门撤销（沙箱全删+按清单回滚失败确认已落盘部分；任务终态 cancelled）。 */
 export const cancelExtract = (id: string): Promise<{ ok: boolean; job_id: string }> =>
   _req(`${BASE}/import/extract/${id}/cancel`, { method: 'POST' })
 
-/** 按任务移除本次产出（add→软删回收站；modify→还原旧版；sha 守卫防误删）。 */
-export const revertExtract = (id: string): Promise<{
-  ok: boolean
-  job_id: string
-  soft_deleted: number
-  restored: number
-  skipped: string[]
-  reindex: { indexed: number; removed: number }
-}> => _req(`${BASE}/import/extract/${id}/revert`, { method: 'POST' })
+/** 按任务移除本次产出——后台异步执行（add→软删回收站；modify→还原旧版；sha 守卫防误删）。 */
+export const revertExtract = (id: string): Promise<{ ok: boolean; job_id: string; stage: 'reverting' }> =>
+  _req(`${BASE}/import/extract/${id}/revert`, { method: 'POST' })
 
 export const getImportJob = (id: string): Promise<ImportJob> =>
   _req<ImportJob>(`${BASE}/import/jobs/${id}`)

@@ -290,7 +290,9 @@ class TestExtractEndpoint:
         j = client.get(f"/api/v1/import/jobs/{jid}").json()
         assert j["nf"] == "AMF" and j["kind"] == "product_doc_mine"
 
-    def test_same_target_awaiting_409(self, monkeypatch):
+    def test_serial_guard_pending_blocks_new(self, monkeypatch):
+        """全流程串行（用户决策 2026-08-27）：存在 awaiting/processing 抽取任务时
+        新抽取一律 409（含异目标）——先确认/撤销或等其结束。"""
         from app import jobs as jobs_mod
         import app.routers.productdoc as pd
 
@@ -301,17 +303,33 @@ class TestExtractEndpoint:
         monkeypatch.setattr(pd, "run_mine", stub)
         j = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
         jobs_mod.update_job(j.job_id, status="awaiting")
-        r2 = None
         try:
             r = self._extract()                                   # 同目标 → 409
-            assert r.status_code == 409 and "待确认" in r.json()["detail"]["message"]
-            r2 = self._extract(target_nf="OTHER")                 # 异目标 → 放行（互斥未占）
-            assert r2.status_code == 200
+            assert r.status_code == 409 and "未完结" in r.json()["detail"]["message"]
+            r2 = self._extract(target_nf="OTHER", target_version="9.9")  # 异目标同样 409
+            assert r2.status_code == 409
         finally:
             jobs_mod.update_job(j.job_id, status="cancelled")
-            if r2 is not None and r2.status_code == 200:
-                jobs_mod.update_job(r2.json()["job_id"], status="cancelled")
-                jobs_mod.delete_job(r2.json()["job_id"])
+            jobs_mod.delete_job(j.job_id)
+
+    def test_serial_guard_cleared_after_cancel(self, monkeypatch):
+        from app import jobs as jobs_mod
+        import app.routers.productdoc as pd
+
+        def stub(job_id, spec):
+            jobs_mod.update_job(job_id, status="awaiting",
+                                result={"target_nf": spec["target_nf"]})
+
+        monkeypatch.setattr(pd, "run_mine", stub)
+        j = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+        jobs_mod.update_job(j.job_id, status="awaiting")
+        jobs_mod.update_job(j.job_id, status="cancelled")         # 终态 → 守卫解除
+        try:
+            r = self._extract()
+            assert r.status_code == 200
+        finally:
+            jobs_mod.update_job(r.json()["job_id"], status="cancelled")
+            jobs_mod.delete_job(r.json()["job_id"])
             jobs_mod.delete_job(j.job_id)
 
     def test_mutex_rejects_second(self):

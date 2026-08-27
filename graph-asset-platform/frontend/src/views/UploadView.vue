@@ -329,28 +329,10 @@
           <div v-if="mineErrorMsg" class="error-banner mono">{{ mineErrorMsg }}</div>
         </section>
 
-        <JobPanel
-          :job="mineJob"
-          :stats-labels="MINE_STAT_LABELS"
-          done-hint="已入库；如质量不行可在下方历史任务「移除产出」按任务回退"
-          @refresh-history="loadHistory"
-        />
-        <JobHistory
-          :jobs="historyFor('product_doc_mine')"
-          :active-id="mineJob?.job_id"
-          @view="(j) => viewJob(j, 'mine')"
-          @remove="removeJob"
-          @revert="revertMineJob"
-        />
+        <!-- ③ 抽取任务表格：门禁信息+操作按钮在行内（awaiting→覆盖/只新增/撤销；
+             确认/回退为后台执行，任务转「入库中/回退中」由轮询刷新） -->
+        <MineTaskTable :jobs="historyFor('product_doc_mine')" @changed="onMineTasksChanged" />
       </template>
-
-      <!-- 入库闸门（el-dialog，位置无关）：awaiting 时弹出——三选后才落正式资产 -->
-      <GateDialog
-        :visible="gateVisible"
-        :job="gateJob"
-        @update:visible="gateVisible = $event"
-        @resolved="onGateResolved"
-      />
     </div>
   </div>
 </template>
@@ -358,7 +340,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElButton, ElInput, ElSelect, ElOption, ElMessage, ElMessageBox } from 'element-plus'
+import { ElButton, ElInput, ElSelect, ElOption, ElMessage } from 'element-plus'
 import {
   stats,
   uploadToDir,
@@ -368,7 +350,6 @@ import {
   targetAssets,
   locateBundle,
   startExtract,
-  revertExtract,
   getImportJob,
   listImportJobs,
   deleteImportJob,
@@ -382,7 +363,7 @@ import {
 import JobPanel from '../components/JobPanel.vue'
 import JobHistory from '../components/JobHistory.vue'
 import DirPickerDialog from '../components/DirPickerDialog.vue'
-import GateDialog from '../components/GateDialog.vue'
+import MineTaskTable from '../components/MineTaskTable.vue'
 
 const route = useRoute()
 
@@ -421,14 +402,12 @@ onMounted(async () => {
   if (q.domain) domain.value = String(q.domain)
   if (q.scenario) scenario.value = String(q.scenario)
   await loadHistory()
-  // 有进行中的任务 → 恢复对应模式进度轮询（刷新不丢）
+  // 有进行中的任务 → 恢复对应模式进度轮询（刷新不丢；mine 含后台入库/回退中）
   const runningExtract = history.value.find((j) => j.kind === 'product_doc_extract' && j.status === 'processing')
   if (runningExtract) { exJob.value = runningExtract; exBusy.value = true; pollJob(runningExtract.job_id, 'extract') }
   const runningMine = history.value.find((j) => j.kind === 'product_doc_mine' && j.status === 'processing')
   if (runningMine) { mineJob.value = runningMine; mineBusy.value = true; pollJob(runningMine.job_id, 'mine') }
-  // 有待闸门确认的抽取任务 → 重开闸门弹窗（awaiting 跨重启存活）
-  const awaitingMine = history.value.find((j) => j.kind === 'product_doc_mine' && j.status === 'awaiting')
-  if (awaitingMine) { mineJob.value = awaitingMine; openGate(awaitingMine) }
+  // awaiting 任务在任务表格里展示（行内三选按钮），无需弹窗
 })
 
 const nfHints = computed(() => globalStats.value?.nfs ?? [])
@@ -524,15 +503,6 @@ function hasRunning(kind: 'product_doc_extract' | 'product_doc_mine'): boolean {
   return history.value.some((j) => j.kind === kind && j.status === 'processing')
 }
 async function removeJob(j: ImportJob): Promise<void> {
-  // 删除有产物清单的抽取任务 → 回退权随之丧失（originals 备份被清），先确认
-  const r = (j.result ?? {}) as Record<string, unknown>
-  if (j.kind === 'product_doc_mine' && j.status === 'done' && r.script && !r.reverted_at) {
-    try {
-      await ElMessageBox.confirm(
-        '删除后该任务的「移除产出」回退能力随之丧失（旧版备份一并清理）。继续？',
-        '删除抽取任务', { type: 'warning' })
-    } catch { return }
-  }
   try {
     await deleteImportJob(j.job_id)
     ElMessage.success(`已删除任务 ${j.job_id}`)
@@ -581,9 +551,14 @@ function pollJob(jobId: string, kind: PollKind) {
         else mineBusy.value = false
         void loadHistory()
         if (j.status === 'awaiting' && kind === 'mine') {
-          openGate(j) // 沙箱构建完成 → 闸门三选（弹窗在 GateDialog）
+          // 沙箱构建完成 → 任务表格行内三选（无弹窗）
         } else if (j.status === 'done') {
-          ElMessage.success(kind === 'extract' ? '解压完成' : '抽取入库完成')
+          if (kind === 'mine') {
+            const stage = ((j.result ?? {}) as Record<string, unknown>).stage
+            ElMessage.success(stage === 'reverting' || (j.result as Record<string, unknown>)?.revert ? '回退完成' : '抽取入库完成')
+          } else {
+            ElMessage.success('解压完成')
+          }
           ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
           if (kind === 'mine') void loadBundles() // 刷新资产存在标志
         }
@@ -608,8 +583,6 @@ function viewJob(j: ImportJob, kind: PollKind) {
     if (kind === 'extract') exBusy.value = true
     else mineBusy.value = true
     pollJob(j.job_id, kind)
-  } else if (kind === 'mine' && j.status === 'awaiting') {
-    openGate(j) // 从历史点回待确认任务 → 重开闸门
   }
 }
 
@@ -698,14 +671,6 @@ const missingNeeds = computed(() =>
 const mineBusy = ref(false)
 const mineJob = ref<ImportJob | null>(null)
 const mineErrorMsg = ref('')
-
-const MINE_STAT_LABELS = [
-  { k: 'total', label: '总计' },
-  { k: 'Command', label: '命令' },
-  { k: 'ConfigObject', label: '配置对象' },
-  { k: 'License', label: 'License' },
-  { k: 'Feature', label: '特性' },
-]
 
 async function loadBundles(): Promise<void> {
   bundlesLoading.value = true
@@ -836,59 +801,21 @@ async function doExtractTask(): Promise<void> {
   }
 }
 
-// ---- 入库闸门（awaiting → 三选） ----
+// ---- 抽取任务表格事件（表格内完成确认/撤销/回退/删除的操作与确认框） ----
 
-const gateVisible = ref(false)
-const gateJob = ref<ImportJob | null>(null)
-
-function openGate(j: ImportJob): void {
-  gateJob.value = j
-  gateVisible.value = true
-}
-
-async function onGateResolved(action: 'overwrite' | 'new_only' | 'cancel'): Promise<void> {
-  if (action === 'cancel') {
-    ElMessage.info('已撤销——产出未入库，正式资产无任何改动')
-  } else {
-    ElMessage.success(action === 'overwrite'
-      ? '已入库（重复已覆盖，旧版自动备份可回退）'
-      : '已入库（只新增，重复保留现有版本）')
-  }
-  const jid = gateJob.value?.job_id
-  gateJob.value = null
+async function onMineTasksChanged(): Promise<void> {
   await loadHistory()
-  void loadBundles()                                     // 刷新包行资产标志
+  void loadBundles()
   ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
-  if (jid) {
-    try { mineJob.value = await getImportJob(jid) } catch { /* 已删除等 */ }
-  }
-}
-
-// ---- 按任务移除产出（revert） ----
-
-async function revertMineJob(j: ImportJob): Promise<void> {
-  try {
-    await ElMessageBox.confirm(
-      '将软删除本次新增的文件（进回收站）、还原本次覆盖的文件；已被后续任务改动的自动跳过。继续？',
-      '移除本次产出', { type: 'warning' })
-  } catch { return }
-  try {
-    const r = await revertExtract(j.job_id)
-    ElMessage.success(
-      `已移除产出：软删 ${r.soft_deleted} / 还原 ${r.restored}`
-      + (r.skipped.length ? ` / 跳过 ${r.skipped.length}（已被改动）` : ''))
-    await loadHistory()
-    void loadBundles()
-    ;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats?.()
-    if (mineJob.value?.job_id === j.job_id) {
-      try { mineJob.value = await getImportJob(j.job_id) } catch { /* 已删除 */ }
-    }
-  } catch (e: unknown) {
-    const detail = (e as { detail?: unknown }).detail
-    if (typeof detail === 'string') ElMessage.error(detail)
-    else if (detail && typeof detail === 'object' && 'message' in detail) {
-      ElMessage.error(String((detail as { message: unknown }).message))
-    } else ElMessage.error(e instanceof Error ? e.message : String(e))
+  // 有执行中的（抽取/后台入库/后台回退）→ 轮询推进表格；否则停轮询
+  const running = history.value.find(
+    (j) => j.kind === 'product_doc_mine' && j.status === 'processing')
+  if (running) {
+    mineJob.value = running
+    pollJob(running.job_id, 'mine')
+  } else {
+    stopPolling('mine')
+    mineBusy.value = false
   }
 }
 

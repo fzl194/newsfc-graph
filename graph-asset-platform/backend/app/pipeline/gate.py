@@ -402,8 +402,64 @@ def revert_job(job_id: str, deleted_by: str = "") -> dict:
         svc.db.commit()
 
     cleanup(job_id)  # originals 已消费
-    jobs.update_job(job_id, result={
-        **res, "reverted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    jobs.update_job(job_id, status="done", result={
+        **res, "stage": "applied", "reverted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "revert": {"soft_deleted": out["soft_deleted"], "restored": out["restored"],
                    "skipped": out["skipped"]}})
     return out
+
+
+def reconcile_interrupted() -> int:
+    """重启对账（main.py 在 ``sweep_interrupted`` **之前**调用）：中断于确认/回退
+    **执行中**（status=processing + result.stage ∈ applying/reverting）的抽取任务复位。
+
+    - applying → awaiting：清单先行+sha 守卫使重试安全；也可撤销（cancel 会按
+      清单回滚已落盘部分）；
+    - reverting → done + 告警：reverted_at 未写、清单行未消费（末尾才删），
+      每文件守卫使重新发起「移除产出」安全。
+
+    真正的抽取运行中断（stage=running）不在本函数范围——仍由 sweep_interrupted
+    标 failed。返回复位数。
+    """
+    import time as _time
+    db = jobs._db()
+    try:
+        rows = db.execute(
+            "SELECT job_id, result, warnings FROM import_jobs "
+            "WHERE kind='product_doc_mine' AND status='processing'").fetchall()
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+    for r in rows:
+        try:
+            res = json.loads(r["result"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if res.get("stage") == "applying":
+            res["stage"] = "gate"
+            res["confirm_error"] = "后端重启，入库执行中断——可重新确认或撤销"
+            db.execute("UPDATE import_jobs SET status='awaiting', result=? WHERE job_id=?",
+                       (json.dumps(res, ensure_ascii=False), r["job_id"]))
+            n += 1
+        elif res.get("stage") == "reverting":
+            try:
+                warns = json.loads(r["warnings"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                warns = []
+            warns.append("后端重启，回退执行中断——可重新发起「移除产出」")
+            res["revert_error"] = "后端重启，回退执行中断"
+            db.execute(
+                "UPDATE import_jobs SET status='done', result=?, warnings=?, finished_at=? "
+                "WHERE job_id=?",
+                (json.dumps(res, ensure_ascii=False), json.dumps(warns, ensure_ascii=False),
+                 _time.time(), r["job_id"]))
+            n += 1
+    db.commit()
+    # 内存副本同步（重启后 registry 为空；测试/同进程场景用）
+    with jobs._lock:
+        for jid in [r["job_id"] for r in rows]:
+            if jid in jobs._registry:
+                fresh = db.execute("SELECT * FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
+                if fresh:
+                    jobs._registry[jid] = jobs._from_row(fresh)
+    return n

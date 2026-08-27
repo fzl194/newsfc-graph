@@ -172,7 +172,8 @@ class ExtractIn(BaseModel):
 @router.post("/import/extract")
 def extract(req: ExtractIn, request: Request, background: BackgroundTasks):
     """发起抽取任务：依赖**阻断**（缺层 400 报明细，不自动补齐——人来编排
-    「先命令后特性」）；同目标已有 awaiting 任务 409（沙箱/报告单份）。"""
+    「先命令后特性」）；**全流程串行**（2026-08-27 用户决策）：存在未完结抽取
+    任务（抽取中/待确认/入库中）即 409——上一任务入库完结或撤销后再发下一个。"""
     bnf, bver = req.bundle_nf.strip(), req.bundle_version.strip()
     tnf, tver = req.target_nf.strip(), req.target_version.strip()
     _check_names(bnf, bver)
@@ -210,12 +211,13 @@ def extract(req: ExtractIn, request: Request, background: BackgroundTasks):
             status_code=400,
             detail=f"抽取器「{x.name}」必须选择源目录角色: {'、'.join(lack_roles)}")
 
-    clash = jobs.awaiting_for("product_doc_mine", tnf, tver)
+    clash = jobs.pending_for("product_doc_mine")
     if clash is not None:
+        state = "待入库确认" if clash.status == "awaiting" else "执行中（抽取/入库/回退）"
         raise HTTPException(
             status_code=409,
-            detail={"message": f"目标 {tnf}@{tver} 已有待确认的抽取任务"
-                              f"（{clash.job_id}）——请先在闸门中确认或撤销",
+            detail={"message": f"存在未完结的抽取任务（{state} · {clash.job_id}）"
+                              f"——全流程串行：先完成确认/撤销或等其结束",
                     "job_id": clash.job_id})
     if not jobs.acquire_mutex("product_doc_mine"):
         running = jobs.has_processing("product_doc_mine")
@@ -261,9 +263,11 @@ class ConfirmIn(BaseModel):
 
 
 @router.post("/import/extract/{job_id}/confirm")
-def confirm(job_id: str, req: ConfirmIn, request: Request):
-    """闸门确认：把沙箱变更落正式资产+索引+产物清单（同步端点，秒级）。
-    action=overwrite（重复覆盖，旧版备份供回退）| new_only（重复保留现有）。"""
+def confirm(job_id: str, req: ConfirmIn, request: Request, background: BackgroundTasks):
+    """闸门确认——**后台异步执行**（2026-08-27 用户反馈改版：不阻塞前台，同步
+    端点在千文件拷贝+重索引期间挂着 HTTP 请求易超时）。立即返回，任务转
+    processing(stage=applying)，完成转 done。执行失败自动回 awaiting 可重试/
+    撤销（清单先行设计使重试安全）。action=overwrite|new_only。"""
     _require_assets(request)
     if req.action not in ("overwrite", "new_only"):
         raise HTTPException(status_code=400, detail="action 仅支持 overwrite | new_only")
@@ -272,27 +276,49 @@ def confirm(job_id: str, req: ConfirmIn, request: Request):
         raise HTTPException(status_code=409,
                             detail=f"任务状态为 {j.status}，仅待确认（awaiting）任务可确认")
     if not jobs.acquire_mutex("product_doc_mine"):
-        raise HTTPException(status_code=409, detail="已有抽取任务在跑，稍后确认")
+        raise HTTPException(status_code=409, detail="已有抽取任务在执行（抽取/入库/回退），稍后再试")
     try:
-        out = gate.apply_gate(job_id, req.action)
-    finally:
+        steps = list(j.steps or []) + [{"name": "入库", "status": "processing", "detail": ""}]
+        jobs.update_job(job_id, status="processing",
+                        result={**(j.result or {}), "stage": "applying"},
+                        steps=steps)
+        background.add_task(_apply_and_release, job_id, req.action)
+    except Exception:
         jobs.release_mutex("product_doc_mine")
+        raise
     record("/import/extract/confirm", job_id, "", user=request.state.user,
            caller=request.state.caller, level="object",
            operator=getattr(request.state, "operator", ""))
-    return {"ok": True, "job_id": job_id, **out}
+    return {"ok": True, "job_id": job_id, "stage": "applying"}
+
+
+def _apply_and_release(job_id: str, action: str) -> None:
+    """后台包装：执行入库（成败皆释放互斥）。失败回 awaiting（清单先行+sha 守卫
+    使重试自愈；亦可撤销——cancel 会按清单回滚已落盘部分）。"""
+    try:
+        gate.apply_gate(job_id, action)
+    except Exception as e:  # noqa: BLE001
+        j = jobs.get_job(job_id)
+        res = dict((j.result if j else None) or {})
+        res["confirm_error"] = str(e)
+        jobs.update_job(job_id, status="awaiting", result=res,
+                        warnings=[*((j.warnings if j else None) or []),
+                                  f"入库执行失败：{e}——可重试确认或撤销"])
+    finally:
+        jobs.release_mutex("product_doc_mine")
 
 
 @router.post("/import/extract/{job_id}/cancel")
 def cancel(job_id: str, request: Request):
-    """闸门撤销：沙箱全删（正式资产从未被碰），任务终态 cancelled。"""
+    """闸门撤销：沙箱全删（含按清单回滚失败确认已落盘的部分），任务终态 cancelled。
+    同步端点（正常秒级——仅清理；部分回滚仅在确认失败后才发生）。"""
     _require_assets(request)
     j = _get_mine_job_or_404(job_id)
     if j.status != "awaiting":
         raise HTTPException(status_code=409,
                             detail=f"任务状态为 {j.status}，仅待确认（awaiting）任务可撤销")
     if not jobs.acquire_mutex("product_doc_mine"):
-        raise HTTPException(status_code=409, detail="已有抽取任务在跑，稍后撤销")
+        raise HTTPException(status_code=409, detail="已有抽取任务在执行，稍后撤销")
     try:
         gate.cancel_gate(job_id)
     finally:
@@ -304,9 +330,10 @@ def cancel(job_id: str, request: Request):
 
 
 @router.post("/import/extract/{job_id}/revert")
-def revert(job_id: str, request: Request):
-    """按任务移除本次抽取内容：新增→软删进回收站；覆盖→还原旧版备份。
-    sha 守卫：已被后续任务改动的文件跳过防误删。"""
+def revert(job_id: str, request: Request, background: BackgroundTasks):
+    """按任务移除本次抽取内容——**后台异步执行**（同确认）：新增→软删进回收站；
+    覆盖→还原旧版备份；sha 守卫跳过已被后续任务改动的文件。失败回 done 带告警
+    可重发起（每文件守卫使重发起安全）。"""
     _require_assets(request)
     j = _get_mine_job_or_404(job_id)
     if j.status != "done":
@@ -318,15 +345,36 @@ def revert(job_id: str, request: Request):
         raise HTTPException(status_code=400,
                             detail="该任务无产物清单（旧任务或空产出），无法回退")
     if not jobs.acquire_mutex("product_doc_mine"):
-        raise HTTPException(status_code=409, detail="已有抽取任务在跑，稍后回退")
+        raise HTTPException(status_code=409, detail="已有抽取任务在执行，稍后回退")
     try:
-        out = gate.revert_job(job_id, deleted_by=getattr(request.state, "user", ""))
-    finally:
+        steps = list(j.steps or []) + [{"name": "回退", "status": "processing", "detail": ""}]
+        jobs.update_job(job_id, status="processing",
+                        result={**(j.result or {}), "stage": "reverting"},
+                        steps=steps)
+        background.add_task(_revert_and_release, job_id,
+                            getattr(request.state, "user", ""))
+    except Exception:
         jobs.release_mutex("product_doc_mine")
+        raise
     record("/import/extract/revert", job_id, "", user=request.state.user,
            caller=request.state.caller, level="object",
            operator=getattr(request.state, "operator", ""))
-    return {"ok": True, "job_id": job_id, **out}
+    return {"ok": True, "job_id": job_id, "stage": "reverting"}
+
+
+def _revert_and_release(job_id: str, by: str) -> None:
+    """后台包装：执行回退（成败皆释放互斥）。失败回 done 带告警。"""
+    try:
+        gate.revert_job(job_id, deleted_by=by)
+    except Exception as e:  # noqa: BLE001
+        j = jobs.get_job(job_id)
+        res = dict((j.result if j else None) or {})
+        res["revert_error"] = str(e)
+        jobs.update_job(job_id, status="done", result=res,
+                        warnings=[*((j.warnings if j else None) or []),
+                                  f"回退执行失败：{e}——可重新发起「移除产出」"])
+    finally:
+        jobs.release_mutex("product_doc_mine")
 
 
 def _svc_db():

@@ -193,7 +193,10 @@ def test_cmd_gate_report_then_confirm_overwrite(env, monkeypatch, tmp_data_dir):
 
     r = client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
     assert r.status_code == 200, r.text
-    st = r.json()["stats"]
+    assert r.json()["stage"] == "applying"                       # 立即返回（后台执行）
+    j2 = _get_job(j.job_id)                                      # TestClient 同步跑完后台任务
+    assert j2["status"] == "done"
+    st = j2["result"]["applied"]
     assert st["added"] == 1 and st["modified"] == 2 and st["skipped_identical"] == 1
     assert "新正文" in live_mod.read_text(encoding="utf-8")
     assert (tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md").exists()
@@ -229,7 +232,8 @@ def test_confirm_new_only_keeps_existing(env, monkeypatch, tmp_data_dir):
     live_mod = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@MOD ME.md"
     r = client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "new_only"})
     assert r.status_code == 200
-    st = r.json()["stats"]
+    j2 = _get_job(j.job_id)
+    st = j2["result"]["applied"]
     assert st["added"] == 1 and st["modified"] == 0 and st["skipped_existing"] == 1
     assert "旧正文" in live_mod.read_text(encoding="utf-8")     # 重复保留现有
     rows = _rows(j.job_id)
@@ -275,13 +279,12 @@ def test_restart_after_confirm_keeps_originals_for_revert(env, monkeypatch, tmp_
     assert gate.gate_originals(j.job_id).exists()               # 备份未被清扫
     r = client.post(f"/api/v1/import/extract/{j.job_id}/revert")
     assert r.status_code == 200
-    assert r.json()["restored"] == 1                            # 回退照常可用
+    assert _get_job(j.job_id)["result"]["revert"]["restored"] == 1  # 回退照常可用
 
 
 def test_confirm_copy_failure_retry_completes_manifest(env, monkeypatch, tmp_data_dir):
-    """apply 拷贝中断（清单先行已写）→ 重试：已落盘文件 identical 但清单行保留，
-    清单覆盖面完整（add+modify 齐）——revert 不丢覆盖。"""
-    j = None
+    """apply 后台执行拷贝中断（清单先行已写）→ 任务自动回 awaiting 带告警 →
+    重试：已落盘文件 identical 但清单行保留，覆盖面完整——revert 不丢覆盖。"""
     fake = env.stub_cmd()
     j = env.start(monkeypatch, fake)
     orig_copy = gate._copy
@@ -294,16 +297,20 @@ def test_confirm_copy_failure_retry_completes_manifest(env, monkeypatch, tmp_dat
         return orig_copy(src, dst)
 
     monkeypatch.setattr(gate, "_copy", flaky_copy)
-    with pytest.raises(OSError):                                 # TestClient 重抛服务端异常=真实 500
-        client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
-    assert _get_job(j.job_id)["status"] == "awaiting"           # 可重试
+    r1 = client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
+    assert r1.status_code == 200                                 # 立即返回（后台）
+    j1 = _get_job(j.job_id)                                      # 后台失败已回 awaiting
+    assert j1["status"] == "awaiting"
+    assert any("入库执行失败" in w for w in j1["warnings"])
     assert len(_rows(j.job_id)) == 2                             # 清单先行：完整
 
     monkeypatch.setattr(gate, "_copy", orig_copy)
     r2 = client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
     assert r2.status_code == 200, r2.text
+    j2 = _get_job(j.job_id)
+    assert j2["status"] == "done"
     rows = _rows(j.job_id)
-    ops = {r2["op"] for r2 in rows}
+    ops = {r["op"] for r in rows}
     assert len(rows) == 2 and ops == {"add", "modify"}           # 重试后清单仍完整
     mod_p = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@MOD ME.md"
     assert "新正文" in mod_p.read_text(encoding="utf-8")         # 重试补完了拷贝
@@ -323,8 +330,9 @@ def test_cancel_after_partial_apply_rolls_back_files(env, monkeypatch, tmp_data_
         return orig_copy(src, dst)
 
     monkeypatch.setattr(gate, "_copy", flaky_copy)
-    with pytest.raises(OSError):                                 # 拷贝中断（真实 500）
-        client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
+    r1 = client.post(f"/api/v1/import/extract/{j.job_id}/confirm", json={"action": "overwrite"})
+    assert r1.status_code == 200                                 # 后台执行失败自动回 awaiting
+    assert _get_job(j.job_id)["status"] == "awaiting"
     add_p = tmp_data_dir / "Command/UDG/20.15.2/UDG@MMLCommand@ADD NEW.md"
     assert add_p.exists()                                        # 首文件已落盘（泄漏）
 
@@ -410,7 +418,9 @@ def test_revert_full(env, monkeypatch, tmp_data_dir):
 
     r = client.post(f"/api/v1/import/extract/{j.job_id}/revert")
     assert r.status_code == 200, r.text
-    out = r.json()
+    assert r.json()["stage"] == "reverting"                      # 立即返回（后台）
+    j3 = _get_job(j.job_id)                                      # 后台同步跑完
+    out = j3["result"]["revert"]
     assert out["soft_deleted"] == 1 and out["restored"] == 1 and out["skipped"] == []
     assert not add_p.exists()                                   # 新增→软删（进回收站）
     assert "旧正文" in mod_p.read_text(encoding="utf-8")        # 覆盖→还原旧版
@@ -434,11 +444,46 @@ def test_revert_sha_guard_skips_overwritten(env, monkeypatch, tmp_data_dir):
     add_p.write_text("被后续改写", encoding="utf-8")
     r = client.post(f"/api/v1/import/extract/{j.job_id}/revert")
     assert r.status_code == 200
-    out = r.json()
+    out = _get_job(j.job_id)["result"]["revert"]
     assert out["soft_deleted"] == 0 and out["restored"] == 1
     assert len(out["skipped"]) == 1 and "防误删" in out["skipped"][0]
     assert add_p.exists() and add_p.read_text(encoding="utf-8") == "被后续改写"
     assert "旧正文" in mod_p.read_text(encoding="utf-8")
+
+
+# ---------- 重启对账（applying/reverting 执行中断，2026-08-27 异步化） ----------
+
+def test_reconcile_applying_back_to_awaiting(env, monkeypatch):
+    """入库执行中后端重启 → 复位 awaiting（可重试确认/撤销），不被 sweep 标 failed。"""
+    from app import jobs as jobs_mod
+    job = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+    jobs_mod.update_job(job.job_id, status="awaiting", result={
+        "stage": "gate", "target_nf": "UDG", "target_version": "20.15.2"})
+    jobs_mod.update_job(job.job_id, status="processing",
+                        result={"stage": "applying", "target_nf": "UDG"})
+    jobs_mod._registry.clear()                                  # 模拟重启（DB-only）
+    assert gate.reconcile_interrupted() >= 1
+    j = jobs_mod.get_job(job.job_id)
+    assert j.status == "awaiting" and j.result["stage"] == "gate"
+    assert "入库执行中断" in j.result["confirm_error"]
+    jobs_mod.sweep_interrupted()                                # 复位后 sweep 不再动它
+    assert jobs_mod.get_job(job.job_id).status == "awaiting"
+
+
+def test_reconcile_reverting_back_to_done(env, monkeypatch):
+    """回退执行中后端重启 → 复位 done + 告警（可重发起，每文件守卫安全）。"""
+    from app import jobs as jobs_mod
+    job = jobs_mod.create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+    jobs_mod.update_job(job.job_id, status="done", result={
+        "stage": "applied", "script": "cmd", "target_nf": "UDG"})
+    jobs_mod.update_job(job.job_id, status="processing",
+                        result={"stage": "reverting", "target_nf": "UDG"})
+    jobs_mod._registry.clear()
+    assert gate.reconcile_interrupted() >= 1
+    j = jobs_mod.get_job(job.job_id)
+    assert j.status == "done" and j.finished_at > 0
+    assert any("回退执行中断" in w for w in j.warnings)
+    assert not j.result.get("reverted_at")                       # 未标已回退→可重发起
 
 
 def test_revert_rejects_wrong_state(env, monkeypatch):

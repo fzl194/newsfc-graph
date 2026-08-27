@@ -12,9 +12,13 @@ v3（2026-08-19，两步流水线）：
 v4（2026-08-26，抽取任务化+入图闸门）：
 - status 扩展 ``awaiting``（沙箱构建完成、等用户在闸门三选——**非终态**，
   ``sweep_interrupted`` 只清 processing 不动它，跨重启存活）与 ``cancelled``
-  （闸门撤销，终态）。awaiting 期间 kind 互斥已释放（其他目标可继续抽）。
-- job.nf/version 对抽取任务存**目标**网元/版本（同目标 awaiting 守卫一条 SQL）；
-  包身份在 result.bundle_nf/bundle_version。
+  （闸门撤销，终态）。awaiting 期间 kind 互斥已释放。
+- 确认/回退为**后台异步执行**（2026-08-27 用户反馈改版）：端点置
+  status=processing + result.stage=applying/reverting 即返，BackgroundTask 执行；
+  重启对账见 ``gate.reconcile_interrupted``（applying→awaiting 可重试、reverting→done）。
+- job.nf/version 对抽取任务存**目标**网元/版本；包身份在 result.bundle_nf/version。
+- **全流程串行**（用户决策 2026-08-27）：``pending_for``——存在 processing/awaiting
+  即拒绝新抽取（替代先前同目标局部守卫）。
 """
 import json
 import os
@@ -149,10 +153,21 @@ def create_job(kind: str = "import", nf: str = "", version: str = "") -> ImportJ
 
 
 def update_job(jid: str, **kw) -> None:
+    """更新任务字段并落库。**DB-only 任务（重启后）先载入再更新**——awaiting 跨
+    重启存活，闸门确认/回退必须仍能推进其状态（2026-08-27 修复：先前对 DB-only
+    任务静默 no-op，导致重启后确认入库而任务永远停在 awaiting）。"""
     with _lock:
         j = _registry.get(jid)
         if j is None:
-            return
+            try:
+                row = _db().execute(
+                    "SELECT * FROM import_jobs WHERE job_id=?", (jid,)).fetchone()
+            except sqlite3.Error:
+                return
+            if row is None:
+                return
+            j = _from_row(row)
+            _registry[jid] = j
         for k, v in kw.items():
             setattr(j, k, v)
         if kw.get("status") in ("done", "failed", "cancelled"):
@@ -230,14 +245,18 @@ def has_processing(kind: str) -> Optional[ImportJob]:
     return _from_row(row) if row else None
 
 
-def awaiting_for(kind: str, nf: str, version: str) -> Optional[ImportJob]:
-    """该 kind 下同 (nf, version) 是否已有 awaiting（待闸门确认）任务——
-    同目标守卫：沙箱/报告是单份的，同目标并发待确认会互相踩（用户决策阻断）。"""
+def pending_for(kind: str) -> Optional[ImportJob]:
+    """该 kind 是否存在未完结任务（processing[含入库/回退执行中]或 awaiting）——
+    抽取全流程**串行守卫**（用户决策 2026-08-27：上一任务未入库完结不发起新抽取，
+    替代先前仅同目标的局部守卫）。"""
+    with _lock:
+        for j in _registry.values():
+            if j.kind == kind and j.status in ("processing", "awaiting"):
+                return j
     try:
         row = _db().execute(
-            "SELECT * FROM import_jobs WHERE kind=? AND status='awaiting' "
-            "AND nf=? AND version=? ORDER BY started_at DESC LIMIT 1",
-            (kind, nf, version)).fetchone()
+            "SELECT * FROM import_jobs WHERE kind=? AND status IN ('processing','awaiting') "
+            "ORDER BY started_at DESC LIMIT 1", (kind,)).fetchone()
     except sqlite3.Error:
         return None
     return _from_row(row) if row else None
