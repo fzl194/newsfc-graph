@@ -470,6 +470,45 @@ export const statsFeatureMatrix = (p: StatsFilterParams = {}, page = 1, size = 2
 export const statsBusinessOverview = (): Promise<BusinessOverview> =>
   _req<BusinessOverview>(`${BASE}/stats/business/overview`)
 
+// 三层图谱进展总览（stats_overview.json，手动维护；管理员可页编辑）
+export interface OverviewMetric {
+  label: string
+  value: string | number
+  /** 0~100，存在时前端渲染进度条（覆盖率/进展） */
+  progress?: number
+}
+
+export interface OverviewCard {
+  title: string
+  accent?: string
+  metrics: OverviewMetric[]
+}
+
+export interface StatsOverviewConfig {
+  description?: string
+  updated_at?: string
+  updated_by?: string
+  cards: OverviewCard[]
+}
+
+export interface StatsOverview {
+  available: boolean
+  config: StatsOverviewConfig | null
+  error?: string
+}
+
+export const fetchStatsOverview = (): Promise<StatsOverview> =>
+  _req<StatsOverview>(`${BASE}/stats/overview`)
+
+export const saveStatsOverview = (
+  cfg: StatsOverviewConfig,
+): Promise<{ ok: boolean; config: StatsOverviewConfig }> =>
+  _req(`${BASE}/stats/overview`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  })
+
 // MOP 动网变更场景统计（Excel 底表聚合，不走库）
 export interface MopRow {
   path: string[]

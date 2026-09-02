@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from ..stats import cache as stats_cache
 from ..stats import export as export_mod
 from ..stats import mop as mop_mod
+from ..stats import overview as overview_mod
 from ..stats.core import get_conn, parse_filters, view_payload
 
 router = APIRouter()
@@ -91,6 +92,31 @@ def stats_business_overview():
 @router.get("/mop")
 def stats_mop(level: int = 1):
     return mop_mod.aggregate(level)
+
+
+# ---------- 三层图谱进展总览（stats_overview.json，手动维护）----------
+
+@router.get("/overview")
+def stats_overview():
+    """总览配置（缺文件 → available:false，前端隐藏总览区）。"""
+    return overview_mod.load()
+
+
+@router.put("/overview")
+async def stats_overview_save(request: Request):
+    """管理员编辑总览（body=完整配置 JSON；等价手改 stats_overview.json）。"""
+    user = getattr(request.state, "user_obj", None) or {}
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="仅管理员可编辑总览")
+    try:
+        raw = await request.json()
+    except Exception as e:  # noqa: BLE001 —— body 非 JSON
+        raise HTTPException(status_code=400, detail=f"请求体不是合法 JSON: {e}") from e
+    try:
+        cfg = overview_mod.save(raw, updated_by=str(user.get("username") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "config": cfg}
 
 
 @router.put("/mop/source")
