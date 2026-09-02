@@ -15,9 +15,13 @@ RUN npm run build
 FROM python:3.11-slim
 WORKDIR /gap/backend
 
-# 后端依赖（与 backend/pyproject.toml dependencies 一致；内网无外网时见 deploy/README 离线说明）
+# 后端依赖（与 backend/pyproject.toml dependencies 保持同步；内网无外网时见 deploy/README 离线说明）
+# ⚠ 2026-09-03 补 mcp（MCP 服务 /mcp 的 SDK，2026-08-24 上线时 Dockerfile 漏同步，
+#   旧清单构建的镜像会在启动 import mcp_server 时崩溃）；**必须钉 mcp<2**——
+#   2.x 把 FastMCP 改名 MCPServer（API 破坏性变更），代码基于 1.x（开发环境 1.27）
+# 统计页/MOP 全标准库无新增依赖
 RUN pip install --no-cache-dir \
-    fastapi "uvicorn[standard]" pyyaml python-multipart chardet beautifulsoup4
+    fastapi "uvicorn[standard]" pyyaml python-multipart chardet beautifulsoup4 "mcp<2"
 
 # 代码进镜像（数据走卷）：app/ + 前端 dist
 # dist 路径对应 main.py 的 Path(__file__).parents[2]/frontend/dist → /gap/frontend/dist
