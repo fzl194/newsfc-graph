@@ -11,7 +11,7 @@ services:
     image: graph-asset-platform:latest
     container_name: gap
     ports:
-      - "8000:8000"
+      - "80:8000"   # 平台对外 80（用户要求）；容器内仍是 8000
     environment:
       - GAP_DATA_DIR=/data          # 平台数据根（DB/资产/原始文档/用户/测试用例）
     volumes:
