@@ -273,7 +273,8 @@ def test_command_rules_ne_version_mode(seeded):
     assert d["total"] == 8
     m = {(r["ne"], r["version"], r["rule_type"]): r for r in d["rows"]}
     syn = m[("UPCF", "20.10.2", "语法规则")]
-    assert (syn["cmd_count"], syn["param_count"], syn["rule_count"]) == (2, 3, 3)
+    # 语法行：命令数=组内 DISTINCT CMD_NAME；参数数=行数；规则数量无口径 → 0（前端显示 —）
+    assert (syn["cmd_count"], syn["param_count"], syn["rule_count"]) == (2, 3, 0)
     assert m[("UDG", "20.10.2", "语法规则")]["cmd_count"] == 1
     assert m[("UPCF", "20.10.2", "图规则")]["rule_count"] == 2
     assert m[("UDG", "20.10.2", "删除规则")]["rule_count"] == 1
@@ -291,7 +292,8 @@ def test_command_rules_mode_ne_and_all(seeded):
     d2 = _get("/api/v1/stats/command/rules?mode=all")
     assert d2["total"] == 6  # 六类各一行
     m2 = {(r["rule_type"]): r for r in d2["rows"]}
-    assert (m2["语法规则"]["cmd_count"], m2["语法规则"]["rule_count"]) == (3, 5)
+    assert (m2["语法规则"]["cmd_count"], m2["语法规则"]["param_count"],
+            m2["语法规则"]["rule_count"]) == (3, 5, 0)
     assert m2["图规则"]["rule_count"] == 3
     assert all(r["ne"] == "" for r in d2["rows"])
 
@@ -303,7 +305,7 @@ def test_command_rules_pagination_and_filters(seeded):
     d2 = _get("/api/v1/stats/command/rules?logical_ne=SMF")
     syn = [r for r in d2["rows"] if r["rule_type"] == "语法规则"]
     assert {(r["ne"], r["cmd_count"], r["rule_count"]) for r in syn} == {
-        ("UPCF", 1, 2)}
+        ("UPCF", 1, 0)}
     # 五类不受逻辑网元影响（图规则仍 UPCF 2 + UDG 1）
     graph_sum = sum(r["rule_count"] for r in d2["rows"] if r["rule_type"] == "图规则")
     assert graph_sum == 3

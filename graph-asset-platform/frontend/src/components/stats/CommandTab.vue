@@ -101,18 +101,23 @@
           </template>
         </el-table-column>
         <el-table-column prop="rule_type" label="规则类型" width="130" sortable="custom" />
-        <el-table-column prop="cmd_count" label="命令数量" sortable="custom" align="right">
+        <el-table-column prop="cmd_count" sortable="custom" align="right">
+          <template #header><span title="语法规则表 DISTINCT CMD_NAME（组内去重，同命令多条参数行只计 1）">命令数量</span></template>
           <template #default="{ row }">
             <span class="mono" :class="{ faint: !row.cmd_count }">{{ row.cmd_count ? fmt(row.cmd_count) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="param_count" label="参数数量" sortable="custom" align="right">
+        <el-table-column prop="param_count" sortable="custom" align="right">
+          <template #header><span title="语法规则表行数（每行 = 一条命令参数定义）">参数数量</span></template>
           <template #default="{ row }">
             <span class="mono" :class="{ faint: !row.param_count }">{{ row.param_count ? fmt(row.param_count) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="rule_count" label="规则数量" sortable="custom" align="right">
-          <template #default="{ row }"><span class="mono strong">{{ fmt(row.rule_count) }}</span></template>
+        <el-table-column prop="rule_count" sortable="custom" align="right">
+          <template #header><span title="五类规则表（图/重复/MOD/SET/删除）行数；语法规则无此口径（其行数即参数数量）">规则数量</span></template>
+          <template #default="{ row }">
+            <span class="mono" :class="{ strong: row.rule_count, faint: !row.rule_count }">{{ row.rule_count ? fmt(row.rule_count) : '—' }}</span>
+          </template>
         </el-table-column>
       </el-table>
     </section>

@@ -440,6 +440,14 @@ def view_payload(conn: Conn, view: str, f: Filters) -> dict:
 # 筛选 + 分页 + 排序）。GROUP BY 结果行数有限，排序/切片在 Python 侧做（成本
 # 在聚合本身，LIMIT 不省算力，只省传输）。
 
+def _sort_key(v):
+    """排序键类型归一：数值列可能出现 0/None 与字符串混排（如语法行 rule_count=0），
+    统一成 (类型序, 数值, 字符串) 三元组，避免 int/str 比较抛 TypeError。"""
+    if isinstance(v, (int, float)):
+        return (0, v, "")
+    return (1, 0, str(v) if v is not None else "")
+
+
 def _sort_rows(rows: list[dict], sort: str, whitelist: dict[str, str]) -> list[dict]:
     """白名单排序：'-total' 倒序；未知键原样返回。"""
     if not sort:
@@ -448,8 +456,7 @@ def _sort_rows(rows: list[dict], sort: str, whitelist: dict[str, str]) -> list[d
     field = whitelist.get(sort.lstrip("-"))
     if not field:
         return rows
-    return sorted(rows, key=lambda r: (r.get(field) is None, r.get(field) or ""),
-                  reverse=desc)
+    return sorted(rows, key=lambda r: _sort_key(r.get(field)), reverse=desc)
 
 
 def _paginate(rows: list[dict], page: int, size: int) -> tuple[list[dict], int]:
@@ -571,7 +578,10 @@ def command_rules(conn: Conn, f: Filters, mode: str = "ne_version",
                 f'COUNT(*) AS n FROM "{SYNTAX_TABLE}" WHERE {where} {group}', params):
             rows.append({"ne": r["ne"] or "", "version": r["version"] or "",
                          "rule_type": "语法规则", "cmd_count": r["c"] or 0,
-                         "param_count": r["n"] or 0, "rule_count": r["n"] or 0})
+                         "param_count": r["n"] or 0,
+                         # 语法表行=参数定义，无独立"规则数量"口径（曾填行数与
+                         # 参数数量恒等，2026-09-02 用户指出后置 0=前端显示 —）
+                         "rule_count": 0})
     for key, (table, ne_col, ver_col, label) in RULE_TABLES.items():
         if key not in sel:
             continue
