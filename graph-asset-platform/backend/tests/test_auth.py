@@ -120,3 +120,20 @@ def test_skill_user_cannot_write_assets_nor_tests(tmp_path, monkeypatch, tmp_dat
 
 # X-User-Id 机制已随旧两接口删除（MCP 服务化 2026-08-24）：
 # 工号归因迁移至 MCP 工具参数 AGENT_USERNAME（见 test_mcp.py 打点用例）。
+
+
+def test_stats_view_endpoints_frontend_perm(tmp_path, monkeypatch, tmp_data_dir):
+    """三视图统计端点（/api/v1/stats/*，2026-09-01）：frontend 权限——
+    无 KEY 401 / 纯 skill 403 / can_frontend 200（含导出，不走 /export 的 upload 分支）；
+    旧 GET /api/v1/stats 同级权限不受新路由影响。"""
+    _seed(tmp_path, monkeypatch, [FE, SK])
+    from app.main import app
+    with TestClient(app) as c:
+        assert c.get("/api/v1/stats/command").status_code == 401
+        assert c.get("/api/v1/stats/command",
+                     headers={"X-API-Key": "gap_sk"}).status_code == 403
+        for url in ("/api/v1/stats/command", "/api/v1/stats/feature",
+                    "/api/v1/stats/business", "/api/v1/stats/filters",
+                    "/api/v1/stats/export?view=command&format=csv",
+                    "/api/v1/stats"):
+            assert c.get(url, headers={"X-API-Key": "gap_fe"}).status_code == 200, url

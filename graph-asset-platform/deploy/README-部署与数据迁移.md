@@ -11,6 +11,7 @@ deploy/platform-data/          ← docker-compose 卷映射点（宿主机磁盘
   assets/          图谱资产 md+图片（Command/ConfigObject/Feature/License/Task/Business）
   output/          原始产品文档解压包（bundle）
   platform.db      SQLite：索引(objects/edges) + 用户 + 任务历史 + 打点 + 回收站记录
+                   + 8 张 AIMML 历史规则表 B_AI_*（v11，统计页数据源，只读）
   users.json       用户备份（库损坏时的恢复源；日常以 DB users 表为准）
   tests/           测试用例子系统
   telemetry/       打点 raw 备份
@@ -91,3 +92,9 @@ compose 挂载三处，**容器内零持久状态**（删容器/重建镜像/重
   `storage/` 为待确认产出（确认后自动清）、`originals/` 为覆盖文件的旧版（按任务回退的
   还原源，随任务历史删除而清理）——迁移整体拷贝即可，不影响。
 - 版本升级：更新服务器上的 backend/dist → `docker compose up -d --build`（数据卷不动，自动沿用）。
+- **统计页三视图（2026-09-01，db v11）**：重启自动幂等建 8 张 B_AI_* 规则表（空表）。
+  规则数据由内网 GaussDB 导出脚本 `AIMML历史图谱/db_tool/dump_rule_tables_to_platform.py`
+  灌入 platform.db（已灌过则只需 git pull + 重启）；未灌数时统计页命令图谱的
+  命令/参数/五类规则指标为 0，页面顶部显示"规则表未导入"提示。
+  运行需 SQLite ≥ 3.38（json_extract；Python 3.11+ 自带均满足）。
+  详见 `docs/实施计划-统计页面重构-2026-09-01.md`。

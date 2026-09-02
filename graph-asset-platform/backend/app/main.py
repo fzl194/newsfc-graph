@@ -20,6 +20,7 @@ from .routers import fs as fs_router
 from .routers import mcp_tools as mcp_tools_router
 from .routers import objects as objects_router
 from .routers import productdoc as productdoc_router
+from .routers import stats as stats_router
 from .routers import telemetry as telemetry_router
 from .routers import tests as tests_router
 from .routers import users as users_router
@@ -110,6 +111,7 @@ app.include_router(fs_router.router, prefix="/api/v1")
 app.include_router(objects_router.router, prefix="/api/v1")
 app.include_router(mcp_tools_router.router, prefix="/api/v1")
 app.include_router(productdoc_router.router, prefix="/api/v1")
+app.include_router(stats_router.router, prefix="/api/v1/stats")
 app.include_router(telemetry_router.router, prefix="/api/v1")
 app.include_router(tests_router.router, prefix="/api/v1")
 app.include_router(users_router.router, prefix="/api/v1")

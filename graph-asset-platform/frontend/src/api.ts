@@ -288,6 +288,203 @@ export const exportUrl = (f: {
   scenario?: string
 }): string => `${BASE}/export${qs(f)}`
 
+// ---------- 三视图统计（统计页重构 2026-09-01）----------
+// 口径与后端 app/stats 对齐；多值筛选以逗号拼接传递。
+
+export interface StatsFilterOptions {
+  nfs: string[]
+  versions: string[]
+  logical_nes: Record<string, string[]>
+  object_types: string[]
+  relations: string[]
+  rule_types: { key: string; label: string }[]
+  domains: string[]
+  scenarios: string[]
+  solutions: { domain: string; scenario: string; name: string }[]
+  /** 8 张导入表行数；-1=表不存在。0/-1 → 前端提示"规则表未导入" */
+  table_rows: Record<string, number>
+}
+
+/** 下钻行公共列：nf/nf_display 为 objects 系；规则表系为 ne（nf_display 同名输出） */
+export interface MatrixBase {
+  nf_display: string
+  version: string
+  version_display: string
+}
+
+export interface CommandMatrixRow extends MatrixBase {
+  nf: string
+  MMLCommand: number
+  ConfigObject: number
+  total: number
+}
+
+export interface SyntaxMatrixRow extends MatrixBase {
+  ne: string
+  cmd_count: number
+  param_count: number
+}
+
+export interface RuleMatrixRow extends MatrixBase {
+  ne: string
+  count: number
+}
+
+export interface FeatureMatrixRow extends MatrixBase {
+  nf: string
+  feature_codes: number
+  feature_knowledge: number
+  license_codes: number
+  license_knowledge: number
+}
+
+export interface SolutionRow {
+  domain: string
+  scenario: string
+  solutions: string[]
+  count: number
+}
+
+export interface TaskMatrixRow {
+  type: string
+  nf: string
+  count: number
+}
+
+export interface EdgesBlock {
+  raw: [string, number][]
+  merged: [string, number][]
+  merged_total: number
+  groups?: Record<string, number>
+}
+
+export interface CommandStats {
+  view: 'command'
+  knowledge: { MMLCommand: number; ConfigObject: number; points: number }
+  edges: EdgesBlock
+  inbound: { raw: [string, number][] }
+  rules: {
+    syntax?: { cmd_count: number; param_count: number; cmd_count_by_group_sum: number }
+    graph?: number
+    repeat?: number
+    mod?: number
+    set?: number
+    delete?: number
+  }
+  five_total: number
+  matrix: CommandMatrixRow[]
+  syntax_matrix: SyntaxMatrixRow[]
+  rule_matrix: Record<string, RuleMatrixRow[]>
+}
+
+export interface FeatureStats {
+  view: 'feature'
+  totals: {
+    feature_codes: number
+    feature_knowledge: number
+    license_codes: number
+    license_knowledge: number
+  }
+  matrix: FeatureMatrixRow[]
+  edges: EdgesBlock
+  prefixes: string[]
+}
+
+export interface BusinessStats {
+  view: 'business'
+  counts: {
+    domains: number
+    scenarios: number
+    solutions: number
+    atom_tasks: number
+    feature_tasks: number
+    compound_tasks: number
+    task_cmd_edges: number
+    task_feature_edges: number
+  }
+  solutions_matrix: SolutionRow[]
+  tasks_matrix: TaskMatrixRow[]
+  edges: EdgesBlock & { groups: Record<string, number> }
+}
+
+export type StatsViewKey = 'command' | 'feature' | 'business'
+
+export interface StatsFilterParams {
+  nfs?: string[]
+  versions?: string[]
+  logical_ne?: string
+  object_types?: string[]
+  relations?: string[]
+  rule_types?: string[]
+  domain?: string
+  scenario?: string
+  solution?: string
+  overseas?: boolean
+}
+
+function statsQs(p: StatsFilterParams): string {
+  const parts: string[] = []
+  const multi = (k: string, v?: string[]): void => {
+    if (v?.length) parts.push(`${k}=${encodeURIComponent(v.join(','))}`)
+  }
+  const single = (k: string, v?: string): void => {
+    if (v) parts.push(`${k}=${encodeURIComponent(v)}`)
+  }
+  multi('nfs', p.nfs)
+  multi('versions', p.versions)
+  multi('object_types', p.object_types)
+  multi('relations', p.relations)
+  multi('rule_types', p.rule_types)
+  single('logical_ne', p.logical_ne)
+  single('domain', p.domain)
+  single('scenario', p.scenario)
+  single('solution', p.solution)
+  if (p.overseas) parts.push('overseas=true')
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
+export const statsFilters = (): Promise<StatsFilterOptions> =>
+  _req<StatsFilterOptions>(`${BASE}/stats/filters`)
+
+export const statsCommand = (p: StatsFilterParams = {}): Promise<CommandStats> =>
+  _req<CommandStats>(`${BASE}/stats/command${statsQs(p)}`)
+
+export const statsFeature = (p: StatsFilterParams = {}): Promise<FeatureStats> =>
+  _req<FeatureStats>(`${BASE}/stats/feature${statsQs(p)}`)
+
+export const statsBusiness = (p: StatsFilterParams = {}): Promise<BusinessStats> =>
+  _req<BusinessStats>(`${BASE}/stats/business${statsQs(p)}`)
+
+/** 导出当前筛选（fetch 带 KEY → blob → a[download]；直接导航无法带 X-API-Key）。 */
+export async function downloadStatsExport(
+  view: StatsViewKey,
+  format: 'csv' | 'xlsx' | 'md',
+  p: StatsFilterParams = {},
+): Promise<void> {
+  const headers = new Headers()
+  const k = getKey()
+  if (k) headers.set('X-API-Key', k)
+  const q = statsQs(p)
+  const resp = await fetch(
+    `${BASE}/stats/export?view=${view}&format=${format}${q ? `&${q.slice(1)}` : ''}`,
+    { headers },
+  )
+  if (!resp.ok) {
+    throw Object.assign(new Error(`导出失败 HTTP ${resp.status}`), {
+      status: resp.status,
+    })
+  }
+  const blob = await resp.blob()
+  const cd = resp.headers.get('content-disposition') || ''
+  const m = /filename="?([^";]+)"?/.exec(cd)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = m?.[1] ?? `stats-${view}.${format}`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 export const subgraph = (p: {
   center: string
   hops?: number

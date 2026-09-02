@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -135,6 +135,154 @@ CREATE INDEX IF NOT EXISTS idx_extract_files_job ON extract_files(job_id);
 CREATE INDEX IF NOT EXISTS idx_runs_case ON test_runs(case_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_run ON test_reviews(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_owner ON test_artifacts(owner_type, owner_id);
+
+-- ============ AIMML 历史规则表（v11，统计页 2026-09-01）============
+-- 8 张表由内网 GaussDB 全量导出灌入（AIMML历史图谱/db_tool/dump_rule_tables_to_platform.py），
+-- 平台侧只读（统计页数据源），列名/结构与源库一致。DDL 与《图谱平台统计页面需求说明书》
+-- §9 逐字一致——修改须先改需求文档。网元列名两套：GRAPH/REPEAT/LOGICAL_NE/映射表用
+-- PHYSICAL_NE_TYPE；MOD/SET/DELETE/语法规则表用 NE_TYPE（stats/spec.py 维护映射）。
+CREATE TABLE IF NOT EXISTS "B_AI_COMMAND_SYNTAX_CHECK_RULES" (
+  "CMD_NAME"            TEXT,  -- 命令名，如 'SET OFI'、'ADD DIAMMEDACT'
+  "PARAM_ID"            TEXT,  -- 参数 ID（每命令内自增序号）
+  "PARAM_NAME"          TEXT,  -- 参数名
+  "DATA_TYPE"           TEXT,  -- 数据类型
+  "OPTIONAL_MANDATORY"  TEXT,  -- 参数属性：可选/必选/条件必选/条件可选
+  "BIT_FIELD"           TEXT,  -- 位域标志
+  "DEFAULTVALUE"        TEXT,  -- 默认值
+  "MAX_VALUE"           TEXT,  -- 最大值
+  "MIN_VALUE"           TEXT,  -- 最小值
+  "INTERVAL_VALUE"      TEXT,  -- 步长/间隔
+  "MAX_LENGTH"          TEXT,  -- 最大长度
+  "MIN_LENGTH"          TEXT,  -- 最小长度
+  "DATA_LENGTH"         TEXT,  -- 数据长度
+  "ASSOCIATED_COMMANDS" TEXT,  -- 关联命令
+  "ASSOCIATED_PARAMRS"  TEXT,  -- 关联参数
+  "CASE_SENSITIVE"      TEXT,  -- 是否大小写敏感
+  "FORMAT"              TEXT,  -- 格式（CLOB 原列，已转全文）
+  "VALUE_RANGE"         TEXT,  -- 取值范围（CLOB 原列）
+  "REG_ID"              TEXT,  -- 规则 ID
+  "DESCRIPTION"         TEXT,  -- 描述（CLOB 原列）
+  "NE_TYPE"             TEXT,  -- 网元类型（本表自有命名，如 'vSE2980_4U'/'UEG-M'）
+  "NE_VERSION"          TEXT,  -- 版本，如 'V500R025C10'、'20.9.2'
+  "PARAM_NAME_CN"       TEXT,  -- 参数中文名
+  "COMPARERELATION"     TEXT,  -- 比较关系
+  "FORBIDDINGINPUT"     TEXT,  -- 禁止输入
+  "ENUMVALUE"           TEXT,  -- 枚举值（CLOB 原列）
+  "CONDITION_RANGE"     TEXT,  -- 条件范围
+  "CONDITION_SELECTION" TEXT,  -- 条件选择（CLOB 原列）
+  "PARAM_NAME_EN"       TEXT,  -- 参数英文名
+  "COMMAND_DESC_CN"     TEXT,  -- 命令中文描述（CLOB 原列）
+  "COMMAND_DESC_EN"     TEXT,  -- 命令英文描述
+  "NEW_PARAM_ID"        TEXT,  -- 新参数 ID（预留）
+  "PARAM_PREFIX"        TEXT   -- 参数前缀（预留）
+);
+CREATE INDEX IF NOT EXISTS idx_syntax_ne ON "B_AI_COMMAND_SYNTAX_CHECK_RULES"("NE_TYPE","NE_VERSION");
+CREATE INDEX IF NOT EXISTS idx_syntax_cmd ON "B_AI_COMMAND_SYNTAX_CHECK_RULES"("CMD_NAME","NE_TYPE","NE_VERSION");
+
+CREATE TABLE IF NOT EXISTS "B_AI_CONFIG_CHECK_LOGICAL_NE_CMD_T" (
+  "PHYSICAL_NE_TYPE" TEXT,  -- 物理网元，如 'UNC'
+  "LOGICAL_NE_TYPE"  TEXT,  -- 逻辑网元，如 'SMSF'、'AMF'、'SMF'
+  "NE_VERSION"       TEXT,  -- 版本，如 '23.1.0'
+  "COMMAND_NAME"     TEXT   -- 命令名，如 'SET HSMFCOMMONSW'
+);
+CREATE INDEX IF NOT EXISTS idx_lne_ne ON "B_AI_CONFIG_CHECK_LOGICAL_NE_CMD_T"("PHYSICAL_NE_TYPE","LOGICAL_NE_TYPE","NE_VERSION");
+
+CREATE TABLE IF NOT EXISTS "B_AI_MML_GRAPH_RULE_T" (
+  "ID"                      TEXT,
+  "PHYSICAL_NE_TYPE"        TEXT,
+  "NE_VERSION"              TEXT,
+  "COMMAND_NAME"            TEXT,
+  "PARAM_NAME"              TEXT,
+  "DEPEND_COMMAND_NAME"     TEXT,
+  "DEPEND_PARAM_NAME"       TEXT,
+  "DEPEND_TYPE"             TEXT,
+  "CONDITION_COMMAND_NAME"  TEXT,
+  "CONDITION_PARAM_NAME"    TEXT,
+  "CONDITION_PARAM_VALUE"   TEXT,
+  "MATCH_RULE_CODE"         TEXT,
+  "RELATION_RULE_CODE"      TEXT,
+  "ERR_MSG_ZH"              TEXT,
+  "ERR_MSG_EN"              TEXT,
+  "DEFAULT_ERROR_ZH"        TEXT,
+  "DEFAULT_ERROR_EN"        TEXT,
+  "BIND_TYPE"               TEXT,
+  "LINKED_DELETE"           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_graph_ne ON "B_AI_MML_GRAPH_RULE_T"("PHYSICAL_NE_TYPE","NE_VERSION","COMMAND_NAME");
+
+CREATE TABLE IF NOT EXISTS "B_AI_MML_REPEAT_CHECK_RULE_T" (
+  "REPEAT_CHECK_RULE_ID" TEXT,
+  "PHYSICAL_NE_TYPE"     TEXT,
+  "NE_VERSION"           TEXT,
+  "CREATE_TIME"          TEXT,
+  "UPDATE_TIME"          TEXT,
+  "COMMAND_NAME"         TEXT,
+  "PARAMS"               TEXT,
+  "RELATION"             TEXT,
+  "ERROR_MSG_CN"         TEXT,
+  "ERROR_MSG_EN"         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_repeat_ne ON "B_AI_MML_REPEAT_CHECK_RULE_T"("PHYSICAL_NE_TYPE","NE_VERSION","COMMAND_NAME");
+
+CREATE TABLE IF NOT EXISTS "B_AI_MOD_RULE_T" (
+  "ID"                            TEXT,
+  "MOD_CMD"                       TEXT,
+  "ADD_CMD"                       TEXT,
+  "INDEX_PARAMS"                  TEXT,
+  "COMMON_PARAMS"                 TEXT,
+  "INDEPENDENT_EXISTENCE"         TEXT,
+  "MOD_PARAM"                     TEXT,
+  "ADD_PARAM"                     TEXT,
+  "RESERVED"                      TEXT,
+  "SPECIAL_ASSOCIATION_CONDITIONS" TEXT,
+  "NE_VERSION"                    TEXT,
+  "NE_TYPE"                       TEXT,
+  "ERR_MSG_EN"                    TEXT,
+  "ERR_MSG_CN"                    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mod_ne ON "B_AI_MOD_RULE_T"("NE_TYPE","NE_VERSION","MOD_CMD");
+
+CREATE TABLE IF NOT EXISTS "B_AI_MML_SET_CHECK_RULE_T" (
+  "NE_TYPE"            TEXT,
+  "NE_VERSION"         TEXT,
+  "CMD_NAME"           TEXT,
+  "PARAM_ID"           TEXT,
+  "PARAM_NAME"         TEXT,
+  "DATA_TYPE"          TEXT,
+  "KEY_PARAMETER"      TEXT,
+  "COMMAND_UNIQUE"     TEXT,
+  "OPTIONAL_MANDATORY" TEXT,
+  "CONDITION_SELECTION" TEXT,
+  "CASE_SENSITIVE"     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_set_ne ON "B_AI_MML_SET_CHECK_RULE_T"("NE_TYPE","NE_VERSION","CMD_NAME");
+
+CREATE TABLE IF NOT EXISTS "B_AI_DELETE_RULE_V2_T" (
+  "ID"                 TEXT,
+  "EXCUTE_CMD"         TEXT,
+  "EXCUTE_PARAMS"      TEXT,
+  "RELATION_ADD_CMD"   TEXT,
+  "RMV_SPECIAL"        TEXT,
+  "FIND_RMV_JEXL_CODE" TEXT,
+  "ERR_MSG_EN"         TEXT,
+  "ERR_MSG_CN"         TEXT,
+  "NE_TYPE"            TEXT,
+  "NE_VERSION"         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_del_ne ON "B_AI_DELETE_RULE_V2_T"("NE_TYPE","NE_VERSION","EXCUTE_CMD");
+
+CREATE TABLE IF NOT EXISTS "B_AI_NE_VERSION_MAPPING_T" (
+  "UUID"             TEXT,
+  "PHYSICAL_NE_TYPE" TEXT,
+  "LOGICAL_NE_TYPE"  TEXT,
+  "NE_VIEW"          TEXT,
+  "LOCAL_VERSION"    TEXT,
+  "OVERSEAS_VERSION" TEXT,
+  "SUPPORT"          TEXT,
+  "DOMAIN_NAME"      TEXT,
+  "DOMAIN_NAME_EN"   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vm_ne ON "B_AI_NE_VERSION_MAPPING_T"("PHYSICAL_NE_TYPE","LOCAL_VERSION");
 """
 
 
