@@ -92,9 +92,11 @@ compose 挂载三处，**容器内零持久状态**（删容器/重建镜像/重
   `storage/` 为待确认产出（确认后自动清）、`originals/` 为覆盖文件的旧版（按任务回退的
   还原源，随任务历史删除而清理）——迁移整体拷贝即可，不影响。
 - 版本升级：更新服务器上的 backend/dist → `docker compose up -d --build`（数据卷不动，自动沿用）。
-- **统计页三视图（2026-09-01，db v11）**：重启自动幂等建 8 张 B_AI_* 规则表（空表）。
+- **统计页三视图（2026-09-01，db v11；2026-09-02 改版）**：重启自动幂等建 8 张 B_AI_* 规则表（空表）。
   规则数据由内网 GaussDB 导出脚本 `AIMML历史图谱/db_tool/dump_rule_tables_to_platform.py`
   灌入 platform.db（已灌过则只需 git pull + 重启）；未灌数时统计页命令图谱的
   命令/参数/五类规则指标为 0，页面顶部显示"规则表未导入"提示。
-  运行需 SQLite ≥ 3.38（json_extract；Python 3.11+ 自带均满足）。
+  **MOP 动网变更场景统计**（2026-09-02）读 `platform-data/mop_scenarios.xlsx`
+  （或 .csv，不走库、随时替换；管理员也可在业务图谱页直接上传）——底表列头需含
+  "L1场景"…"L5场景"。运行需 SQLite ≥ 3.38（json_extract；Python 3.11+ 自带均满足）。
   详见 `docs/实施计划-统计页面重构-2026-09-01.md`。

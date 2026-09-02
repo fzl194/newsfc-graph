@@ -21,6 +21,11 @@ export const router = createRouter({
       component: () => import('./views/StatsView.vue'),
     },
     {
+      path: '/ops',
+      name: 'ops',
+      component: () => import('./views/OpsView.vue'),
+    },
+    {
       path: '/upload',
       name: 'upload',
       component: () => import('./views/UploadView.vue'),

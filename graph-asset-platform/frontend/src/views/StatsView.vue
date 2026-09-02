@@ -5,29 +5,16 @@
         <div>
           <h1 class="page-title">统计</h1>
           <p class="page-sub">
-            三图谱视图：命令 / 特性 / 业务——按网元、版本（国内/海外）、对象/关系/规则类型、业务域筛选，支持导出
+            三图谱视图：命令 / 特性 / 业务——卡片、表格分区分层，表格独立筛选与分页
           </p>
         </div>
-        <div class="head-actions">
-          <button
-            v-for="f in EXPORTS" :key="f.key" class="exp-btn" type="button"
-            :disabled="exporting" @click="doExport(f.key)"
-          >{{ f.label }}</button>
-          <el-button :icon="Refresh" :loading="anyLoading" text @click="reload">
-            刷新
-          </el-button>
-        </div>
+        <el-button :icon="Refresh" text @click="reloadActive">刷新</el-button>
       </header>
 
       <div v-if="ruleTablesMissing" class="warn-banner">
         AIMML 历史规则表未导入（B_AI_* 表为空）——命令图谱的「命令数量 / 参数数量 / 五类规则」将为 0。
         内网请先运行 dump_rule_tables_to_platform.py 灌数。
       </div>
-
-      <StatsFilterBar
-        v-if="filterOpts" v-model="filters" :options="filterOpts" :view="active"
-        @reset="filters = emptyFilters()"
-      />
 
       <div v-if="errorMsg" class="error-banner">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
@@ -39,36 +26,26 @@
 
       <el-tabs v-model="active" class="stats-tabs">
         <el-tab-pane label="命令图谱" name="command">
-          <CommandTab :data="cmd" :loading="loadings.command" />
+          <CommandTab v-if="filterOpts" ref="cmdRef" :options="filterOpts" />
         </el-tab-pane>
         <el-tab-pane label="特性图谱" name="feature">
-          <FeatureTab :data="feat" :loading="loadings.feature" />
+          <FeatureTab v-if="filterOpts" ref="featRef" :options="filterOpts" />
         </el-tab-pane>
         <el-tab-pane label="业务图谱" name="business">
-          <BusinessTab :data="biz" :loading="loadings.business" />
+          <BusinessTab ref="bizRef" />
         </el-tab-pane>
       </el-tabs>
-
-      <!-- 知识取用频次（取用打点聚合，独立于三视图） -->
-      <TelemetrySection />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref, watch } from 'vue'
-import { ElButton, ElMessage, ElTabs, ElTabPane } from 'element-plus'
-import {
-  downloadStatsExport, statsBusiness, statsCommand, statsFeature, statsFilters,
-  type BusinessStats, type CommandStats, type FeatureStats,
-  type StatsFilterOptions, type StatsViewKey,
-} from '../api'
-import TelemetrySection from '../components/TelemetrySection.vue'
-import StatsFilterBar from '../components/stats/StatsFilterBar.vue'
+import { computed, h, onMounted, ref } from 'vue'
+import { ElButton, ElMessage, ElTabPane, ElTabs } from 'element-plus'
+import { statsFilters, type StatsFilterOptions, type StatsViewKey } from '../api'
 import CommandTab from '../components/stats/CommandTab.vue'
 import FeatureTab from '../components/stats/FeatureTab.vue'
 import BusinessTab from '../components/stats/BusinessTab.vue'
-import { emptyFilters, type StatsFilterState } from '../components/stats/shared'
 
 // Element Plus Refresh 图标（内联 SVG，避免引 @element-plus/icons-vue 依赖膨胀）
 const Refresh = () =>
@@ -85,23 +62,13 @@ const Refresh = () =>
     }),
   ])
 
-const EXPORTS = [
-  { key: 'csv' as const, label: '导出 CSV' },
-  { key: 'xlsx' as const, label: '导出 Excel' },
-  { key: 'md' as const, label: '导出 Markdown' },
-]
-
-const filters = ref<StatsFilterState>(emptyFilters())
 const filterOpts = ref<StatsFilterOptions | null>(null)
 const active = ref<StatsViewKey>('command')
-const cmd = ref<CommandStats | null>(null)
-const feat = ref<FeatureStats | null>(null)
-const biz = ref<BusinessStats | null>(null)
-const loadings = reactive({ command: false, feature: false, business: false })
 const errorMsg = ref('')
-const exporting = ref(false)
+const cmdRef = ref<InstanceType<typeof CommandTab> | null>(null)
+const featRef = ref<InstanceType<typeof FeatureTab> | null>(null)
+const bizRef = ref<InstanceType<typeof BusinessTab> | null>(null)
 
-const anyLoading = computed(() => loadings[active.value])
 const ruleTablesMissing = computed(() => {
   const rows = filterOpts.value?.table_rows ?? {}
   const vals = Object.values(rows)
@@ -113,47 +80,16 @@ async function loadFilters(): Promise<void> {
     filterOpts.value = await statsFilters()
   } catch (e: unknown) {
     errorMsg.value = e instanceof Error ? e.message : String(e)
+    ElMessage.error(errorMsg.value)
   }
 }
 
-async function loadView(view: StatsViewKey): Promise<void> {
-  loadings[view] = true
-  errorMsg.value = ''
-  try {
-    if (view === 'command') cmd.value = await statsCommand(filters.value)
-    else if (view === 'feature') feat.value = await statsFeature(filters.value)
-    else biz.value = await statsBusiness(filters.value)
-  } catch (e: unknown) {
-    errorMsg.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    loadings[view] = false
-  }
+/** 刷新当前 Tab（懒加载语义：切 Tab 由组件 onMounted 自理）。 */
+function reloadActive(): void {
+  if (active.value === 'command') cmdRef.value?.reload()
+  else if (active.value === 'feature') featRef.value?.reload()
+  else bizRef.value?.reload()
 }
-
-async function reload(): Promise<void> {
-  await loadFilters()
-  await loadView(active.value)
-}
-
-async function doExport(format: 'csv' | 'xlsx' | 'md'): Promise<void> {
-  exporting.value = true
-  try {
-    await downloadStatsExport(active.value, format, filters.value)
-    ElMessage.success(`已导出（${VIEW_LABEL[active.value]} · ${format.toUpperCase()}）`)
-  } catch (e: unknown) {
-    ElMessage.error(e instanceof Error ? e.message : String(e))
-  } finally {
-    exporting.value = false
-  }
-}
-
-const VIEW_LABEL: Record<StatsViewKey, string> = {
-  command: '命令图谱', feature: '特性图谱', business: '业务图谱',
-}
-
-// 筛选变化 → 重载当前视图（切 Tab 时 watch(active) 拉取该视图）
-watch(filters, () => void loadView(active.value), { deep: true })
-watch(active, (v) => void loadView(v))
 
 // 注册全局刷新钩子（上传完成后 UploadView 会调 window.__refreshStats）；
 // AppHeader / App.vue 也各自注册同名钩子——串联调用不覆盖。
@@ -165,14 +101,17 @@ function setupGlobalRefreshHook(): void {
   const prev = w.__refreshStats
   w.__refreshStats = async () => {
     await prev?.()
-    reload()
+    await loadFilters()
+    reloadActive()
   }
-  w.__refreshStatsView = reload
+  w.__refreshStatsView = async () => {
+    await loadFilters()
+    reloadActive()
+  }
 }
 
 onMounted(() => {
   void loadFilters()
-  void loadView('command')
   setupGlobalRefreshHook()
 })
 </script>
@@ -214,34 +153,6 @@ onMounted(() => {
   font-size: 13px;
   max-width: 680px;
   line-height: 1.55;
-}
-
-.head-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-shrink: 0;
-}
-
-.exp-btn {
-  border: 1px solid var(--border);
-  background: var(--bg-elev);
-  color: var(--text-muted);
-  font-size: 12px;
-  padding: 5px 12px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
-}
-
-.exp-btn:hover:not(:disabled) {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-
-.exp-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 .warn-banner {

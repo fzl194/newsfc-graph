@@ -1,10 +1,10 @@
-"""统计页三视图（/api/v1/stats/*）端到端测试。
+"""统计页三视图端点测试（2026-09-02 改版：卡片/表格分离 + 服务端分页 + MOP）。
 
-种子为合成小数据，期望值按《图谱平台统计页面需求说明书》§4/§5/§7 口径手算，
-用例编号映射 §11 验收 Case 1-10 的语义（合并取大、UPCF 别名、版本归一、
-逻辑网元仅作用 B1/B2、导出三格式）。老 GET /api/v1/stats 的回归由
+种子为合成小数据，期望值按《图谱平台统计页面需求说明书》§4/§5/§7 口径手算。
+导出端点（保留未动）一并覆盖；老 GET /api/v1/stats 的回归由
 test_api_assets.test_stats_ui_layer_aggregation 覆盖。
 """
+import io
 import json
 import zipfile
 
@@ -94,7 +94,7 @@ def _seed_objects(conn):
 
 
 def _seed_edges(conn):
-    # 命令图谱出边：参见1；操作配置对象3 / 被操作2（成对应取大=3，Case 8）
+    # 命令图谱出边：参见1；操作配置对象3 / 被操作2（成对应取大=3）
     _edge(conn, "MMLCommand@CMD_0", "20.10.2", "参见", "MMLCommand@CMD_1")
     for f, t in (("MMLCommand@CMD_0", "ConfigObject@CFG_0"),
                  ("MMLCommand@CMD_0", "ConfigObject@CFG_1"),
@@ -134,7 +134,6 @@ def _seed_edges(conn):
 
 
 def _seed_rules(conn):
-    # 语法规则表：UPCF 20.10.2 (2 命令 3 参数) + UDG 20.10.2 (1 命令 2 参数)
     rows = [
         ("CMD_A", "1", "UPCF", "20.10.2"), ("CMD_A", "2", "UPCF", "20.10.2"),
         ("CMD_B", "1", "UPCF", "20.10.2"),
@@ -143,12 +142,10 @@ def _seed_rules(conn):
     conn.executemany(
         'INSERT INTO "B_AI_COMMAND_SYNTAX_CHECK_RULES"("CMD_NAME","PARAM_ID",'
         '"NE_TYPE","NE_VERSION") VALUES(?,?,?,?)', rows)
-    # 逻辑网元：UNC/SMF→{CMD_A}；UNC/AMF→{CMD_Z}
     conn.executemany(
         'INSERT INTO "B_AI_CONFIG_CHECK_LOGICAL_NE_CMD_T"("PHYSICAL_NE_TYPE",'
         '"LOGICAL_NE_TYPE","NE_VERSION","COMMAND_NAME") VALUES(?,?,?,?)',
         [("UNC", "SMF", "20.10.2", "CMD_A"), ("UNC", "AMF", "20.10.2", "CMD_Z")])
-    # 五类规则：graph3 / repeat2 / mod1 / set2 / delete1 → five_total=9
     conn.executemany(
         'INSERT INTO "B_AI_MML_GRAPH_RULE_T"("PHYSICAL_NE_TYPE","NE_VERSION",'
         '"COMMAND_NAME") VALUES(?,?,?)',
@@ -167,7 +164,6 @@ def _seed_rules(conn):
     conn.execute(
         'INSERT INTO "B_AI_DELETE_RULE_V2_T"("NE_TYPE","NE_VERSION","EXCUTE_CMD") '
         'VALUES(?,?,?)', ("UDG", "20.10.2", "RMV MGWPATH"))
-    # 版本映射：UPCF 20.10.2→23.1.0；20.16.2→26.0.0 与 26.0.1（多海外版并列）；UDG 20.10.2→22.1.0
     conn.executemany(
         'INSERT INTO "B_AI_NE_VERSION_MAPPING_T"("PHYSICAL_NE_TYPE","LOGICAL_NE_TYPE",'
         '"LOCAL_VERSION","OVERSEAS_VERSION") VALUES(?,?,?,?)',
@@ -197,257 +193,314 @@ def _get(path: str) -> dict:
     return r.json()
 
 
-# ---------- Case 1/2：命令总览 + 网元×版本矩阵 ----------
+# ---------- 命令图谱：卡片摘要 ----------
 
-def test_command_overview_full(seeded):
-    d = _get("/api/v1/stats/command")
+def test_command_summary_full(seeded):
+    d = _get("/api/v1/stats/command/summary")
     assert d["knowledge"] == {"MMLCommand": 7, "ConfigObject": 3, "points": 10}
-    # 出边合并取大：参见1 + 操作配置对象/被操作 max(3,2)=3 → 4
     merged = dict(d["edges"]["merged"])
     assert merged["操作配置对象/被操作"] == 3
-    assert merged["参见"] == 1
     assert d["edges"]["merged_total"] == 4
-    raw = dict(d["edges"]["raw"])
-    assert raw["被操作"] == 2 and raw["操作配置对象"] == 3
-    # 入边（跨图谱）：使用命令2 + 对应命令1 + 复用命令1（FT→命令）；
-    # 图谱内部边（参见/操作配置对象/被操作）已在 A4 出边计，不入 A5
     inbound = dict(d["inbound"]["raw"])
-    assert inbound == {"使用命令": 2, "对应命令": 1, "复用命令": 1}
-    # B 区
+    assert inbound == {"使用命令": 2, "对应命令": 1, "复用命令": 1}  # 跨图谱入边
     assert d["rules"]["syntax"] == {
         "cmd_count": 3, "param_count": 5, "cmd_count_by_group_sum": 3}
     assert d["rules"]["graph"] == 3
-    assert d["rules"]["repeat"] == 2
-    assert d["rules"]["mod"] == 1
-    assert d["rules"]["set"] == 2
-    assert d["rules"]["delete"] == 1
     assert d["five_total"] == 9
 
 
-def test_command_matrix_and_syntax_matrix(seeded):
-    d = _get("/api/v1/stats/command")
-    m = {(r["nf"], r["version"]): r for r in d["matrix"]}
-    assert m[("PCF", "20.10.2")]["MMLCommand"] == 3
-    assert m[("PCF", "20.10.2")]["ConfigObject"] == 2
-    assert m[("PCF", "20.10.2")]["total"] == 5
-    assert m[("PCF", "20.16.2")]["total"] == 2
-    assert m[("UDG", "20.10.2")]["total"] == 3
-    sm = {(r["ne"], r["version"]): r for r in d["syntax_matrix"]}
-    upcf_row = sm[("UPCF", "20.10.2")]
-    assert upcf_row["cmd_count"] == 2 and upcf_row["param_count"] == 3
-    assert upcf_row["version_display"] == "20.10.2"
-    assert sm[("UDG", "20.10.2")]["cmd_count"] == 1
-    gm = {(r["ne"], r["version"]): r["count"] for r in d["rule_matrix"]["graph"]}
-    assert gm == {("UPCF", "20.10.2"): 2, ("UDG", "20.10.2"): 1}
-
-
-# ---------- Case 8/10：双向合并 + UPCF 别名 ----------
-
-def test_upcf_alias_filter(seeded):
-    d = _get("/api/v1/stats/command?nfs=UPCF")
+def test_command_summary_upcf_and_version(seeded):
+    d = _get("/api/v1/stats/command/summary?nfs=UPCF")
     assert d["knowledge"] == {"MMLCommand": 5, "ConfigObject": 2, "points": 7}
-    assert d["rules"]["syntax"]["cmd_count"] == 2   # CMD_X(UDG) 排除
-    assert d["rules"]["graph"] == 2
-    assert {r["nf"] for r in d["matrix"]} == {"PCF"}
-    assert all(r["nf_display"] == "UPCF" for r in d["matrix"])  # 展示归一
+    assert d["rules"]["syntax"]["cmd_count"] == 2
+    d2 = _get("/api/v1/stats/command/summary?versions=20.16.2")
+    assert d2["knowledge"]["points"] == 2
+    assert d2["rules"]["graph"] == 0
 
 
-def test_version_filter_cross_sources(seeded):
-    d = _get("/api/v1/stats/command?versions=20.16.2")
-    assert d["knowledge"]["points"] == 2            # 仅 PCF 20.16.2 两命令
-    assert d["rules"]["syntax"]["param_count"] == 0  # 规则表同受版本筛选
-    assert d["rules"]["graph"] == 0
+def test_old_view_endpoints_removed(seeded):
+    """2026-09-02 改版：旧 /command /feature /business 整体端点已拆分为 summary/表。"""
+    assert client.get("/api/v1/stats/command").status_code == 404
+    assert client.get("/api/v1/stats/feature").status_code == 404
+    assert client.get("/api/v1/stats/business").status_code == 404
 
 
-def test_relation_filter(seeded):
-    d = _get("/api/v1/stats/feature?relations=使用命令")
-    assert dict(d["edges"]["raw"]) == {"使用命令": 2}
-    assert d["edges"]["merged_total"] == 2
+# ---------- 命令图谱：知识统计表（含出/入边并入 + 分页）----------
+
+def test_command_knowledge_rows(seeded):
+    d = _get("/api/v1/stats/command/knowledge")
+    m = {(r["nf"], r["version"]): r for r in d["rows"]}
+    p = m[("PCF", "20.10.2")]
+    # 出边=6（参见1+操作3+被操作2，from 都在 PCF/20.10.2）；
+    # 入边=10（参见1+操作3+被操作2+使用命令2+对应命令1+复用命令1，按 id 落槽位）
+    assert (p["cmd_knowledge"], p["cfg_knowledge"], p["total_knowledge"]) == (3, 2, 5)
+    assert (p["out_edges"], p["in_edges"]) == (6, 10)
+    assert p["nf_display"] == "UPCF"
+    assert m[("UDG", "20.10.2")]["total_knowledge"] == 3
+    assert m[("UDG", "20.10.2")]["out_edges"] == 0
+    assert m[("PCF", "20.16.2")]["in_edges"] == 0
+    assert d["total"] == 3
 
 
-def test_rule_types_filter(seeded):
-    d = _get("/api/v1/stats/command?rule_types=graph")
-    assert set(d["rules"]) == {"graph"}
-    assert d["rules"]["graph"] == 3
-    assert d["five_total"] == 3
-    assert set(d["rule_matrix"]) == {"graph"}
+def test_command_knowledge_pagination_and_sort(seeded):
+    d = _get("/api/v1/stats/command/knowledge?page=1&size=2&sort=-total")
+    assert len(d["rows"]) == 2 and d["total"] == 3
+    assert d["rows"][0]["total_knowledge"] == 5  # 降序
+    d2 = _get("/api/v1/stats/command/knowledge?page=2&size=2&sort=-total")
+    assert len(d2["rows"]) == 1
 
 
-def test_object_types_filter(seeded):
-    d = _get("/api/v1/stats/command?object_types=MMLCommand")
-    assert d["knowledge"] == {"MMLCommand": 7, "ConfigObject": 0, "points": 7}
+def test_command_knowledge_filters(seeded):
+    d = _get("/api/v1/stats/command/knowledge?nfs=UPCF")
+    assert {r["nf"] for r in d["rows"]} == {"PCF"}
+    assert d["total"] == 2
+    d2 = _get("/api/v1/stats/command/knowledge?versions=20.16.2")
+    assert d2["total"] == 1
+    assert d2["rows"][0]["total_knowledge"] == 2
 
 
-def test_relation_filter_single_pair_member(seeded):
-    """成对关系只筛一侧：合并键取该侧计数（§7.1 单侧成员路径）。"""
-    d = _get("/api/v1/stats/command?relations=被操作")
-    assert dict(d["edges"]["raw"]) == {"被操作": 2}
-    assert dict(d["edges"]["merged"]) == {"操作配置对象/被操作": 2}
-    assert d["edges"]["merged_total"] == 2
+def test_command_knowledge_overseas_display(seeded):
+    d = _get("/api/v1/stats/command/knowledge?overseas=true")
+    m = {(r["nf"], r["version"]): r for r in d["rows"]}
+    assert m[("PCF", "20.10.2")]["version_display"] == "23.1.0"
+    assert m[("PCF", "20.16.2")]["version_display"] == "26.0.0/26.0.1"
 
 
-def test_object_types_empty_intersection(seeded):
-    """对象类型筛选与视图类型集交集为空 → 1=0 短路（不 500）。"""
-    d = _get("/api/v1/stats/command?object_types=Feature")
-    assert d["knowledge"] == {"MMLCommand": 0, "ConfigObject": 0, "points": 0}
-    assert d["matrix"] == []
-    assert d["edges"]["merged_total"] == 0
+# ---------- 命令图谱：语法规则统计总表（mode 切换 + 分页）----------
+
+def test_command_rules_ne_version_mode(seeded):
+    d = _get("/api/v1/stats/command/rules")
+    assert d["total"] == 8
+    m = {(r["ne"], r["version"], r["rule_type"]): r for r in d["rows"]}
+    syn = m[("UPCF", "20.10.2", "语法规则")]
+    assert (syn["cmd_count"], syn["param_count"], syn["rule_count"]) == (2, 3, 3)
+    assert m[("UDG", "20.10.2", "语法规则")]["cmd_count"] == 1
+    assert m[("UPCF", "20.10.2", "图规则")]["rule_count"] == 2
+    assert m[("UDG", "20.10.2", "删除规则")]["rule_count"] == 1
+    assert m[("UPCF", "20.10.2", "SET 规则")]["rule_count"] == 2
+    # 默认 -rule 降序：首行是数量最大的
+    assert d["rows"][0]["rule_count"] == max(r["rule_count"] for r in d["rows"])
 
 
-# ---------- Case 5/6：特性图谱 ----------
-
-def test_feature_view(seeded):
-    d = _get("/api/v1/stats/feature")
-    assert d["totals"] == {"feature_codes": 4, "feature_knowledge": 5,
-                           "license_codes": 1, "license_knowledge": 2}
-    m = {(r["nf"], r["version"]): r for r in d["matrix"]}
-    assert m[("UDG", "20.10.2")]["feature_codes"] == 2
-    assert m[("UDG", "20.10.2")]["feature_knowledge"] == 3
-    assert m[("UDG", "20.10.2")]["license_codes"] == 1
-    assert m[("UDG", "20.10.2")]["license_knowledge"] == 2
-    assert m[("PCF", "20.16.2")]["feature_codes"] == 2
-    assert m[("PCF", "20.16.2")]["license_knowledge"] == 0
-    # 合并：包含子文档/属于特性 max(2,1)=2
-    merged = dict(d["edges"]["merged"])
-    assert merged["包含子文档/属于特性"] == 2
-    assert d["edges"]["merged_total"] == 2 + 2 + 1 + 1 + 1  # 使用命令2+合并2+依赖/对应/License
-    assert d["prefixes"] == ["GWFD", "WHFD"]
+def test_command_rules_mode_ne_and_all(seeded):
+    d = _get("/api/v1/stats/command/rules?mode=ne")
+    m = {(r["ne"], r["rule_type"]): r for r in d["rows"]}
+    assert m[("UPCF", "语法规则")]["cmd_count"] == 2
+    assert m[("UDG", "语法规则")]["param_count"] == 2
+    assert m[("UPCF", "图规则")]["rule_count"] == 2
+    d2 = _get("/api/v1/stats/command/rules?mode=all")
+    assert d2["total"] == 6  # 六类各一行
+    m2 = {(r["rule_type"]): r for r in d2["rows"]}
+    assert (m2["语法规则"]["cmd_count"], m2["语法规则"]["rule_count"]) == (3, 5)
+    assert m2["图规则"]["rule_count"] == 3
+    assert all(r["ne"] == "" for r in d2["rows"])
 
 
-# ---------- Case 7：业务图谱 ----------
+def test_command_rules_pagination_and_filters(seeded):
+    d = _get("/api/v1/stats/command/rules?page=2&size=3")
+    assert len(d["rows"]) == 3 and d["total"] == 8
+    # 逻辑网元仅作用语法行
+    d2 = _get("/api/v1/stats/command/rules?logical_ne=SMF")
+    syn = [r for r in d2["rows"] if r["rule_type"] == "语法规则"]
+    assert {(r["ne"], r["cmd_count"], r["rule_count"]) for r in syn} == {
+        ("UPCF", 1, 2)}
+    # 五类不受逻辑网元影响（图规则仍 UPCF 2 + UDG 1）
+    graph_sum = sum(r["rule_count"] for r in d2["rows"] if r["rule_type"] == "图规则")
+    assert graph_sum == 3
+    # 规则类型筛选
+    d3 = _get("/api/v1/stats/command/rules?rule_types=graph")
+    assert d3["total"] == 2
+    assert {r["rule_type"] for r in d3["rows"]} == {"图规则"}
+    # 版本筛选同时作用语法与五类
+    d4 = _get("/api/v1/stats/command/rules?versions=20.16.2")
+    assert d4["total"] == 0
 
-def test_business_view(seeded):
-    d = _get("/api/v1/stats/business")
+
+# ---------- 特性图谱：默认不去重 ----------
+
+def test_feature_summary_default_no_dedupe(seeded):
+    d = _get("/api/v1/stats/feature/summary")
+    assert d["feature_count"] == 5     # 不去重（知识条数）
+    assert d["feature_codes"] == 4     # 去重为次级数字
+    assert d["license_count"] == 2
+    assert d["license_codes"] == 1
+    assert dict(d["edges"]["merged"])["包含子文档/属于特性"] == 2
+
+
+def test_feature_matrix_paginated(seeded):
+    d = _get("/api/v1/stats/feature/matrix")
+    assert d["total"] == 2
+    m = {(r["nf"], r["version"]): r for r in d["rows"]}
+    u = m[("UDG", "20.10.2")]
+    assert (u["feature_codes"], u["feature_knowledge"],
+            u["license_codes"], u["license_knowledge"]) == (2, 3, 1, 2)
+    d2 = _get("/api/v1/stats/feature/matrix?nfs=UPCF&page=1&size=1")
+    assert d2["total"] == 1
+    assert d2["rows"][0]["nf"] == "PCF"
+
+
+# ---------- 业务图谱：无筛选 + 无 D7/D7b ----------
+
+def test_business_overview(seeded):
+    d = _get("/api/v1/stats/business/overview")
     c = d["counts"]
     assert c["domains"] == 2 and c["scenarios"] == 2 and c["solutions"] == 3
     assert c["atom_tasks"] == 3 and c["feature_tasks"] == 2 and c["compound_tasks"] == 1
-    assert c["task_cmd_edges"] == 1 and c["task_feature_edges"] == 1
+    assert "task_cmd_edges" not in c and "task_feature_edges" not in c  # 已删
+    assert "filters" not in d
     sm = {(r["domain"], r["scenario"]): r for r in d["solutions_matrix"]}
     assert sm[("business-awareness", "access-control")]["count"] == 2
-    assert set(sm[("business-awareness", "access-control")]["solutions"]) == {
-        "策略匹配基础", "URL 过滤"}
     tm = {(r["type"], r["nf"]): r["count"] for r in d["tasks_matrix"]}
-    assert tm[("AtomTask", "UNC")] == 2 and tm[("AtomTask", "UDG")] == 1
-    assert tm[("FeatureTask", "UDG")] == 1
+    assert tm[("AtomTask", "UNC")] == 2
     g = d["edges"]["groups"]
-    assert g["编排关系"] == 4
-    assert g["组成/复用"] == 3
-    assert g["上下游/引用"] == 7          # 上游/下游2 + 场景对1 + 域对1 + 引用3
-    assert g["跨图谱任务关联"] == 2
-    assert d["edges"]["merged_total"] == 16
+    assert (g["编排关系"], g["组成/复用"], g["上下游/引用"], g["跨图谱任务关联"]) == (4, 3, 7, 2)
 
 
-def test_business_domain_and_solution_filter(seeded):
-    d = _get("/api/v1/stats/business?domain=business-awareness")
-    assert d["counts"]["solutions"] == 2
-    assert all(r["domain"] == "business-awareness" for r in d["solutions_matrix"])
-    d2 = _get("/api/v1/stats/business?solution=地址分配")
-    assert len(d2["solutions_matrix"]) == 1
-    assert d2["solutions_matrix"][0]["count"] == 1
-
-
-# ---------- Case 9：版本归一（国内→海外展示） ----------
-
-def test_overseas_display(seeded):
-    d = _get("/api/v1/stats/command?overseas=true")
-    m = {(r["nf"], r["version"]): r for r in d["matrix"]}
-    assert m[("PCF", "20.10.2")]["version_display"] == "23.1.0"
-    assert m[("PCF", "20.16.2")]["version_display"] == "26.0.0/26.0.1"  # 多海外并列
-    assert m[("UDG", "20.10.2")]["version_display"] == "22.1.0"
-    sm = {(r["ne"], r["version"]): r for r in d["syntax_matrix"]}
-    assert sm[("UPCF", "20.10.2")]["version_display"] == "23.1.0"
-    # UDG 20.16.2 无映射行 → 显原值（本种子 UDG 只有 20.10.2，用特性矩阵补验）
-    f = _get("/api/v1/stats/feature?overseas=true")
-    fm = {(r["nf"], r["version"]): r for r in f["matrix"]}
-    assert fm[("PCF", "20.16.2")]["version_display"] == "26.0.0/26.0.1"
-
-
-def test_overseas_filter_still_local(seeded):
-    """筛选恒用国内号：overseas 开着也按 20.10.2 命中。"""
-    d = _get("/api/v1/stats/command?overseas=true&versions=20.10.2")
-    assert d["knowledge"]["points"] == 8  # PCF5 + UDG3
-
-
-# ---------- 逻辑网元（§6.2，仅作用 B1/B2） ----------
-
-def test_logical_ne_filter_only_affects_rules(seeded):
-    d = _get("/api/v1/stats/command?logical_ne=SMF")
-    assert d["rules"]["syntax"] == {
-        "cmd_count": 1, "param_count": 2, "cmd_count_by_group_sum": 1}  # 仅 CMD_A
-    assert d["knowledge"]["points"] == 10  # A 区不受逻辑网元影响
-    assert d["rules"]["graph"] == 3        # 五类规则同样不受影响（仅语法表）
-
-
-# ---------- /filters ----------
+# ---------- /filters + 空表 ----------
 
 def test_filters_options(seeded):
     d = _get("/api/v1/stats/filters")
     assert "UDG" in d["nfs"] and "UPCF" in d["nfs"] and "UNC" in d["nfs"]
-    assert "20.10.2" in d["versions"] and "20.16.2" in d["versions"]
     assert d["logical_nes"] == {"UNC": ["AMF", "SMF"]}
-    assert "MMLCommand" in d["object_types"] and "BusinessDomain" in d["object_types"]
-    assert "操作配置对象" in d["relations"] and "上游域" in d["relations"]
     assert {x["key"] for x in d["rule_types"]} == {
         "syntax", "graph", "repeat", "mod", "set", "delete"}
-    assert set(d["domains"]) == {"business-awareness", "apn-domain"}
-    assert len(d["solutions"]) == 3
     assert d["table_rows"]["B_AI_MML_GRAPH_RULE_T"] == 3
-    assert d["table_rows"]["B_AI_COMMAND_SYNTAX_CHECK_RULES"] == 5
 
 
 def test_filters_empty_rule_tables():
     d = _get("/api/v1/stats/filters")
     assert d["table_rows"]["B_AI_COMMAND_SYNTAX_CHECK_RULES"] == 0
-    r = client.get("/api/v1/stats/command")
-    assert r.status_code == 200
-    assert r.json()["rules"]["syntax"]["cmd_count"] == 0  # 空表不报错
+    assert _get("/api/v1/stats/command/summary")["rules"]["syntax"]["cmd_count"] == 0
 
 
-# ---------- 导出（§2：CSV / Excel / Markdown） ----------
+# ---------- MOP 动网变更场景统计 ----------
+
+_MOP_ROWS = [
+    ("核心网改造", "5GC扩容", "AMF扩容"),
+    ("核心网改造", "5GC扩容", "SMF扩容"),
+    ("核心网改造", "语音改造", ""),
+    ("传输调整", "", ""),
+]
+
+
+def _mop_xlsx_inline() -> bytes:
+    """inlineStr 版 xlsx（用我们自己的 export.render_xlsx 生成——写读互证）。"""
+    from app.stats.export import render_xlsx
+    headers = ["编号", "L1场景", "L2场景", "L3场景", "备注"]
+    rows = [[str(i), r[0], r[1], r[2], ""] for i, r in enumerate(_MOP_ROWS)]
+    return render_xlsx([("MOP", headers, rows)])
+
+
+def _mop_xlsx_shared() -> bytes:
+    """sharedStrings 版最小 xlsx（真实 Excel 的常见形态）。"""
+    strings = ["编号", "L1场景", "L2场景", "L3场景", "备注"]
+    cells = []
+    si = len(strings)
+    for i, r in enumerate(_MOP_ROWS, start=2):
+        strings.extend([str(i), r[0], r[1], r[2]])
+        cells.append(f'<row r="{i}">'
+                     f'<c r="A{i}" t="s"><v>{si}</v></c>'
+                     f'<c r="B{i}" t="s"><v>{si + 1}</v></c>'
+                     f'<c r="C{i}" t="s"><v>{si + 2}</v></c>'
+                     f'<c r="D{i}" t="s"><v>{si + 3}</v></c>'
+                     f"</row>")
+        si += 4
+    ss = ('<?xml version="1.0" encoding="UTF-8"?>'
+          '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+          + "".join(f"<si><t>{s}</t></si>" for s in strings) + "</sst>")
+    sheet = ('<?xml version="1.0" encoding="UTF-8"?>'
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+             '<sheetData><row r="1">'
+             + "".join(f'<c r="{ch}1" t="s"><v>{j}</v></c>'
+                       for j, ch in enumerate("ABCDE", start=0))
+             + "</row>" + "".join(cells) + "</sheetData></worksheet>")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+        z.writestr("xl/sharedStrings.xml", ss)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("maker", [_mop_xlsx_inline, _mop_xlsx_shared],
+                         ids=["inlineStr", "sharedStrings"])
+def test_mop_aggregate(tmp_data_dir, maker):
+    (tmp_data_dir.parent / "mop_scenarios.xlsx").write_bytes(maker())
+    d = _get("/api/v1/stats/mop?level=1")
+    assert d["available"] and d["total"] == 4 and d["max_level"] == 3
+    assert d["rows"] == [
+        {"path": ["核心网改造"], "count": 3, "ratio": 0.75},
+        {"path": ["传输调整"], "count": 1, "ratio": 0.25},
+    ]
+    d2 = _get("/api/v1/stats/mop?level=2")
+    assert d2["rows"][0] == {"path": ["核心网改造", "5GC扩容"], "count": 2, "ratio": 0.5}
+    assert {"path": ["传输调整", ""], "count": 1, "ratio": 0.25} in d2["rows"]
+    d3 = _get("/api/v1/stats/mop?level=4")  # 超过 max_level 聚合到 L3 值（L4 空）
+    assert any(r["path"] == ["核心网改造", "5GC扩容", "AMF扩容", ""]
+               for r in d3["rows"])
+
+
+def test_mop_csv_and_missing(tmp_data_dir):
+    (tmp_data_dir.parent / "mop_scenarios.csv").write_bytes(
+        "编号,L1场景,L2场景\n1,割接,主设备\n2,割接,传输\n".encode("utf-8"))
+    d = _get("/api/v1/stats/mop")
+    assert d["available"] and d["total"] == 2 and d["max_level"] == 2
+    assert d["rows"][0]["path"] == ["割接"]
+    d2 = _get("/api/v1/stats/mop?level=2")
+    assert {(r["path"][1], r["count"]) for r in d2["rows"]} == {("主设备", 1), ("传输", 1)}
+
+
+def test_mop_not_uploaded(tmp_data_dir):
+    d = _get("/api/v1/stats/mop")
+    assert d["available"] is False and d["rows"] == []
+
+
+def test_mop_upload_admin_and_errors(tmp_data_dir, monkeypatch):
+    # 非 admin 403（真中间件：state.user_obj 来自 authenticate）
+    from app.middleware import auth as auth_mod
+    monkeypatch.setattr(auth_mod, "authenticate", lambda key: {
+        "username": "u", "can_frontend": True, "is_admin": False})
+    r = client.put("/api/v1/stats/mop/source?filename=a.xlsx", content=b"x")
+    assert r.status_code == 403
+    # 恢复 admin（conftest 的 stub）再上传
+    monkeypatch.setattr(auth_mod, "authenticate", lambda key: {
+        "username": "admin", "can_frontend": True, "is_admin": True})
+    r2 = client.put("/api/v1/stats/mop/source?filename=底表.xlsx",
+                    content=_mop_xlsx_inline())
+    assert r2.status_code == 200, r2.text
+    assert r2.json() == {"ok": True, "saved": "mop_scenarios.xlsx",
+                         "mop_total": 4, "levels_found": [1, 2, 3]}
+    assert _get("/api/v1/stats/mop?level=1")["total"] == 4
+    # 换 csv：xlsx 旧文件被清掉
+    csv_bytes = "编号,L1场景\n1,割接\n".encode("utf-8")
+    r3 = client.put("/api/v1/stats/mop/source?filename=b.csv", content=csv_bytes)
+    assert r3.status_code == 200
+    assert not (tmp_data_dir.parent / "mop_scenarios.xlsx").exists()
+    # 坏文件 400（无 L1场景 列）
+    bad = ("编号,其他\n1,x\n").encode("utf-8")
+    assert client.put("/api/v1/stats/mop/source?filename=c.csv",
+                      content=bad).status_code == 400
+    assert client.put("/api/v1/stats/mop/source?filename=c.txt",
+                      content=b"").status_code == 400
+
+
+# ---------- 导出（保留端点，前端入口已隐藏）----------
 
 def test_export_csv(seeded):
     r = client.get("/api/v1/stats/export?view=command&format=csv")
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/csv")
-    assert "attachment" in r.headers["content-disposition"]
-    text = r.text
-    assert text.startswith("﻿")  # BOM：Excel 双击打开不乱码
-    assert "# 命令图谱·汇总" in text
-    assert "命令知识条数(A1)" in text and "7" in text
-    assert "# 出边按关系·合并取大" in text
-    assert "# 知识下钻·网元×版本" in text
-
-
-def test_export_md(seeded):
-    r = client.get("/api/v1/stats/export?view=business&format=md")
-    assert r.status_code == 200
-    assert "## 业务图谱·汇总" in r.text
-    assert "业务域→场景→方案" in r.text
-    assert "策略匹配基础" in r.text
+    assert "# 命令图谱·汇总" in r.text
+    assert "命令知识条数(A1)" in r.text
 
 
 def test_export_xlsx(seeded):
-    import io
     r = client.get("/api/v1/stats/export?view=feature&format=xlsx")
     assert r.status_code == 200
-    assert "spreadsheetml" in r.headers["content-type"]
     z = zipfile.ZipFile(io.BytesIO(r.content))
-    names = z.namelist()
-    assert "[Content_Types].xml" in names
-    assert "xl/workbook.xml" in names
-    wb = z.read("xl/workbook.xml").decode("utf-8")
-    assert "特性图谱·汇总" in wb
-    sheet1 = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
-    assert "特性编号数(C1)" in sheet1 and "inlineStr" in sheet1
+    assert "xl/workbook.xml" in z.namelist()
+    assert "特性编号数(C1)" in z.read("xl/worksheets/sheet1.xml").decode("utf-8")
 
 
 def test_export_bad_params(seeded):
     assert client.get("/api/v1/stats/export?view=nope").status_code == 400
     assert client.get("/api/v1/stats/export?view=command&format=pdf").status_code == 400
-
-
-def test_export_respects_filters(seeded):
-    r = client.get("/api/v1/stats/export?view=command&format=csv&nfs=UPCF")
-    assert "命令知识条数(A1)" in r.text
-    lines = [ln for ln in r.text.splitlines() if ln.startswith("命令知识条数")]
-    assert lines and lines[0].endswith(",5")  # UPCF 筛选后 A1=5

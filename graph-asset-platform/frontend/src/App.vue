@@ -10,37 +10,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import AppHeader from './components/AppHeader.vue'
-import { stats, type Stats } from './api'
 
 const route = useRoute()
 const isLogin = computed(() => route.name === 'login')
 
-// 全站 stats（AppHeader chip 用）。挂载时拉一次，上传后由 UploadView 触发刷新。
-const globalStats = ref<Stats | null>(null)
-const statsLoading = ref(false)
-
-async function refreshStats(): Promise<void> {
-  statsLoading.value = true
-  try {
-    globalStats.value = await stats()
-  } catch {
-    // 静默：header chip 容错
-  } finally {
-    statsLoading.value = false
-  }
-}
-
-// 暴露给全局以便子组件刷新（上传后调用）
-;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats =
-  refreshStats
-
-// 登录页不拉 stats（未登录会 401）、不显示顶栏
-onMounted(() => {
-  if (!isLogin.value) refreshStats()
-})
+// 右上角对象/边计数 chips 已按用户要求移除（2026-09-02）——全站 stats 拉取
+// 随之取消；window.__refreshStats 现由 StatsView 链式注册（上传后刷新统计页）。
 </script>
 
 <style scoped>

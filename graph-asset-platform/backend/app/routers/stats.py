@@ -1,26 +1,37 @@
-"""stats router：三视图统计（命令/特性/业务图谱，统计页重构 2026-09-01）。
+"""stats router：三视图统计（命令/特性/业务图谱）+ MOP 动网变更场景统计。
 
 挂在 ``/api/v1/stats`` 下（auth 中间件 Others→frontend 权限）。与 assets.py 的
 旧 ``GET /stats`` 并存——旧端点供 AppHeader/LayerNav/UploadView 复用，勿删。
 导出端点在本前缀下（``/api/v1/stats/export``），避开 ``/api/v1/export`` 的
 upload 权限分支。
+
+2026-09-02 改版（用户反馈）：
+- 卡片摘要与表格**分离**：summary 端点受视图级筛选；表端点各自独立筛选 +
+  服务端分页/排序（/command/knowledge、/command/rules、/feature/matrix）。
+- 视图级筛选收窄：命令=物理网元+版本+逻辑网元；特性=物理网元+版本；业务=无。
+- ``GET /mop``：MOP 动网变更场景统计（Excel 底表，不走库）；``PUT /mop/source``
+  （仅 admin，raw body 传文件字节——免 python-multipart 依赖）。
+- 前端导出入口已隐藏（用户决策），``/export`` 后端保留待后续启用。
 """
 import time
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from ..stats import export as export_mod
+from ..stats import mop as mop_mod
 from ..stats.core import (
-    business_view, command_view, feature_view, filters_options,
-    get_conn, parse_filters, view_payload,
+    business_overview, command_knowledge, command_rules, command_summary,
+    feature_matrix, feature_summary, filters_options, get_conn, parse_filters,
+    view_payload,
 )
 
 router = APIRouter()
 
 
-def _f(nfs: str, versions: str, logical_ne: str, object_types: str,
-       relations: str, rule_types: str, domain: str, scenario: str,
-       solution: str, overseas: bool):
+def _f(nfs: str = "", versions: str = "", logical_ne: str = "",
+       object_types: str = "", relations: str = "", rule_types: str = "",
+       domain: str = "", scenario: str = "", solution: str = "",
+       overseas: bool = False):
     return parse_filters(
         nfs=nfs, versions=versions, logical_ne=logical_ne,
         object_types=object_types, relations=relations, rule_types=rule_types,
@@ -33,35 +44,79 @@ def get_filters():
     return filters_options(get_conn())
 
 
-@router.get("/command")
-def stats_command(nfs: str = "", versions: str = "", logical_ne: str = "",
-                  object_types: str = "", relations: str = "", rule_types: str = "",
-                  domain: str = "", scenario: str = "", solution: str = "",
-                  overseas: bool = False):
-    return command_view(get_conn(), _f(nfs, versions, logical_ne, object_types,
-                                       relations, rule_types, domain, scenario,
-                                       solution, overseas))
+# ---------- 命令图谱 ----------
+
+@router.get("/command/summary")
+def stats_command_summary(nfs: str = "", versions: str = "", logical_ne: str = "",
+                          overseas: bool = False):
+    return command_summary(get_conn(), _f(nfs, versions, logical_ne,
+                                          overseas=overseas))
 
 
-@router.get("/feature")
-def stats_feature(nfs: str = "", versions: str = "", logical_ne: str = "",
-                  object_types: str = "", relations: str = "", rule_types: str = "",
-                  domain: str = "", scenario: str = "", solution: str = "",
-                  overseas: bool = False):
-    return feature_view(get_conn(), _f(nfs, versions, logical_ne, object_types,
-                                       relations, rule_types, domain, scenario,
-                                       solution, overseas))
+@router.get("/command/knowledge")
+def stats_command_knowledge(nfs: str = "", versions: str = "",
+                            overseas: bool = False,
+                            page: int = 1, size: int = 20, sort: str = "-total"):
+    return command_knowledge(get_conn(), _f(nfs, versions, overseas=overseas),
+                             page, size, sort)
 
 
-@router.get("/business")
-def stats_business(nfs: str = "", versions: str = "", logical_ne: str = "",
-                   object_types: str = "", relations: str = "", rule_types: str = "",
-                   domain: str = "", scenario: str = "", solution: str = "",
-                   overseas: bool = False):
-    return business_view(get_conn(), _f(nfs, versions, logical_ne, object_types,
-                                        relations, rule_types, domain, scenario,
-                                        solution, overseas))
+@router.get("/command/rules")
+def stats_command_rules(nfs: str = "", versions: str = "", logical_ne: str = "",
+                        rule_types: str = "", mode: str = "ne_version",
+                        overseas: bool = False,
+                        page: int = 1, size: int = 20, sort: str = "-rule"):
+    return command_rules(get_conn(), _f(nfs, versions, logical_ne,
+                                        rule_types=rule_types, overseas=overseas),
+                         mode, page, size, sort)
 
+
+# ---------- 特性图谱 ----------
+
+@router.get("/feature/summary")
+def stats_feature_summary(nfs: str = "", versions: str = "", overseas: bool = False):
+    return feature_summary(get_conn(), _f(nfs, versions, overseas=overseas))
+
+
+@router.get("/feature/matrix")
+def stats_feature_matrix(nfs: str = "", versions: str = "", overseas: bool = False,
+                         page: int = 1, size: int = 20, sort: str = "-fk"):
+    return feature_matrix(get_conn(), _f(nfs, versions, overseas=overseas),
+                          page, size, sort)
+
+
+# ---------- 业务图谱（无筛选）----------
+
+@router.get("/business/overview")
+def stats_business_overview():
+    return business_overview(get_conn())
+
+
+# ---------- MOP 动网变更场景统计 ----------
+
+@router.get("/mop")
+def stats_mop(level: int = 1):
+    return mop_mod.aggregate(level)
+
+
+@router.put("/mop/source")
+async def stats_mop_upload(request: Request, filename: str = Query(...)):
+    """上传/替换 MOP 底表（仅 admin）。body = 文件原始字节（前端 Blob 直传）。"""
+    user = getattr(request.state, "user_obj", None) or {}
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="仅管理员可上传 MOP 底表")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件超过 20MB 上限")
+    try:
+        return mop_mod.save_source(filename, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+# ---------- 导出（前端入口已隐藏，端点保留）----------
 
 _EXPORT_FORMATS = {
     "csv": ("text/csv; charset=utf-8", ".csv"),

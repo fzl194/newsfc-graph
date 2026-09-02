@@ -132,8 +132,10 @@ def test_stats_view_endpoints_frontend_perm(tmp_path, monkeypatch, tmp_data_dir)
         assert c.get("/api/v1/stats/command").status_code == 401
         assert c.get("/api/v1/stats/command",
                      headers={"X-API-Key": "gap_sk"}).status_code == 403
-        for url in ("/api/v1/stats/command", "/api/v1/stats/feature",
-                    "/api/v1/stats/business", "/api/v1/stats/filters",
+        for url in ("/api/v1/stats/command/summary", "/api/v1/stats/command/knowledge",
+                    "/api/v1/stats/command/rules", "/api/v1/stats/feature/summary",
+                    "/api/v1/stats/feature/matrix", "/api/v1/stats/business/overview",
+                    "/api/v1/stats/mop", "/api/v1/stats/filters",
                     "/api/v1/stats/export?view=command&format=csv",
                     "/api/v1/stats"):
             assert c.get(url, headers={"X-API-Key": "gap_fe"}).status_code == 200, url

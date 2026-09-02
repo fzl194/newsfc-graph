@@ -33,14 +33,6 @@
     </nav>
 
     <div class="stats-chips">
-      <div v-if="totalObjects !== null" class="chip">
-        <span class="chip-label">对象</span>
-        <span class="chip-val mono">{{ totalObjects.toLocaleString() }}</span>
-      </div>
-      <div v-if="edgeCount !== null" class="chip">
-        <span class="chip-label">边</span>
-        <span class="chip-val mono">{{ edgeCount.toLocaleString() }}</span>
-      </div>
       <div class="chip user-chip">
         <span class="chip-label">{{ session?.username }}</span>
         <button class="logout-link" @click="logout">登出</button>
@@ -50,24 +42,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
-import { stats, type Stats } from '../api'
+import { computed, h } from 'vue'
 import { getSession, clearSession } from '../auth'
 
-const globalStats = ref<Stats | null>(null)
 const session = getSession()
 
 function logout(): void {
   clearSession()
   window.location.assign('/login')
-}
-
-async function load(): Promise<void> {
-  try {
-    globalStats.value = await stats()
-  } catch {
-    /* header chip 容错，不打断用户 */
-  }
 }
 
 // 简单内联 SVG 图标（避免引依赖）
@@ -211,11 +193,28 @@ const FolderIcon = () =>
     ],
   )
 
+// 运维页（齿轮图标：SKILL/MCP 取用统计）
+const OpsIcon = () =>
+  h(
+    'svg',
+    { width: '15', height: '15', viewBox: '0 0 24 24', fill: 'none' },
+    [
+      h('circle', { cx: '12', cy: '12', r: '3', stroke: 'currentColor', 'stroke-width': '1.7' }),
+      h('path', {
+        d: 'M12 2v3m0 14v3M2 12h3m14 0h3M4.9 4.9l2.1 2.1m10 10 2.1 2.1m0-14.2-2.1 2.1m-10 10-2.1 2.1',
+        stroke: 'currentColor',
+        'stroke-width': '1.5',
+        opacity: '0.7',
+      }),
+    ],
+  )
+
 const tabs = computed(() => {
   const s = getSession()
   const base = [
     { to: '/', label: '图谱浏览', icon: GraphIcon },
     { to: '/stats', label: '统计', icon: StatsIcon },
+    { to: '/ops', label: '运维', icon: OpsIcon },
   ]
   if (s?.can_assets) base.push({ to: '/fs', label: '资产目录', icon: FolderIcon })
   if (s?.can_assets) base.push({ to: '/upload', label: '上传', icon: UploadIcon })
@@ -224,22 +223,6 @@ const tabs = computed(() => {
   if (s?.is_admin) base.push({ to: '/mcp-tools', label: 'MCP 工具', icon: McpToolIcon })
   return base
 })
-
-const totalObjects = computed(() =>
-  globalStats.value
-    ? Object.values(globalStats.value.object_counts_by_type).reduce(
-        (a, b) => a + b,
-        0,
-      )
-    : null,
-)
-const edgeCount = computed(() => globalStats.value?.edge_count ?? null)
-
-onMounted(load)
-
-// 监听全局刷新（上传后触发）
-;(window as unknown as { __refreshStats?: () => Promise<void> }).__refreshStats =
-  load
 </script>
 
 <style scoped>

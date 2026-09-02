@@ -288,7 +288,7 @@ export const exportUrl = (f: {
   scenario?: string
 }): string => `${BASE}/export${qs(f)}`
 
-// ---------- 三视图统计（统计页重构 2026-09-01）----------
+// ---------- 三视图统计（2026-09-02 改版：卡片/表格分离 + 服务端分页）----------
 // 口径与后端 app/stats 对齐；多值筛选以逗号拼接传递。
 
 export interface StatsFilterOptions {
@@ -305,33 +305,11 @@ export interface StatsFilterOptions {
   table_rows: Record<string, number>
 }
 
-/** 下钻行公共列：nf/nf_display 为 objects 系；规则表系为 ne（nf_display 同名输出） */
-export interface MatrixBase {
+export interface FeatureMatrixRow {
+  nf: string
   nf_display: string
   version: string
   version_display: string
-}
-
-export interface CommandMatrixRow extends MatrixBase {
-  nf: string
-  MMLCommand: number
-  ConfigObject: number
-  total: number
-}
-
-export interface SyntaxMatrixRow extends MatrixBase {
-  ne: string
-  cmd_count: number
-  param_count: number
-}
-
-export interface RuleMatrixRow extends MatrixBase {
-  ne: string
-  count: number
-}
-
-export interface FeatureMatrixRow extends MatrixBase {
-  nf: string
   feature_codes: number
   feature_knowledge: number
   license_codes: number
@@ -358,8 +336,7 @@ export interface EdgesBlock {
   groups?: Record<string, number>
 }
 
-export interface CommandStats {
-  view: 'command'
+export interface CommandSummary {
   knowledge: { MMLCommand: number; ConfigObject: number; points: number }
   edges: EdgesBlock
   inbound: { raw: [string, number][] }
@@ -372,26 +349,40 @@ export interface CommandStats {
     delete?: number
   }
   five_total: number
-  matrix: CommandMatrixRow[]
-  syntax_matrix: SyntaxMatrixRow[]
-  rule_matrix: Record<string, RuleMatrixRow[]>
 }
 
-export interface FeatureStats {
-  view: 'feature'
-  totals: {
-    feature_codes: number
-    feature_knowledge: number
-    license_codes: number
-    license_knowledge: number
-  }
-  matrix: FeatureMatrixRow[]
+export interface KnowledgeRow {
+  nf: string
+  nf_display: string
+  version: string
+  version_display: string
+  cmd_knowledge: number
+  cfg_knowledge: number
+  total_knowledge: number
+  out_edges: number
+  in_edges: number
+}
+
+export interface RuleRow {
+  ne: string
+  nf_display: string
+  version: string
+  version_display: string
+  rule_type: string
+  cmd_count: number
+  param_count: number
+  rule_count: number
+}
+
+export interface FeatureSummary {
+  feature_count: number
+  feature_codes: number
+  license_count: number
+  license_codes: number
   edges: EdgesBlock
-  prefixes: string[]
 }
 
-export interface BusinessStats {
-  view: 'business'
+export interface BusinessOverview {
   counts: {
     domains: number
     scenarios: number
@@ -399,12 +390,15 @@ export interface BusinessStats {
     atom_tasks: number
     feature_tasks: number
     compound_tasks: number
-    task_cmd_edges: number
-    task_feature_edges: number
   }
   solutions_matrix: SolutionRow[]
   tasks_matrix: TaskMatrixRow[]
   edges: EdgesBlock & { groups: Record<string, number> }
+}
+
+export interface PagedResult<T> {
+  rows: T[]
+  total: number
 }
 
 export type StatsViewKey = 'command' | 'feature' | 'business'
@@ -413,16 +407,13 @@ export interface StatsFilterParams {
   nfs?: string[]
   versions?: string[]
   logical_ne?: string
-  object_types?: string[]
-  relations?: string[]
   rule_types?: string[]
-  domain?: string
-  scenario?: string
-  solution?: string
   overseas?: boolean
 }
 
-function statsQs(p: StatsFilterParams): string {
+export type RuleGroupMode = 'ne_version' | 'ne' | 'version' | 'all'
+
+function statsQs(p: StatsFilterParams, extra: Record<string, string | number> = {}): string {
   const parts: string[] = []
   const multi = (k: string, v?: string[]): void => {
     if (v?.length) parts.push(`${k}=${encodeURIComponent(v.join(','))}`)
@@ -432,30 +423,85 @@ function statsQs(p: StatsFilterParams): string {
   }
   multi('nfs', p.nfs)
   multi('versions', p.versions)
-  multi('object_types', p.object_types)
-  multi('relations', p.relations)
   multi('rule_types', p.rule_types)
   single('logical_ne', p.logical_ne)
-  single('domain', p.domain)
-  single('scenario', p.scenario)
-  single('solution', p.solution)
   if (p.overseas) parts.push('overseas=true')
+  for (const [k, v] of Object.entries(extra)) parts.push(`${k}=${encodeURIComponent(String(v))}`)
   return parts.length ? `?${parts.join('&')}` : ''
 }
 
 export const statsFilters = (): Promise<StatsFilterOptions> =>
   _req<StatsFilterOptions>(`${BASE}/stats/filters`)
 
-export const statsCommand = (p: StatsFilterParams = {}): Promise<CommandStats> =>
-  _req<CommandStats>(`${BASE}/stats/command${statsQs(p)}`)
+export const statsCommandSummary = (p: StatsFilterParams = {}): Promise<CommandSummary> =>
+  _req<CommandSummary>(`${BASE}/stats/command/summary${statsQs(p)}`)
 
-export const statsFeature = (p: StatsFilterParams = {}): Promise<FeatureStats> =>
-  _req<FeatureStats>(`${BASE}/stats/feature${statsQs(p)}`)
+export const statsCommandKnowledge = (p: StatsFilterParams = {}, page = 1, size = 20,
+  sort = '-total'): Promise<PagedResult<KnowledgeRow>> =>
+  _req<PagedResult<KnowledgeRow>>(`${BASE}/stats/command/knowledge${statsQs(p, { page, size, sort })}`)
 
-export const statsBusiness = (p: StatsFilterParams = {}): Promise<BusinessStats> =>
-  _req<BusinessStats>(`${BASE}/stats/business${statsQs(p)}`)
+export const statsCommandRules = (p: StatsFilterParams = {}, mode: RuleGroupMode = 'ne_version',
+  page = 1, size = 20, sort = '-rule'): Promise<PagedResult<RuleRow>> =>
+  _req<PagedResult<RuleRow>>(`${BASE}/stats/command/rules${statsQs(p, { mode, page, size, sort })}`)
 
-/** 导出当前筛选（fetch 带 KEY → blob → a[download]；直接导航无法带 X-API-Key）。 */
+export const statsFeatureSummary = (p: StatsFilterParams = {}): Promise<FeatureSummary> =>
+  _req<FeatureSummary>(`${BASE}/stats/feature/summary${statsQs(p)}`)
+
+export const statsFeatureMatrix = (p: StatsFilterParams = {}, page = 1, size = 20,
+  sort = '-fk'): Promise<PagedResult<FeatureMatrixRow>> =>
+  _req<PagedResult<FeatureMatrixRow>>(`${BASE}/stats/feature/matrix${statsQs(p, { page, size, sort })}`)
+
+export const statsBusinessOverview = (): Promise<BusinessOverview> =>
+  _req<BusinessOverview>(`${BASE}/stats/business/overview`)
+
+// MOP 动网变更场景统计（Excel 底表聚合，不走库）
+export interface MopRow {
+  path: string[]
+  count: number
+  ratio: number
+}
+
+export interface MopStats {
+  available: boolean
+  total: number
+  max_level: number
+  levels: number[]
+  rows: MopRow[]
+  source: string
+  updated_at: string
+}
+
+export const statsMop = (level = 1): Promise<MopStats> =>
+  _req<MopStats>(`${BASE}/stats/mop?level=${level}`)
+
+/** 上传/替换 MOP 底表（仅 admin）：File 原始字节 PUT（免 multipart 依赖）。 */
+export async function uploadMopSource(file: File): Promise<{
+  ok: boolean
+  saved: string
+  mop_total: number
+  levels_found: number[]
+}> {
+  const headers = new Headers()
+  const k = getKey()
+  if (k) headers.set('X-API-Key', k)
+  const resp = await fetch(
+    `${BASE}/stats/mop/source?filename=${encodeURIComponent(file.name)}`,
+    { method: 'PUT', headers, body: await file.arrayBuffer() },
+  )
+  if (!resp.ok) {
+    let detail = ''
+    try {
+      detail = ((await resp.json()) as { detail?: unknown }).detail as string ?? ''
+    } catch { /* 忽略 */ }
+    throw Object.assign(new Error(detail || `上传失败 HTTP ${resp.status}`), {
+      status: resp.status,
+    })
+  }
+  return resp.json()
+}
+
+/** 导出当前筛选（fetch 带 KEY → blob → a[download]；直接导航无法带 X-API-Key）。
+ * 2026-09-02 前端入口按用户要求隐藏，端点保留待后续启用。 */
 export async function downloadStatsExport(
   view: StatsViewKey,
   format: 'csv' | 'xlsx' | 'md',

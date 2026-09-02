@@ -1,6 +1,7 @@
 <template>
-  <div v-loading="loading" class="tab">
-    <div class="cards">
+  <div class="tab">
+    <!-- 统计卡片（无筛选；D7/D7b 已按用户要求删除） -->
+    <div v-loading="loading" class="cards">
       <StatCard title="业务主线" :total="d?.counts.solutions ?? 0" total-label="方案数（D3）"
         :details="[
           { label: '业务域数（D1）', value: d?.counts.domains ?? 0 },
@@ -11,8 +12,6 @@
           { label: '原子任务 AtomTask（D4）', value: d?.counts.atom_tasks ?? 0 },
           { label: '特性任务 FeatureTask（D5）', value: d?.counts.feature_tasks ?? 0 },
           { label: '步骤任务 CompoundTask（D6）', value: d?.counts.compound_tasks ?? 0 },
-          { label: '任务关联命令数（D7）', value: d?.counts.task_cmd_edges ?? 0 },
-          { label: '任务关联特性数（D7b）', value: d?.counts.task_feature_edges ?? 0 },
         ]" accent="#0ea5e9" />
       <StatCard title="知识关联出边" :total="d?.edges.merged_total ?? 0" total-label="合并边数"
         :details="groupDetails" accent="#8b5cf6" hint="上下游/场景/域 成对合并取大" />
@@ -45,30 +44,40 @@
       </el-table>
     </section>
 
-    <div class="edges-grid">
-      <RelationTable title="出边按关系 · 合并取大" :rows="d?.edges.merged ?? []"
-        hint="编排/组成/上下游等（成对取大）" />
-      <RelationTable title="出边按关系 · 原始方向" :rows="d?.edges.raw ?? []" hint="edges 原始行计数" />
-    </div>
+    <!-- MOP 动网变更场景统计（Excel 底表，不走库） -->
+    <MopTable />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElTable, ElTableColumn } from 'element-plus'
 import StatCard from '../StatCard.vue'
-import RelationTable from './RelationTable.vue'
+import MopTable from './MopTable.vue'
 import { fmt } from './shared'
-import type { BusinessStats } from '../../api'
+import { statsBusinessOverview, type BusinessOverview } from '../../api'
 
-const props = defineProps<{ data: BusinessStats | null; loading: boolean }>()
-const d = computed(() => props.data)
+const d = ref<BusinessOverview | null>(null)
+const loading = ref(false)
 
 const taskTotal = computed(() =>
   (d.value?.counts.atom_tasks ?? 0) + (d.value?.counts.feature_tasks ?? 0)
   + (d.value?.counts.compound_tasks ?? 0))
 const groupDetails = computed(() =>
   Object.entries(d.value?.edges.groups ?? {}).map(([label, value]) => ({ label, value })))
+
+async function load(): Promise<void> {
+  loading.value = true
+  try {
+    d.value = await statsBusinessOverview()
+  } finally {
+    loading.value = false
+  }
+}
+
+defineExpose({ reload: load })
+
+onMounted(load)
 </script>
 
 <style scoped>
