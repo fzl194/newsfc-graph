@@ -79,6 +79,14 @@ async def lifespan(app: FastAPI):
             print(f"[startup] users.json 为空 → 已自动创建 admin（全权限）。KEY: {u['key']}（请妥善保存，仅显示一次）", flush=True)
     except Exception as e:
         print(f"[startup] WARNING: users.json 读取失败 ({e})", flush=True)
+    # 统计缓存后台预热（2026-09-02：内网百万行级聚合缓存化，筛选走内存过滤；
+    # 构建期间统计端点等待首个构建完成，之后「更新缓存」按钮重建）
+    try:
+        from .stats import cache as stats_cache_mod
+        if stats_cache_mod.refresh_async():
+            print("[startup] 统计缓存后台预热中（数据量大时约几十秒）…", flush=True)
+    except Exception as e:  # noqa: BLE001 —— 预热失败不阻断启动（首个请求会同步构建）
+        print(f"[startup] WARNING: 统计缓存预热失败 ({e})", flush=True)
     # MCP 服务（Streamable HTTP，/mcp）：session manager 随应用生命周期启停
     # （SDK 限制 run() 仅一次/实例 → 每次启动重建；测试多 TestClient 场景可重入）
     from .mcp_server import apply_instructions, rebuild_session_manager

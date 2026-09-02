@@ -2,12 +2,12 @@
   <div class="tab">
     <!-- ① 统计值卡片 -->
     <div v-loading="sumLoading" class="cards">
-      <StatCard title="特性数量" :total="sum?.feature_count ?? 0" total-label="特性知识条数（不去重）"
-        :details="[{ label: '编号去重数（C1）', value: sum?.feature_codes ?? 0 }]"
-        accent="#4f46e5" hint="feature_code 去重为次级口径（2026-09-02）" />
-      <StatCard title="License 数量" :total="sum?.license_count ?? 0" total-label="License 知识条数（不去重）"
-        :details="[{ label: '编号去重数（C2）', value: sum?.license_codes ?? 0 }]"
-        accent="#0ea5e9" hint="license_code 去重为次级口径" />
+      <StatCard title="特性数量" :total="sum?.feature_count ?? 0" total-label="特性知识条数"
+        :details="[{ label: '覆盖特性编号（跨版本合并计）', value: sum?.feature_codes ?? 0 }]"
+        accent="#4f46e5" hint="多版本/多子文档各计一条；编号跨版本合并后去重" />
+      <StatCard title="License 数量" :total="sum?.license_count ?? 0" total-label="License 知识条数"
+        :details="[{ label: '覆盖 License 编号（跨版本合并计）', value: sum?.license_codes ?? 0 }]"
+        accent="#0ea5e9" hint="多版本各计一条；编号跨版本合并后去重" />
       <StatCard title="知识关联出边" :total="sum?.edges.merged_total ?? 0" total-label="合并边数（C5）"
         :details="mergedDetails" accent="#8b5cf6" hint="包含子文档/属于特性 合并取大" />
     </div>
@@ -46,7 +46,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElPagination, ElTable, ElTableColumn } from 'element-plus'
 import StatCard from '../StatCard.vue'
 import StatsFilterBar from './StatsFilterBar.vue'
@@ -66,7 +66,8 @@ const matrix = ref<PagedResult<FeatureMatrixRow>>({ rows: [], total: 0 })
 const loading = ref(false)
 const page = ref(1)
 const size = 20
-const tableFilter = reactive({ nfs: [] as string[], versions: [] as string[] })
+// ⚠ 必须用 ref：reactive 常量上的 v-model 整对象赋值会断开 watch（筛选无反应 bug）
+const tableFilter = ref({ nfs: [] as string[], versions: [] as string[] })
 
 const mergedDetails = computed(() =>
   (sum.value?.edges.merged ?? []).slice(0, 6).map(([label, value]) => ({ label, value })))
@@ -85,8 +86,8 @@ async function loadMatrix(): Promise<void> {
   try {
     matrix.value = await statsFeatureMatrix({
       ...toParams(card.value),
-      nfs: mergeMulti(card.value.nfs, tableFilter.nfs),
-      versions: mergeMulti(card.value.versions, tableFilter.versions),
+      nfs: mergeMulti(card.value.nfs, tableFilter.value.nfs),
+      versions: mergeMulti(card.value.versions, tableFilter.value.versions),
       logical_ne: '',
     }, page.value, size)
   } finally {

@@ -401,6 +401,17 @@ def business_view(conn: Conn, f: Filters) -> dict:
             f"SELECT o.type AS type, o.nf AS nf, COUNT(*) AS count FROM objects o "
             f"WHERE {task_where} GROUP BY o.type, o.nf ORDER BY o.type, o.nf",
             task_params)]
+    # 域/场景中文名（md 的 name 字段；id 只作兜底与 title）——2026-09-02 用户要求
+    dom_names = {r["domain"] or "": r["name"] or "" for r in conn.execute(
+        "SELECT domain, name FROM objects WHERE type='BusinessDomain'")}
+    scn_names = {(r["domain"] or "", r["scenario"] or ""): r["name"] or ""
+                 for r in conn.execute(
+                     "SELECT domain, scenario, name FROM objects "
+                     "WHERE type='NetworkScenario'")}
+    for row in solutions_matrix:
+        row["domain_name"] = dom_names.get(row["domain"]) or row["domain"]
+        row["scenario_name"] = scn_names.get(
+            (row["domain"], row["scenario"])) or row["scenario"]
     block = edges_block(conn, f, BUSINESS_TYPES)
     merged = dict(block["merged"])
     groups = {label: sum(merged.get(rel, 0) for rel in members if merged.get(rel))
@@ -439,6 +450,8 @@ def view_payload(conn: Conn, view: str, f: Filters) -> dict:
 # 布局契约：卡片摘要（command_summary 等，受视图级筛选）＋若干张表（各自独立
 # 筛选 + 分页 + 排序）。GROUP BY 结果行数有限，排序/切片在 Python 侧做（成本
 # 在聚合本身，LIMIT 不省算力，只省传输）。
+# 2026-09-02 晚再改版：内网百万行级数据每次筛选仍秒级卡顿 → 全部改走
+# cache.py 预聚合缓存（本模块只留聚合"积木"，serve 逻辑在 cache.py）。
 
 def _sort_key(v):
     """排序键类型归一：数值列可能出现 0/None 与字符串混排（如语法行 rule_count=0），
@@ -465,194 +478,73 @@ def _paginate(rows: list[dict], page: int, size: int) -> tuple[list[dict], int]:
     return rows[(page - 1) * size: page * size], len(rows)
 
 
-def command_summary(conn: Conn, f: Filters) -> dict:
-    """命令图谱卡片摘要（A1-A3 + 出边 + 入边 + B1/B2/B8；无矩阵）。"""
-    a1 = objects_count(conn, f, ("MMLCommand",))
-    a2 = objects_count(conn, f, ("ConfigObject",))
-    rules: dict = {}
-    five_total = 0
-    sel = _selected_rule_keys(f)
-    if "syntax" in sel:
-        st = syntax_stats(conn, f)
-        st["cmd_count_by_group_sum"] = sum(
-            r["cmd_count"] for r in syntax_matrix(conn, f))
-        rules["syntax"] = st
-    for key in RULE_TABLES:
-        if key in sel:
-            rules[key] = rule_count(conn, f, key)
-            five_total += rules[key]
-    return {
-        "view": "command", "filters": f.echo(),
-        "knowledge": {"MMLCommand": a1, "ConfigObject": a2, "points": a1 + a2},
-        "edges": edges_block(conn, f, COMMAND_TYPES),
-        "inbound": {"raw": sorted(edges_inbound(conn, f, COMMAND_TYPES).items(),
-                                  key=lambda kv: -kv[1])},
-        "rules": rules, "five_total": five_total,
-    }
+def edges_out_by_slot_rel(conn: Conn, types: tuple[str, ...]) -> dict:
+    """出边按 (from nf,version) × relation 分组（缓存积木）。"""
+    ph = _ph(len(types))
+    out: dict[tuple[str, str], dict[str, int]] = {}
+    for r in conn.execute(
+            f"SELECT o.nf, o.version, e.relation AS rel, COUNT(*) AS n FROM edges e "
+            f"JOIN objects o ON o.id=e.from_id AND o.version=e.from_version "
+            f"WHERE o.type IN ({ph}) GROUP BY o.nf, o.version, e.relation", types):
+        out.setdefault((r["nf"] or "", r["version"] or ""), {})[r["rel"]] = r["n"]
+    return out
 
 
-def _out_edges_by_slot(conn: Conn, f: Filters) -> dict:
-    """出边数按 (nf,version)（from 对象精确归属）。"""
-    where, params = _obj_where(f, COMMAND_TYPES)
-    return {(r["nf"] or "", r["version"] or ""): r["n"] for r in conn.execute(
-        f"SELECT o.nf, o.version, COUNT(*) AS n FROM edges e "
-        f"JOIN objects o ON o.id=e.from_id AND o.version=e.from_version "
-        f"WHERE {where} GROUP BY o.nf, o.version", params)}
+def edges_in_by_slot_rel(conn: Conn, types: tuple[str, ...],
+                         cross_only: bool = True) -> dict:
+    """入边按 (to nf,version) × relation 分组（to 无版本列，按 id 落槽位）。
+    cross_only=True 排除图谱内部边（A5 卡片口径）；False=全量入边（知识表
+    「入边数」列口径，含内部引用）。"""
+    ph = _ph(len(types))
+    extra = (f"AND NOT EXISTS(SELECT 1 FROM objects o2 "
+             f"WHERE o2.id=e.from_id AND o2.type IN ({ph})) ") if cross_only else ""
+    params: tuple = (*types, *types) if cross_only else types
+    out: dict[tuple[str, str], dict[str, int]] = {}
+    for r in conn.execute(
+            f'SELECT o.nf, o.version, e.relation AS rel, COUNT(*) AS n FROM edges e '
+            f'JOIN objects o ON o.id=e."to" '
+            f"WHERE o.type IN ({ph}) {extra}"
+            f"GROUP BY o.nf, o.version, e.relation", params):
+        out.setdefault((r["nf"] or "", r["version"] or ""), {})[r["rel"]] = r["n"]
+    return out
 
 
-def _in_edges_by_slot(conn: Conn, f: Filters) -> dict:
-    """入边数按 (nf,version)：edges.to 无版本列——按 id JOIN 落到目标槽位
-    （边指向该 (nf,version) 即计一次；同 id 多版本会分别计入，属槽位视角）。"""
-    where, params = _obj_where(f, COMMAND_TYPES)
-    return {(r["nf"] or "", r["version"] or ""): r["n"] for r in conn.execute(
-        f'SELECT o.nf, o.version, COUNT(*) AS n FROM edges e '
-        f'JOIN objects o ON o.id=e."to" '
-        f"WHERE {where} GROUP BY o.nf, o.version", params)}
+def syntax_group_rows(conn: Conn):
+    """语法表 (NE,版本,命令) → 参数行数 流（缓存据此建 DISTINCT 命令集合：
+    任何粒度的 DISTINCT 用集合并集推导，不再回表）。"""
+    return conn.execute(
+        'SELECT "NE_TYPE" AS ne, "NE_VERSION" AS ver, "CMD_NAME" AS cmd, COUNT(*) AS n '
+        'FROM "B_AI_COMMAND_SYNTAX_CHECK_RULES" '
+        'GROUP BY "NE_TYPE", "NE_VERSION", "CMD_NAME"')
 
 
-_KNOWLEDGE_SORT = {"nf": "nf", "version": "version", "cmd": "cmd_knowledge",
-                   "cfg": "cfg_knowledge", "total": "total_knowledge",
-                   "out": "out_edges", "in": "in_edges"}
+def lne_syntax_counts(conn: Conn) -> list[dict]:
+    """逻辑网元粒度的语法统计（一趟 JOIN）：(物理网元,逻辑网元,版本) →
+    命令数(DISTINCT) / 参数行数。LNE 先 DISTINCT 防映射重复行放大参数计数。"""
+    try:
+        return [dict(r) for r in conn.execute(
+            'SELECT d."PHYSICAL_NE_TYPE" AS phys, d."LOGICAL_NE_TYPE" AS logi, '
+            'd."NE_VERSION" AS ver, COUNT(DISTINCT s."CMD_NAME") AS cmds, '
+            'COUNT(*) AS params '
+            'FROM (SELECT DISTINCT "PHYSICAL_NE_TYPE","LOGICAL_NE_TYPE","NE_VERSION",'
+            '"COMMAND_NAME" FROM "B_AI_CONFIG_CHECK_LOGICAL_NE_CMD_T") d '
+            'JOIN "B_AI_COMMAND_SYNTAX_CHECK_RULES" s '
+            'ON s."CMD_NAME"=d."COMMAND_NAME" AND s."NE_TYPE"=d."PHYSICAL_NE_TYPE" '
+            'AND s."NE_VERSION"=d."NE_VERSION" '
+            'GROUP BY 1,2,3')]
+    except sqlite3.OperationalError:
+        return []
 
 
-def command_knowledge(conn: Conn, f: Filters, page: int = 1, size: int = 20,
-                      sort: str = "-total") -> dict:
-    """知识统计表：网元/版本/命令/配置对象/总计知识条数 + 出边/入边并入。"""
-    vmap = overseas_map(conn)
-    know = objects_matrix(conn, f, COMMAND_TYPES)
-    out_map = _out_edges_by_slot(conn, f)
-    in_map = _in_edges_by_slot(conn, f)
-    rows = []
-    for r in know:
-        key = (r["nf"], r["version"])
-        rows.append({
-            "nf": r["nf"], "version": r["version"],
-            "cmd_knowledge": r["MMLCommand"], "cfg_knowledge": r["ConfigObject"],
-            "total_knowledge": r["total"],
-            "out_edges": out_map.get(key, 0), "in_edges": in_map.get(key, 0),
-        })
-    _dress_rows(rows, vmap, f, True)
-    rows = _sort_rows(rows, sort, _KNOWLEDGE_SORT)
-    paged, total = _paginate(rows, page, size)
-    return {"rows": paged, "total": total}
+def codes_set_rows(conn: Conn, type_: str, code_key: str):
+    """Feature/License 编号集合流：(nf,version,编号) → 行数（缓存建集合用）。"""
+    return conn.execute(
+        f"SELECT o.nf AS nf, o.version AS ver, "
+        f"json_extract(o.frontmatter_json,'$.{code_key}') AS code, COUNT(*) AS n "
+        f"FROM objects o WHERE o.type=? AND json_extract(o.frontmatter_json,"
+        f"'$.{code_key}') IS NOT NULL GROUP BY o.nf, o.version, "
+        f"json_extract(o.frontmatter_json,'$.{code_key}')", (type_,))
 
-
-_RULE_MODE_DIMS = {
-    "ne_version": (True, True), "ne": (True, False),
-    "version": (False, True), "all": (False, False),
-}
-_RULES_SORT = {"ne": "ne", "version": "version", "type": "rule_type",
-               "cmd": "cmd_count", "param": "param_count", "rule": "rule_count"}
-
-
-def command_rules(conn: Conn, f: Filters, mode: str = "ne_version",
-                  page: int = 1, size: int = 20, sort: str = "-rule") -> dict:
-    """语法规则统计总表：语法（命令数/参数数）+ 五类规则合一张表，
-    汇总方式 mode = 网元×版本 | 仅网元 | 仅版本 | 总计。
-
-    ⚠ GROUP BY 必须用**各表自己的网元列名**（GRAPH/REPEAT 是 PHYSICAL_NE_TYPE，
-    其余 NE_TYPE）——统一写 "NE_TYPE" 会命中 SQLite 双引号字符串回退：不存在
-    的列被当字符串常量 → 整表并成一组（计数错且不报错，已测试锁定）。
-    """
-    by_ne, by_ver = _RULE_MODE_DIMS.get(mode, _RULE_MODE_DIMS["ne_version"])
-    vmap = overseas_map(conn)
-    rows: list[dict] = []
-    sel = _selected_rule_keys(f)
-
-    def _ne_ver_expr(ne_col: str, ver_col: str) -> tuple[str, str, str]:
-        ne_expr = f'"{ne_col}" AS ne' if by_ne else "'' AS ne"
-        ver_expr = f'"{ver_col}" AS version' if by_ver else "'' AS version"
-        dims = ([f'"{ne_col}"'] if by_ne else []) + ([f'"{ver_col}"'] if by_ver else [])
-        group = f"GROUP BY {', '.join(dims)}" if dims else ""
-        return ne_expr, ver_expr, group
-
-    if "syntax" in sel:
-        where, params = _rule_where(f, "NE_TYPE", "NE_VERSION")
-        if f.logical_ne:
-            sub, sub_params = _logical_ne_subquery(f)
-            where += f' AND "CMD_NAME" IN ({sub})'
-            params.extend(sub_params)
-        ne_expr, ver_expr, group = _ne_ver_expr("NE_TYPE", "NE_VERSION")
-        for r in conn.execute(
-                f'SELECT {ne_expr}, {ver_expr}, COUNT(DISTINCT "CMD_NAME") AS c, '
-                f'COUNT(*) AS n FROM "{SYNTAX_TABLE}" WHERE {where} {group}', params):
-            rows.append({"ne": r["ne"] or "", "version": r["version"] or "",
-                         "rule_type": "语法规则", "cmd_count": r["c"] or 0,
-                         "param_count": r["n"] or 0,
-                         # 语法表行=参数定义，无独立"规则数量"口径（曾填行数与
-                         # 参数数量恒等，2026-09-02 用户指出后置 0=前端显示 —）
-                         "rule_count": 0})
-    for key, (table, ne_col, ver_col, label) in RULE_TABLES.items():
-        if key not in sel:
-            continue
-        where, params = _rule_where(f, ne_col, ver_col)
-        ne_expr, ver_expr, group = _ne_ver_expr(ne_col, ver_col)
-        for r in conn.execute(
-                f'SELECT {ne_expr}, {ver_expr}, COUNT(*) AS n FROM "{table}" '
-                f'WHERE {where} {group}', params):
-            rows.append({"ne": r["ne"] or "", "version": r["version"] or "",
-                         "rule_type": label, "cmd_count": 0, "param_count": 0,
-                         "rule_count": r["n"] or 0})
-    _dress_rows(rows, vmap, f, False)
-    rows = _sort_rows(rows, sort, _RULES_SORT)
-    paged, total = _paginate(rows, page, size)
-    return {"rows": paged, "total": total}
-
-
-def feature_summary(conn: Conn, f: Filters) -> dict:
-    """特性图谱卡片：**数量默认不去重**（知识条数为主数，编号去重为次级数字，
-    用户决策 2026-09-02）。"""
-    ft = codes_stats(conn, f, "Feature", "feature_code")
-    lc = codes_stats(conn, f, "License", "license_code")
-    return {
-        "view": "feature", "filters": f.echo(),
-        "feature_count": ft["knowledge"], "feature_codes": ft["codes"],
-        "license_count": lc["knowledge"], "license_codes": lc["codes"],
-        "edges": edges_block(conn, f, FEATURE_TYPES),
-    }
-
-
-_MATRIX_SORT = {"nf": "nf", "version": "version", "fcodes": "feature_codes",
-                "fk": "feature_knowledge", "lcodes": "license_codes",
-                "lk": "license_knowledge"}
-
-
-def feature_matrix(conn: Conn, f: Filters, page: int = 1, size: int = 20,
-                   sort: str = "-fk") -> dict:
-    vmap = overseas_map(conn)
-    frows = codes_matrix(conn, f, "Feature", "feature_code")
-    lrows = codes_matrix(conn, f, "License", "license_code")
-    lmap = {(r["nf"], r["version"]): r for r in lrows}
-    rows = {
-        (r["nf"], r["version"]): {
-            "nf": r["nf"], "version": r["version"],
-            "feature_codes": r["codes"], "feature_knowledge": r["knowledge"],
-            "license_codes": 0, "license_knowledge": 0}
-        for r in frows}
-    for r in lrows:
-        cell = rows.setdefault((r["nf"], r["version"]), {
-            "nf": r["nf"], "version": r["version"], "feature_codes": 0,
-            "feature_knowledge": 0, "license_codes": 0, "license_knowledge": 0})
-        cell["license_codes"] = r["codes"]
-        cell["license_knowledge"] = r["knowledge"]
-    out = _dress_rows(sorted(rows.values(), key=lambda r: (r["nf"], r["version"])),
-                      vmap, f, True)
-    out = _sort_rows(out, sort, _MATRIX_SORT)
-    paged, total = _paginate(out, page, size)
-    return {"rows": paged, "total": total}
-
-
-def business_overview(conn: Conn) -> dict:
-    """业务图谱总览：**无筛选**（用户决策 2026-09-02）；卡片去掉任务关联命令/
-    特性数（D7/D7b），表（域→场景→方案 / 任务矩阵）数据量小随卡片一次返回。"""
-    d = business_view(conn, Filters())
-    d["counts"].pop("task_cmd_edges", None)
-    d["counts"].pop("task_feature_edges", None)
-    d.pop("filters", None)
-    return d
-
-
-# ---------- 筛选下拉选项（/filters） ----------
 
 def _distinct(conn: Conn, sql: str, params: list | None = None) -> list[str]:
     return sorted({r[0] for r in conn.execute(sql, params or []) if r[0]})
@@ -701,8 +593,11 @@ def filters_options(conn: Conn) -> dict:
         "logical_nes": {k: sorted(v) for k, v in logical.items()},
         "object_types": list(ALL_TYPES),
         "relations": _distinct(conn, "SELECT DISTINCT relation FROM edges"),
-        "rule_types": [{"key": k, "label": v} for k, v in
-                       (("syntax", "语法规则"), *((kk, RULE_TABLES[kk][3]) for kk in RULE_TABLES))],
+        "rule_types": [
+            {"key": "cmd", "label": "命令数量"},
+            {"key": "param", "label": "参数数量"},
+            *({"key": kk, "label": RULE_TABLES[kk][3]} for kk in RULE_TABLES),
+        ],
         "domains": _distinct(conn, "SELECT DISTINCT domain FROM objects"),
         "scenarios": _distinct(conn, "SELECT DISTINCT scenario FROM objects"),
         "solutions": solutions,

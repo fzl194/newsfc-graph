@@ -84,13 +84,13 @@ def _seed_objects(conn):
     _obj(conn, "ConfigurationSolution@S_2", "", "ConfigurationSolution",
          layer="Business", domain="apn-domain", scenario="apn-access", name="地址分配")
     _obj(conn, "NetworkScenario@NS_0", "", "NetworkScenario", layer="Business",
-         domain="business-awareness", scenario="access-control")
+         domain="business-awareness", scenario="access-control", name="访问控制")
     _obj(conn, "NetworkScenario@NS_1", "", "NetworkScenario", layer="Business",
-         domain="apn-domain", scenario="apn-access")
+         domain="apn-domain", scenario="apn-access", name="APN 接入")
     _obj(conn, "BusinessDomain@BD_0", "", "BusinessDomain", layer="Business",
-         domain="business-awareness")
+         domain="business-awareness", name="业务感知")
     _obj(conn, "BusinessDomain@BD_1", "", "BusinessDomain", layer="Business",
-         domain="apn-domain")
+         domain="apn-domain", name="APN 域")
 
 
 def _seed_edges(conn):
@@ -138,6 +138,7 @@ def _seed_rules(conn):
         ("CMD_A", "1", "UPCF", "20.10.2"), ("CMD_A", "2", "UPCF", "20.10.2"),
         ("CMD_B", "1", "UPCF", "20.10.2"),
         ("CMD_X", "1", "UDG", "20.10.2"), ("CMD_X", "2", "UDG", "20.10.2"),
+        ("CMD_A", "3", "UNC", "20.10.2"),
     ]
     conn.executemany(
         'INSERT INTO "B_AI_COMMAND_SYNTAX_CHECK_RULES"("CMD_NAME","PARAM_ID",'
@@ -203,8 +204,7 @@ def test_command_summary_full(seeded):
     assert d["edges"]["merged_total"] == 4
     inbound = dict(d["inbound"]["raw"])
     assert inbound == {"使用命令": 2, "对应命令": 1, "复用命令": 1}  # 跨图谱入边
-    assert d["rules"]["syntax"] == {
-        "cmd_count": 3, "param_count": 5, "cmd_count_by_group_sum": 3}
+    assert "syntax" not in d["rules"]  # 命令/参数卡片已删（数值进规则表类型维度）
     assert d["rules"]["graph"] == 3
     assert d["five_total"] == 9
 
@@ -212,7 +212,7 @@ def test_command_summary_full(seeded):
 def test_command_summary_upcf_and_version(seeded):
     d = _get("/api/v1/stats/command/summary?nfs=UPCF")
     assert d["knowledge"] == {"MMLCommand": 5, "ConfigObject": 2, "points": 7}
-    assert d["rules"]["syntax"]["cmd_count"] == 2
+    assert d["rules"]["graph"] == 2  # 规则表系原生命名直配（UDG 行剔除）
     d2 = _get("/api/v1/stats/command/summary?versions=20.16.2")
     assert d2["knowledge"]["points"] == 2
     assert d2["rules"]["graph"] == 0
@@ -268,54 +268,72 @@ def test_command_knowledge_overseas_display(seeded):
 
 # ---------- 命令图谱：语法规则统计总表（mode 切换 + 分页）----------
 
-def test_command_rules_ne_version_mode(seeded):
+def test_command_rules_long_table(seeded):
+    """规则长表（2026-09-02 需求 6）：网元/逻辑网元/版本/类型/数量；
+    类型=命令数量|参数数量|五类；逻辑网元按映射表分行（物理级行 logical=''）。"""
     d = _get("/api/v1/stats/command/rules")
-    assert d["total"] == 8
-    m = {(r["ne"], r["version"], r["rule_type"]): r for r in d["rows"]}
-    syn = m[("UPCF", "20.10.2", "语法规则")]
-    # 语法行：命令数=组内 DISTINCT CMD_NAME；参数数=行数；规则数量无口径 → 0（前端显示 —）
-    assert (syn["cmd_count"], syn["param_count"], syn["rule_count"]) == (2, 3, 0)
-    assert m[("UDG", "20.10.2", "语法规则")]["cmd_count"] == 1
-    assert m[("UPCF", "20.10.2", "图规则")]["rule_count"] == 2
-    assert m[("UDG", "20.10.2", "删除规则")]["rule_count"] == 1
-    assert m[("UPCF", "20.10.2", "SET 规则")]["rule_count"] == 2
-    # 默认 -rule 降序：首行是数量最大的
-    assert d["rows"][0]["rule_count"] == max(r["rule_count"] for r in d["rows"])
+    m = {(r["ne"], r["logical"], r["version"], r["type"]): r["count"] for r in d["rows"]}
+    # 物理级语法行 ×3 网元（每网元 命令+参数 两行）
+    assert m[("UPCF", "", "20.10.2", "命令数量")] == 2
+    assert m[("UPCF", "", "20.10.2", "参数数量")] == 3
+    assert m[("UDG", "", "20.10.2", "命令数量")] == 1
+    assert m[("UNC", "", "20.10.2", "命令数量")] == 1
+    assert m[("UNC", "", "20.10.2", "参数数量")] == 1
+    # 逻辑网元行：UNC/SMF→{CMD_A} 命中语法 1 命令 1 参数；AMF→CMD_Z 未命中无行
+    assert m[("UNC", "SMF", "20.10.2", "命令数量")] == 1
+    assert m[("UNC", "SMF", "20.10.2", "参数数量")] == 1
+    assert not any(r["logical"] == "AMF" for r in d["rows"])
+    # 五类行
+    assert m[("UPCF", "", "20.10.2", "图规则")] == 2
+    assert m[("UDG", "", "20.10.2", "删除规则")] == 1
+    assert d["total"] == 14  # 3 物理级语法×2 + SMF 逻辑×2 + 五类 6
 
 
-def test_command_rules_mode_ne_and_all(seeded):
+def test_command_rules_modes(seeded):
     d = _get("/api/v1/stats/command/rules?mode=ne")
-    m = {(r["ne"], r["rule_type"]): r for r in d["rows"]}
-    assert m[("UPCF", "语法规则")]["cmd_count"] == 2
-    assert m[("UDG", "语法规则")]["param_count"] == 2
-    assert m[("UPCF", "图规则")]["rule_count"] == 2
+    m = {(r["ne"], r["type"]): r["count"] for r in d["rows"]}
+    assert m[("UPCF", "命令数量")] == 2 and m[("UPCF", "参数数量")] == 3
+    assert m[("UNC", "命令数量")] == 1
+    assert not any(r["logical"] for r in d["rows"])  # 汇总模式无逻辑维度
     d2 = _get("/api/v1/stats/command/rules?mode=all")
-    assert d2["total"] == 6  # 六类各一行
-    m2 = {(r["rule_type"]): r for r in d2["rows"]}
-    assert (m2["语法规则"]["cmd_count"], m2["语法规则"]["param_count"],
-            m2["语法规则"]["rule_count"]) == (3, 5, 0)
-    assert m2["图规则"]["rule_count"] == 3
-    assert all(r["ne"] == "" for r in d2["rows"])
+    m2 = {r["type"]: r["count"] for r in d2["rows"]}
+    assert (m2["命令数量"], m2["参数数量"]) == (3, 6)  # 全局 DISTINCT=3，行数=6
+    assert m2["图规则"] == 3
+    assert d2["total"] == 7
 
 
-def test_command_rules_pagination_and_filters(seeded):
-    d = _get("/api/v1/stats/command/rules?page=2&size=3")
-    assert len(d["rows"]) == 3 and d["total"] == 8
-    # 逻辑网元仅作用语法行
+def test_command_rules_filters(seeded):
+    # 类型筛选：只看命令数量 → 3 物理级 + 1 逻辑行
+    d = _get("/api/v1/stats/command/rules?rule_types=cmd")
+    assert d["total"] == 4
+    assert {r["type"] for r in d["rows"]} == {"命令数量"}
+    # 逻辑网元筛选：语法行只剩该逻辑网元行，五类不受影响
     d2 = _get("/api/v1/stats/command/rules?logical_ne=SMF")
-    syn = [r for r in d2["rows"] if r["rule_type"] == "语法规则"]
-    assert {(r["ne"], r["cmd_count"], r["rule_count"]) for r in syn} == {
-        ("UPCF", 1, 0)}
-    # 五类不受逻辑网元影响（图规则仍 UPCF 2 + UDG 1）
-    graph_sum = sum(r["rule_count"] for r in d2["rows"] if r["rule_type"] == "图规则")
-    assert graph_sum == 3
-    # 规则类型筛选
-    d3 = _get("/api/v1/stats/command/rules?rule_types=graph")
-    assert d3["total"] == 2
-    assert {r["rule_type"] for r in d3["rows"]} == {"图规则"}
-    # 版本筛选同时作用语法与五类
-    d4 = _get("/api/v1/stats/command/rules?versions=20.16.2")
-    assert d4["total"] == 0
+    syn = [r for r in d2["rows"] if r["type"] in ("命令数量", "参数数量")]
+    assert {(r["ne"], r["logical"], r["type"], r["count"]) for r in syn} == {
+        ("UNC", "SMF", "命令数量", 1), ("UNC", "SMF", "参数数量", 1)}
+    assert sum(1 for r in d2["rows"] if r["type"] == "图规则") == 2
+    # 版本筛选
+    assert _get("/api/v1/stats/command/rules?versions=20.16.2")["total"] == 0
+    # 分页
+    d3 = _get("/api/v1/stats/command/rules?page=2&size=5")
+    assert len(d3["rows"]) == 5 and d3["total"] == 14
+
+
+def test_cache_refresh(seeded):
+    d = _get("/api/v1/stats/command/summary")
+    assert d["cache"]["built_at"] > 0
+    r = client.post("/api/v1/stats/cache/refresh")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    # 重建后（同步等待或短暂轮询）数据仍可用且口径不变
+    for _ in range(50):
+        if not _get("/api/v1/stats/filters")["cache"]["building"]:
+            break
+        import time as _t
+        _t.sleep(0.1)
+    d2 = _get("/api/v1/stats/command/summary")
+    assert d2["knowledge"]["points"] == 10
 
 
 # ---------- 特性图谱：默认不去重 ----------
@@ -365,14 +383,14 @@ def test_filters_options(seeded):
     assert "UDG" in d["nfs"] and "UPCF" in d["nfs"] and "UNC" in d["nfs"]
     assert d["logical_nes"] == {"UNC": ["AMF", "SMF"]}
     assert {x["key"] for x in d["rule_types"]} == {
-        "syntax", "graph", "repeat", "mod", "set", "delete"}
+        "cmd", "param", "graph", "repeat", "mod", "set", "delete"}
     assert d["table_rows"]["B_AI_MML_GRAPH_RULE_T"] == 3
 
 
 def test_filters_empty_rule_tables():
     d = _get("/api/v1/stats/filters")
     assert d["table_rows"]["B_AI_COMMAND_SYNTAX_CHECK_RULES"] == 0
-    assert _get("/api/v1/stats/command/summary")["rules"]["syntax"]["cmd_count"] == 0
+    assert _get("/api/v1/stats/command/summary")["five_total"] == 0
 
 
 # ---------- MOP 动网变更场景统计 ----------

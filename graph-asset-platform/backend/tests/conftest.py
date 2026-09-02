@@ -62,6 +62,9 @@ def _empty_service_to_avoid_real_index(tmp_data_dir, monkeypatch):
     # stats 独立只读连接（2026-09-02 重查询不阻塞共享连接）→ 同上注入
     import app.stats.core as stats_core
     monkeypatch.setattr(stats_core, "_conn", s.db, raising=False)
+    # 统计缓存按 test 隔离（下个统计请求从 tmp 连接重建）
+    from app.stats import cache as stats_cache
+    stats_cache.reset()
 
 
 @pytest.fixture(autouse=True)

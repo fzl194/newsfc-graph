@@ -20,8 +20,16 @@
     <section class="blk">
       <h3 class="blk-title">业务域 → 场景 → 方案</h3>
       <el-table :data="d?.solutions_matrix ?? []" size="small" :default-sort="{ prop: 'count', order: 'descending' }">
-        <el-table-column prop="domain" label="业务域" min-width="150" sortable />
-        <el-table-column prop="scenario" label="场景" min-width="140" sortable />
+        <el-table-column prop="domain_name" label="业务域" min-width="150" sortable>
+          <template #default="{ row }">
+            <span :title="row.domain">{{ row.domain_name }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="scenario_name" label="场景" min-width="140" sortable>
+          <template #default="{ row }">
+            <span :title="row.scenario">{{ row.scenario_name }}</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="count" label="方案数" width="90" sortable align="right">
           <template #default="{ row }"><span class="mono strong">{{ fmt(row.count) }}</span></template>
         </el-table-column>

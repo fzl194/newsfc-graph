@@ -1,6 +1,6 @@
 <template>
   <div class="tab">
-    <!-- ① 统计值卡片（视图级筛选联动） -->
+    <!-- ① 统计值卡片（视图级筛选联动；命令/参数卡已删，数值在规则表类型维度） -->
     <div v-loading="sumLoading" class="cards">
       <StatCard title="知识维度" :total="sum?.knowledge.points ?? 0" total-label="总计知识条数"
         :details="[
@@ -11,12 +11,6 @@
         :details="mergedDetails" accent="#0ea5e9" hint="成对方向合并取大（§7.1）" />
       <StatCard title="被引用入边" :total="inboundTotal" total-label="跨图谱入边（A5）"
         :details="inboundDetails" accent="#8b5cf6" hint="特性/任务指向命令图谱" />
-      <StatCard v-if="sum?.rules.syntax" title="命令 / 参数" :total="sum.rules.syntax.cmd_count"
-        total-label="命令数量（B1）"
-        :details="[
-          { label: '参数数量（B2）', value: sum.rules.syntax.param_count },
-          { label: '命令数·分组求和口径', value: sum.rules.syntax.cmd_count_by_group_sum },
-        ]" accent="#f59e0b" hint="语法规则表 DISTINCT CMD_NAME / 行数" />
       <StatCard title="五类核查规则" :total="sum?.five_total ?? 0" total-label="合计（B8）"
         :details="ruleDetails" accent="#10b981" hint="图/重复/MOD/SET/删除 各表行数" />
     </div>
@@ -57,10 +51,10 @@
       </el-table>
     </section>
 
-    <!-- ④ 语法规则统计总表（六类合一 + 汇总方式切换） -->
+    <!-- ④ 规则统计总表（长表：类型含命令/参数数量 + 逻辑网元维度） -->
     <section class="blk">
       <div class="blk-head">
-        <h3 class="blk-title">语法规则统计（命令 / 参数 / 五类规则）</h3>
+        <h3 class="blk-title">规则统计（网元 · 逻辑网元 · 版本 · 类型 · 数量）</h3>
         <div class="blk-tools">
           <el-radio-group v-model="ruleMode" size="small" @change="onRuleModeChange">
             <el-radio-button value="ne_version">网元×版本</el-radio-button>
@@ -69,8 +63,7 @@
             <el-radio-button value="all">总计</el-radio-button>
           </el-radio-group>
           <el-select v-model="ruleFilter.rule_types" multiple collapse-tags clearable filterable
-            size="small" placeholder="规则类型" class="rule-type-sel"
-            @change="reloadRules">
+            size="small" placeholder="类型" class="type-sel" @change="reloadRules">
             <el-option v-for="r in options.rule_types" :key="r.key" :label="r.label" :value="r.key" />
           </el-select>
           <el-select v-model="ruleFilter.nfs" multiple collapse-tags clearable filterable
@@ -90,9 +83,17 @@
         </div>
       </div>
       <el-table v-loading="ruleLoading" :data="rules.rows" size="small">
-        <el-table-column prop="nf_display" label="网元" min-width="110" sortable="custom">
+        <el-table-column prop="ne" label="网元" min-width="110" sortable="custom">
           <template #default="{ row }">
             <span :class="{ faint: !row.ne }">{{ row.ne || '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="logical" label="逻辑网元" width="110" sortable="custom">
+          <template #header>
+            <span title="语法类行按逻辑网元映射分行（仅网元×版本模式）；'—' 为物理网元整体">逻辑网元</span>
+          </template>
+          <template #default="{ row }">
+            <span :class="{ faint: !row.logical }">{{ row.logical || '—' }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="version_display" label="版本" width="140" sortable="custom">
@@ -100,24 +101,13 @@
             <span :class="{ faint: !row.version }">{{ row.version || '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="rule_type" label="规则类型" width="130" sortable="custom" />
-        <el-table-column prop="cmd_count" sortable="custom" align="right">
-          <template #header><span title="语法规则表 DISTINCT CMD_NAME（组内去重，同命令多条参数行只计 1）">命令数量</span></template>
-          <template #default="{ row }">
-            <span class="mono" :class="{ faint: !row.cmd_count }">{{ row.cmd_count ? fmt(row.cmd_count) : '—' }}</span>
+        <el-table-column prop="type" label="类型" width="130" sortable="custom">
+          <template #header>
+            <span title="命令数量=语法表 DISTINCT CMD_NAME；参数数量=语法表行数；五类=各规则表行数">类型</span>
           </template>
         </el-table-column>
-        <el-table-column prop="param_count" sortable="custom" align="right">
-          <template #header><span title="语法规则表行数（每行 = 一条命令参数定义）">参数数量</span></template>
-          <template #default="{ row }">
-            <span class="mono" :class="{ faint: !row.param_count }">{{ row.param_count ? fmt(row.param_count) : '—' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="rule_count" sortable="custom" align="right">
-          <template #header><span title="五类规则表（图/重复/MOD/SET/删除）行数；语法规则无此口径（其行数即参数数量）">规则数量</span></template>
-          <template #default="{ row }">
-            <span class="mono" :class="{ strong: row.rule_count, faint: !row.rule_count }">{{ row.rule_count ? fmt(row.rule_count) : '—' }}</span>
-          </template>
+        <el-table-column prop="count" label="数量" sortable="custom" align="right">
+          <template #default="{ row }"><span class="mono strong">{{ fmt(row.count) }}</span></template>
         </el-table-column>
       </el-table>
     </section>
@@ -125,7 +115,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   ElOption, ElPagination, ElRadioButton, ElRadioGroup, ElSelect, ElTable, ElTableColumn,
 } from 'element-plus'
@@ -148,12 +138,13 @@ const card = ref<CardFilterState>(emptyCardFilter())
 const sum = ref<CommandSummary | null>(null)
 const sumLoading = ref(false)
 
-// 知识表（分页 + 本地筛选：网元/版本）
+// 知识表（分页 + 本地筛选：网元/版本）。⚠ 必须用 ref：reactive 常量上的
+// v-model 整对象赋值会断开 watch（曾致"筛选无反应"bug，2026-09-02 修复）
 const know = ref<PagedResult<KnowledgeRow>>({ rows: [], total: 0 })
 const knowLoading = ref(false)
 const knowPage = ref(1)
 const knowSize = 20
-const knowFilter = reactive({ nfs: [] as string[], versions: [] as string[] })
+const knowFilter = ref({ nfs: [] as string[], versions: [] as string[] })
 const knowTotal = computed(() => know.value.total)
 
 // 规则表（分页 + 汇总方式 + 本地筛选：类型/网元/版本/逻辑网元）
@@ -162,7 +153,7 @@ const ruleLoading = ref(false)
 const rulePage = ref(1)
 const ruleSize = 20
 const ruleMode = ref<RuleGroupMode>('ne_version')
-const ruleFilter = reactive({
+const ruleFilter = ref({
   nfs: [] as string[], versions: [] as string[],
   logical_ne: '', rule_types: [] as string[],
 })
@@ -202,8 +193,8 @@ async function loadSummary(): Promise<void> {
 function knowParams() {
   return {
     ...toParams(card.value),
-    nfs: mergeMulti(card.value.nfs, knowFilter.nfs),
-    versions: mergeMulti(card.value.versions, knowFilter.versions),
+    nfs: mergeMulti(card.value.nfs, knowFilter.value.nfs),
+    versions: mergeMulti(card.value.versions, knowFilter.value.versions),
     logical_ne: '', // 知识表不受逻辑网元影响（口径）
   }
 }
@@ -220,10 +211,10 @@ async function loadKnowledge(): Promise<void> {
 function ruleParams() {
   return {
     ...toParams(card.value),
-    nfs: mergeMulti(card.value.nfs, ruleFilter.nfs),
-    versions: mergeMulti(card.value.versions, ruleFilter.versions),
-    logical_ne: mergeSingle(card.value.logical_ne, ruleFilter.logical_ne),
-    rule_types: ruleFilter.rule_types,
+    nfs: mergeMulti(card.value.nfs, ruleFilter.value.nfs),
+    versions: mergeMulti(card.value.versions, ruleFilter.value.versions),
+    logical_ne: mergeSingle(card.value.logical_ne, ruleFilter.value.logical_ne),
+    rule_types: ruleFilter.value.rule_types,
   }
 }
 
@@ -268,13 +259,11 @@ function reloadRules(): void {
   void loadRules()
 }
 
-function reloadKnowledge(): void {
+watch(card, reloadAll, { deep: true })
+watch(knowFilter, () => {
   knowPage.value = 1
   void loadKnowledge()
-}
-
-watch(card, reloadAll, { deep: true })
-watch(knowFilter, reloadKnowledge, { deep: true })
+}, { deep: true })
 
 defineExpose({ reload: reloadAll })
 
@@ -287,6 +276,6 @@ onMounted(reloadAll)
 .blk-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
 .blk-tools { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .mini-sel { width: 130px; }
-.rule-type-sel { width: 150px; }
+.type-sel { width: 150px; }
 .faint { color: var(--text-faint); }
 </style>

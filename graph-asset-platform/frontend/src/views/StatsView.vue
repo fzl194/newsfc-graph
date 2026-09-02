@@ -8,8 +8,14 @@
             三图谱视图：命令 / 特性 / 业务——卡片、表格分区分层，表格独立筛选与分页
           </p>
         </div>
-        <el-button :icon="Refresh" text @click="reloadActive">刷新</el-button>
+        <el-button :icon="Refresh" :loading="cacheBuilding" text @click="updateCache">
+          {{ cacheBuilding ? '缓存构建中…' : '更新缓存' }}
+        </el-button>
       </header>
+
+      <div v-if="cacheBuilding" class="warn-banner">
+        统计缓存重建中——期间展示的仍是旧数据，完成后自动刷新（数据量大时约几十秒）。
+      </div>
 
       <div v-if="ruleTablesMissing" class="warn-banner">
         AIMML 历史规则表未导入（B_AI_* 表为空）——命令图谱的「命令数量 / 参数数量 / 五类规则」将为 0。
@@ -40,9 +46,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref } from 'vue'
 import { ElButton, ElMessage, ElTabPane, ElTabs } from 'element-plus'
-import { statsFilters, type StatsFilterOptions, type StatsViewKey } from '../api'
+import {
+  refreshStatsCache, statsFilters,
+  type StatsFilterOptions, type StatsViewKey,
+} from '../api'
 import CommandTab from '../components/stats/CommandTab.vue'
 import FeatureTab from '../components/stats/FeatureTab.vue'
 import BusinessTab from '../components/stats/BusinessTab.vue'
@@ -65,6 +74,8 @@ const Refresh = () =>
 const filterOpts = ref<StatsFilterOptions | null>(null)
 const active = ref<StatsViewKey>('command')
 const errorMsg = ref('')
+const cacheBuilding = ref(false)
+let cachePollTimer: number | null = null
 const cmdRef = ref<InstanceType<typeof CommandTab> | null>(null)
 const featRef = ref<InstanceType<typeof FeatureTab> | null>(null)
 const bizRef = ref<InstanceType<typeof BusinessTab> | null>(null)
@@ -91,6 +102,32 @@ function reloadActive(): void {
   else bizRef.value?.reload()
 }
 
+/** 「更新缓存」：后台重建预聚合缓存，期间服务旧数据；完成/轮询到就绪后刷新视图。 */
+async function updateCache(): Promise<void> {
+  try {
+    await refreshStatsCache()
+    cacheBuilding.value = true
+    if (cachePollTimer !== null) window.clearInterval(cachePollTimer)
+    cachePollTimer = window.setInterval(async () => {
+      try {
+        const opts = await statsFilters()
+        filterOpts.value = opts
+        const building = opts.cache?.building ?? false
+        cacheBuilding.value = building
+        if (!building) {
+          if (cachePollTimer !== null) window.clearInterval(cachePollTimer)
+          cachePollTimer = null
+          reloadActive()
+        }
+      } catch {
+        /* 轮询容错：下个周期重试 */
+      }
+    }, 2000)
+  } catch (e: unknown) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
 // 注册全局刷新钩子（上传完成后 UploadView 会调 window.__refreshStats）；
 // AppHeader / App.vue 也各自注册同名钩子——串联调用不覆盖。
 function setupGlobalRefreshHook(): void {
@@ -109,6 +146,10 @@ function setupGlobalRefreshHook(): void {
     reloadActive()
   }
 }
+
+onUnmounted(() => {
+  if (cachePollTimer !== null) window.clearInterval(cachePollTimer)
+})
 
 onMounted(() => {
   void loadFilters()

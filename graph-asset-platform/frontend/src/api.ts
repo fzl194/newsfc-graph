@@ -292,6 +292,7 @@ export const exportUrl = (f: {
 // 口径与后端 app/stats 对齐；多值筛选以逗号拼接传递。
 
 export interface StatsFilterOptions {
+  cache?: StatsCacheStatus
   nfs: string[]
   versions: string[]
   logical_nes: Record<string, string[]>
@@ -319,6 +320,9 @@ export interface FeatureMatrixRow {
 export interface SolutionRow {
   domain: string
   scenario: string
+  /** md 中文标题（id 兜底） */
+  domain_name: string
+  scenario_name: string
   solutions: string[]
   count: number
 }
@@ -336,12 +340,18 @@ export interface EdgesBlock {
   groups?: Record<string, number>
 }
 
+export interface StatsCacheStatus {
+  building: boolean
+  built_at: number
+  error: string
+}
+
 export interface CommandSummary {
   knowledge: { MMLCommand: number; ConfigObject: number; points: number }
   edges: EdgesBlock
   inbound: { raw: [string, number][] }
+  /** 五类规则计数（命令/参数卡片已删，数值在规则表类型维度） */
   rules: {
-    syntax?: { cmd_count: number; param_count: number; cmd_count_by_group_sum: number }
     graph?: number
     repeat?: number
     mod?: number
@@ -349,6 +359,7 @@ export interface CommandSummary {
     delete?: number
   }
   five_total: number
+  cache: StatsCacheStatus
 }
 
 export interface KnowledgeRow {
@@ -363,15 +374,15 @@ export interface KnowledgeRow {
   in_edges: number
 }
 
+/** 规则长表行（2026-09-02 需求 6）：类型=命令数量|参数数量|五类规则 */
 export interface RuleRow {
   ne: string
-  nf_display: string
+  logical: string
   version: string
   version_display: string
-  rule_type: string
-  cmd_count: number
-  param_count: number
-  rule_count: number
+  nf_display: string
+  type: string
+  count: number
 }
 
 export interface FeatureSummary {
@@ -380,6 +391,7 @@ export interface FeatureSummary {
   license_count: number
   license_codes: number
   edges: EdgesBlock
+  cache: StatsCacheStatus
 }
 
 export interface BusinessOverview {
@@ -441,8 +453,12 @@ export const statsCommandKnowledge = (p: StatsFilterParams = {}, page = 1, size 
   _req<PagedResult<KnowledgeRow>>(`${BASE}/stats/command/knowledge${statsQs(p, { page, size, sort })}`)
 
 export const statsCommandRules = (p: StatsFilterParams = {}, mode: RuleGroupMode = 'ne_version',
-  page = 1, size = 20, sort = '-rule'): Promise<PagedResult<RuleRow>> =>
+  page = 1, size = 20, sort = '-count'): Promise<PagedResult<RuleRow>> =>
   _req<PagedResult<RuleRow>>(`${BASE}/stats/command/rules${statsQs(p, { mode, page, size, sort })}`)
+
+/** 「更新缓存」：后台重建预聚合缓存（构建期间继续服务旧数据） */
+export const refreshStatsCache = (): Promise<{ ok: boolean; started: boolean } & StatsCacheStatus> =>
+  _req(`${BASE}/stats/cache/refresh`, { method: 'POST' })
 
 export const statsFeatureSummary = (p: StatsFilterParams = {}): Promise<FeatureSummary> =>
   _req<FeatureSummary>(`${BASE}/stats/feature/summary${statsQs(p)}`)
