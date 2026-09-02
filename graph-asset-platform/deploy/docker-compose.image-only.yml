@@ -1,0 +1,23 @@
+# 纯镜像运行变体（2026-09-03）：代码全部在镜像内，**仅数据外挂**。
+#
+# 适用场景：导 tar 包部署（docker save → 内网 docker load）——不必再同步服务器
+# 磁盘上的 backend/ 源码与 frontend/dist（默认 compose 会把它们挂进容器、
+# **盖掉镜像里的新代码**，导致统计页/MCP 等新功能全部缺失）。
+#
+# 用法（内网服务器 deploy/ 目录）：
+#   docker load -i gap-image-<date>.tar
+#   docker compose -f docker-compose.image-only.yml up -d
+# 或直接用它覆盖 docker-compose.yml 后照常 `docker compose up -d`。
+#
+# 数据：./platform-data 仍是唯一状态目录（备份/迁移只动它）。
+services:
+  gap:
+    image: graph-asset-platform:latest
+    container_name: gap
+    ports:
+      - "8000:8000"
+    environment:
+      - GAP_DATA_DIR=/data          # 平台数据根（DB/资产/原始文档/用户/测试用例/MOP 底表）
+    volumes:
+      - ./platform-data:/data       # 数据外挂：容器无状态，可随时删重建
+    restart: unless-stopped
