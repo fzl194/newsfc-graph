@@ -28,6 +28,10 @@ def _need_perm(path: str) -> str:
         return "assets"
     if path.startswith("/api/v1/docs"):  # 原始产品文档（资产页签内，D15 用户决策：页签级权限）
         return "assets"
+    if path in ("/api/v1/domains", "/api/v1/md"):
+        # SKILL 兼容双接口（2026-09-03 恢复）：权限与 MCP 一致（can_skill ∨
+        # can_frontend；admin 全权）——存量 Agent 配置免改，两套并行
+        return "skill"
     if path.startswith("/api/v1/import") or path.startswith("/api/v1/export"):
         return "upload"  # 菜单3：上传/导出
     if path.startswith("/api/v1/tests"):
