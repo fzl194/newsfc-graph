@@ -17,7 +17,7 @@ export async function login(page: Page, u: { username: string; key: string }): P
 /**
  * Element Plus el-select 选值（左栏选择器区）：点开第 selectIndex 个 .el-select →
  * 在（可见的）下拉浮层里点选项。Element Plus 的 placeholder 是覆盖层 span 而非
- * input placeholder（选中后消失），故按索引定位：命令层 0=网元 1=版本 2=类型。
+ * input placeholder（选中后消失），故按索引定位：命令图谱 0=网元 1=版本 2=类型。
  * 下拉 teleport 到 body，可能有多个隐藏浮层，必须 :visible 过滤。
  */
 export async function pickSelect(page: Page, selectIndex: number, option: string): Promise<void> {

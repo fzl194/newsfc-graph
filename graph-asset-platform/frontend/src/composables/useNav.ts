@@ -1,7 +1,9 @@
 // 全局导航状态：UI 层 Tab + 各层选择器 + 列表分页缓存 + 跨栏同步。
 //
-// 后端把 6 个 registry 层聚合成 4 个 UI 层（见后端 app/ui_layers.py），
-// 前端在此镜像一份常量，供 LayerNav 的 Tab 与 /objects?layer= 过滤共用。
+// 2026-09-03（用户决策：仅图谱浏览页改名）：Tab 改为三图谱口径（与统计页一致），
+// 任务层+业务层合并为「业务图谱」。后端 ui_layers.py 已加同名层（纯增量别名，
+// /objects?layer= 新旧层名都收）；旧 /stats 聚合键仍是旧 4 层名——计数/网元
+// 选项经 STATS_LAYER_KEY 映射读取。
 //
 // 关键能力：
 // - selectLayer(l)：切层，保留各层已缓存的选择器与列表（不重拉）。
@@ -11,31 +13,43 @@
 import { reactive, ref } from 'vue'
 import { getObject, listObjects, type ObjectRow } from '../api'
 
-/** 4 个 UI 层（镜像后端 UI_LAYERS）。 */
-export const UI_LAYERS = ['命令层', '特性层', '任务层', '业务层'] as const
+/** 3 个图谱 Tab（镜像后端 UI_LAYERS_GRAPH；与统计页口径一致）。 */
+export const UI_LAYERS = ['命令图谱', '特性图谱', '业务图谱'] as const
 export type UiLayer = (typeof UI_LAYERS)[number]
 
-/** 对象 type → UI 层（镜像后端 REGISTRY_TO_UI / UI_LAYER_TYPES）。 */
+/** 对象 type → 图谱 Tab（任务类 + 业务对象统一归业务图谱）。 */
 export const TYPE_TO_UI: Record<string, UiLayer> = {
-  MMLCommand: '命令层',
-  ConfigObject: '命令层',
-  Feature: '特性层',
-  License: '特性层',
-  AtomTask: '任务层',
-  CompoundTask: '任务层',
-  FeatureTask: '任务层',
-  Task: '任务层',
-  BusinessDomain: '业务层',
-  NetworkScenario: '业务层',
-  ConfigurationSolution: '业务层',
+  MMLCommand: '命令图谱',
+  ConfigObject: '命令图谱',
+  Feature: '特性图谱',
+  License: '特性图谱',
+  AtomTask: '业务图谱',
+  CompoundTask: '业务图谱',
+  FeatureTask: '业务图谱',
+  Task: '业务图谱',
+  BusinessDomain: '业务图谱',
+  NetworkScenario: '业务图谱',
+  ConfigurationSolution: '业务图谱',
 }
 
-/** UI 层 → 该层包含的对象 type（供类型选择器等使用）。 */
+/** 图谱 Tab → 该层包含的对象 type（供类型选择器与 /objects?layer= 过滤）。 */
 export const UI_LAYER_TYPES: Record<UiLayer, string[]> = {
-  命令层: ['MMLCommand', 'ConfigObject'],
-  特性层: ['Feature', 'License'],
-  任务层: ['AtomTask', 'CompoundTask', 'FeatureTask', 'Task'],
-  业务层: ['BusinessDomain', 'NetworkScenario', 'ConfigurationSolution'],
+  命令图谱: ['MMLCommand', 'ConfigObject'],
+  特性图谱: ['Feature', 'License'],
+  业务图谱: [
+    'AtomTask', 'CompoundTask', 'FeatureTask', 'Task',
+    'BusinessDomain', 'NetworkScenario', 'ConfigurationSolution',
+  ],
+}
+
+/**
+ * 图谱 Tab → 旧 /stats 聚合键（后端旧 4 层名，未随浏览页改名）：
+ * 层计数 chip 与网元下拉选项经此映射读取。
+ */
+export const STATS_LAYER_KEY: Record<UiLayer, string[]> = {
+  命令图谱: ['命令层'],
+  特性图谱: ['特性层'],
+  业务图谱: ['任务层', '业务层'],
 }
 
 /** 单层选择器集合。 */
@@ -72,15 +86,14 @@ interface NavState {
 
 function createState(): NavState {
   return {
-    activeLayer: '命令层',
+    activeLayer: '命令图谱',
     selectors: {
-      命令层: emptySelector(),
-      特性层: emptySelector(),
-      任务层: emptySelector(),
-      业务层: emptySelector(),
+      命令图谱: emptySelector(),
+      特性图谱: emptySelector(),
+      业务图谱: emptySelector(),
     },
     listCache: new Map(),
-    pages: { 命令层: 1, 特性层: 1, 任务层: 1, 业务层: 1 },
+    pages: { 命令图谱: 1, 特性图谱: 1, 业务图谱: 1 },
   }
 }
 
@@ -178,11 +191,11 @@ async function syncTo(id: string, forceVersion?: string): Promise<void> {
   const srcVersion = viewVersion.value || '' // 起点版本上下文（跳转时机捕获）
   try {
     const obj = await getObject(id)
-    const layer = TYPE_TO_UI[obj.type] ?? '命令层'
+    const layer = TYPE_TO_UI[obj.type] ?? '命令图谱'
     state.activeLayer = layer
     const sel = state.selectors[layer]
 
-    if (layer === '业务层') {
+    if (layer === '业务图谱') {
       sel.domain = obj.domain ?? ''
       sel.scenario = obj.scenario ?? ''
       sel.nf = ''
@@ -245,6 +258,7 @@ export function useNav() {
     UI_LAYERS,
     UI_LAYER_TYPES,
     TYPE_TO_UI,
+    STATS_LAYER_KEY,
     // 操作
     selectLayer,
     loadList,

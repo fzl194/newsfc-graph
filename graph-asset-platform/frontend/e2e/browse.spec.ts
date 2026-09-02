@@ -12,7 +12,7 @@ test.describe('图谱浏览 · 版本切换', () => {
   })
 
   test('默认层列表加载并显示总数', async ({ page }) => {
-    await expect(page.getByRole('button', { name: /命令层/ })).toBeVisible()
+    await expect(page.getByRole('button', { name: /命令图谱/ })).toBeVisible()
     // footer 显示「共 N 项」（X-Total-Count）
     await expect(page.locator('.footer-text').first()).toContainText(/共 \d+ 项/)
   })

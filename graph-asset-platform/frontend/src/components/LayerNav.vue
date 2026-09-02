@@ -1,6 +1,6 @@
 <template>
   <div class="layer-nav">
-    <!-- 顶部 4 个 UI 层 Tab -->
+    <!-- 顶部 3 个图谱 Tab（命令/特性/业务；业务=任务+业务对象合并） -->
     <div class="layer-tabs">
       <button
         v-for="l in UI_LAYERS"
@@ -16,7 +16,30 @@
 
     <!-- 当前层选择器 -->
     <div class="selectors">
-      <template v-if="state.activeLayer === '业务层'">
+      <template v-if="state.activeLayer === '业务图谱'">
+        <!-- 任务+业务合并展示（2026-09-03）：类型收窄 + 任务类网元 + 业务类域/场景 -->
+        <el-select
+          v-if="typeOptions.length > 1"
+          v-model="sel.type"
+          placeholder="类型"
+          size="small"
+          clearable
+          class="sel sel-type"
+          @change="onSelectorChange"
+        >
+          <el-option v-for="t in typeOptions" :key="t.value" :label="t.label" :value="t.value" />
+        </el-select>
+        <el-select
+          v-model="sel.nf"
+          placeholder="网元（任务类）"
+          size="small"
+          filterable
+          clearable
+          class="sel"
+          @change="onNfChange"
+        >
+          <el-option v-for="n in nfOptions" :key="n" :label="n" :value="n" />
+        </el-select>
         <el-select
           v-model="sel.domain"
           placeholder="域"
@@ -38,17 +61,6 @@
           @change="onSelectorChange"
         >
           <el-option v-for="s in scenarioOptions" :key="s" :label="s" :value="s" />
-        </el-select>
-        <el-select
-          v-if="typeOptions.length > 1"
-          v-model="sel.type"
-          placeholder="类型"
-          size="small"
-          clearable
-          class="sel"
-          @change="onSelectorChange"
-        >
-          <el-option v-for="t in typeOptions" :key="t.value" :label="t.label" :value="t.value" />
         </el-select>
       </template>
       <template v-else>
@@ -146,7 +158,7 @@
 import { computed, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElSelect, ElOption, ElInput, ElTag } from 'element-plus'
 import type { Column, TableV2Instance } from 'element-plus'
-import { useNav, UI_LAYERS, UI_LAYER_TYPES, type UiLayer } from '../composables/useNav'
+import { useNav, UI_LAYERS, UI_LAYER_TYPES, STATS_LAYER_KEY, type UiLayer } from '../composables/useNav'
 import { stats, type ObjectRow, type Stats } from '../api'
 
 const { state, selectedId, viewVersion, loading, loadError, selectLayer, loadList } = useNav()
@@ -170,11 +182,12 @@ const sel = computed(() => state.selectors[state.activeLayer])
 
 // 选项来源
 const nfOptions = computed(() => {
-  const layer = state.activeLayer
-  const perNf = globalStats.value?.per_layer_per_nf?.[layer] ?? {}
-  // 优先用 stats 里该层有计数的网元；否则回退到 nfs 全量
-  const fromStats = Object.keys(perNf)
-  if (fromStats.length > 0) return fromStats.sort()
+  // stats 聚合键仍是旧 4 层名 → 经 STATS_LAYER_KEY 映射（业务图谱=任务层∪业务层）
+  const keys = STATS_LAYER_KEY[state.activeLayer] ?? [state.activeLayer]
+  const perNfAll = globalStats.value?.per_layer_per_nf ?? {}
+  const nfs = new Set<string>()
+  for (const k of keys) Object.keys(perNfAll[k] ?? {}).forEach((n) => nfs.add(n))
+  if (nfs.size > 0) return Array.from(nfs).sort()
   return globalStats.value?.nfs ?? []
 })
 
@@ -448,9 +461,10 @@ watch(
 // 但若同层内点选，selectedId 变化无需重建列表。此处不再额外 watch listCache（Map 写入不触发响应式）。
 // loadList 的结果由 ensureLoaded/loadMore 内部 await 后直接 rebuildAccumulated 处理。
 
-// ---------- 层计数 chip ----------
+// ---------- 层计数 chip（旧 stats 键映射；业务图谱=任务层+业务层求和） ----------
 function layerCount(l: UiLayer): number {
-  return globalStats.value?.per_layer?.[l] ?? 0
+  const perLayer = globalStats.value?.per_layer ?? {}
+  return (STATS_LAYER_KEY[l] ?? [l]).reduce((s, k) => s + (perLayer[k] ?? 0), 0)
 }
 
 const SearchIcon = () =>

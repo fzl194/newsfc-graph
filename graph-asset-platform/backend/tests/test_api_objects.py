@@ -315,3 +315,44 @@ def test_stats_per_domain_scenario(tmp_data_dir, monkeypatch):
         assert s["per_domain_scenario"]["demo"]["demo-scenario"] == 2
         # 业务层计数 = 3
         assert s["per_layer"]["业务层"] == 3
+
+
+def test_list_objects_graph_layer_alias(tmp_data_dir, monkeypatch):
+    """三图谱层别名（2026-09-03，仅图谱浏览页使用；旧 4 层名不动）：
+    业务图谱 = 任务层 + 业务层联合；命令图谱/特性图谱与旧层等价。"""
+    feat = (
+        "---\n"
+        "id: alpha@Feature@F-1\n"
+        "type: Feature\n"
+        "nf: alpha\n"
+        "version: 20.15.2\n"
+        "---\n"
+        "# F-1\n"
+    )
+    atom = (
+        "---\n"
+        "id: alpha@AtomTask@T-1\n"
+        "type: AtomTask\n"
+        "nf: alpha\n"
+        "---\n"
+        "# T-1\n"
+    )
+    biz = (
+        "---\n"
+        "id: alpha@BusinessDomain@D-1\n"
+        "type: BusinessDomain\n"
+        "domain: demo\n"
+        "---\n"
+        "# D-1\n"
+    )
+    _setup(tmp_data_dir, monkeypatch,
+           {"cmd.md": CMD_EDGES, "cfg.md": CFG, "feat.md": feat,
+            "atom.md": atom, "biz.md": biz})
+    with TestClient(app) as c:
+        rows = c.get("/api/v1/objects", params={"layer": "业务图谱"}, headers=H).json()
+        types = {r["type"] for r in rows}
+        assert types == {"AtomTask", "BusinessDomain"}  # 不含命令/特性
+        rows2 = c.get("/api/v1/objects", params={"layer": "命令图谱"}, headers=H).json()
+        assert {r["type"] for r in rows2} == {"MMLCommand", "ConfigObject"}
+        rows3 = c.get("/api/v1/objects", params={"layer": "特性图谱"}, headers=H).json()
+        assert {r["type"] for r in rows3} == {"Feature"}

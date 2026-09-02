@@ -28,6 +28,16 @@ UI_LAYER_TYPES = {
     "业务层": ["BusinessDomain", "NetworkScenario", "ConfigurationSolution"],
 }
 
+# 图谱浏览页三 Tab 别名（2026-09-03，用户决策：**仅浏览页**改名 + 任务/业务合并
+# 展示；与统计页口径一致）。纯增量——旧 4 层名保留不动（旧 /stats 聚合键、
+# tests-module 关联图谱分组、e2e、MCP 说明均继续用旧名），/objects?layer= 新旧都收。
+UI_LAYERS_GRAPH = ["命令图谱", "特性图谱", "业务图谱"]
+UI_LAYER_TYPES.update({
+    "命令图谱": UI_LAYER_TYPES["命令层"],
+    "特性图谱": UI_LAYER_TYPES["特性层"],
+    "业务图谱": UI_LAYER_TYPES["任务层"] + UI_LAYER_TYPES["业务层"],
+})
+
 
 def ui_layer_of(registry_layer: Optional[str]) -> str:
     """registry 层 → UI 层；未注册的层原样返回（不丢数据）。"""
