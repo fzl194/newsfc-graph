@@ -7,10 +7,9 @@
           { label: '命令知识条数（A1）', value: sum?.knowledge.MMLCommand ?? 0 },
           { label: '配置对象知识条数（A2）', value: sum?.knowledge.ConfigObject ?? 0 },
         ]" accent="#4f46e5" hint="objects 行数，多版本各计一次" />
-      <StatCard title="知识关联出边" :total="sum?.edges.merged_total ?? 0" total-label="合并边数（A4）"
-        :details="mergedDetails" accent="#0ea5e9" hint="成对方向合并取大（§7.1）" />
-      <StatCard title="被引用入边" :total="inboundTotal" total-label="跨图谱入边（A5）"
-        :details="inboundDetails" accent="#8b5cf6" hint="特性/任务指向命令图谱" />
+      <StatCard title="知识关联边" :total="sum?.edges.merged_total ?? 0" total-label="合并边数（A4）"
+        :details="mergedDetails" accent="#0ea5e9"
+        hint="成对方向合并取大；跨图谱边归出边方，三图谱合计=全库边" />
       <StatCard title="五类核查规则" :total="sum?.five_total ?? 0" total-label="合计（B8）"
         :details="ruleDetails" accent="#10b981" hint="图/重复/MOD/SET/删除 各表行数" />
     </div>
@@ -103,7 +102,7 @@
         </el-table-column>
         <el-table-column prop="type" label="类型" width="130" sortable="custom">
           <template #header>
-            <span title="命令数量=语法表 DISTINCT CMD_NAME；参数数量=语法表行数；五类=各规则表行数">类型</span>
+            <span title="命令数量=语法表各(网元,版本)组命令数求和（不去重，同命令跨版本重复计）；参数数量=语法表行数；五类=各规则表行数">类型</span>
           </template>
         </el-table-column>
         <el-table-column prop="count" label="数量" sortable="custom" align="right">
@@ -161,10 +160,6 @@ const ruleTotal = computed(() => rules.value.total)
 
 const mergedDetails = computed(() =>
   (sum.value?.edges.merged ?? []).slice(0, 6).map(([label, value]) => ({ label, value })))
-const inbound = computed(() => sum.value?.inbound.raw ?? [])
-const inboundTotal = computed(() => inbound.value.reduce((s, [, v]) => s + v, 0))
-const inboundDetails = computed(() =>
-  inbound.value.slice(0, 6).map(([label, value]) => ({ label, value })))
 const ruleDetails = computed(() => {
   const r = sum.value?.rules ?? {}
   return (['graph', 'repeat', 'mod', 'set', 'delete'] as const)

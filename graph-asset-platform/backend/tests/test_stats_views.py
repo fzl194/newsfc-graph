@@ -139,6 +139,7 @@ def _seed_rules(conn):
         ("CMD_B", "1", "UPCF", "20.10.2"),
         ("CMD_X", "1", "UDG", "20.10.2"), ("CMD_X", "2", "UDG", "20.10.2"),
         ("CMD_A", "3", "UNC", "20.10.2"),
+        ("CMD_B", "9", "UPCF", "20.16.2"),
     ]
     conn.executemany(
         'INSERT INTO "B_AI_COMMAND_SYNTAX_CHECK_RULES"("CMD_NAME","PARAM_ID",'
@@ -202,8 +203,7 @@ def test_command_summary_full(seeded):
     merged = dict(d["edges"]["merged"])
     assert merged["操作配置对象/被操作"] == 3
     assert d["edges"]["merged_total"] == 4
-    inbound = dict(d["inbound"]["raw"])
-    assert inbound == {"使用命令": 2, "对应命令": 1, "复用命令": 1}  # 跨图谱入边
+    assert "inbound" not in d  # A5 被引用入边卡已删（2026-09-03）
     assert "syntax" not in d["rules"]  # 命令/参数卡片已删（数值进规则表类型维度）
     assert d["rules"]["graph"] == 3
     assert d["five_total"] == 9
@@ -276,6 +276,8 @@ def test_command_rules_long_table(seeded):
     # 物理级语法行 ×3 网元（每网元 命令+参数 两行）
     assert m[("UPCF", "", "20.10.2", "命令数量")] == 2
     assert m[("UPCF", "", "20.10.2", "参数数量")] == 3
+    assert m[("UPCF", "", "20.16.2", "命令数量")] == 1  # CMD_B 跨版本
+    assert m[("UPCF", "", "20.16.2", "参数数量")] == 1
     assert m[("UDG", "", "20.10.2", "命令数量")] == 1
     assert m[("UNC", "", "20.10.2", "命令数量")] == 1
     assert m[("UNC", "", "20.10.2", "参数数量")] == 1
@@ -286,26 +288,27 @@ def test_command_rules_long_table(seeded):
     # 五类行
     assert m[("UPCF", "", "20.10.2", "图规则")] == 2
     assert m[("UDG", "", "20.10.2", "删除规则")] == 1
-    assert d["total"] == 14  # 3 物理级语法×2 + SMF 逻辑×2 + 五类 6
+    assert d["total"] == 16  # 4 物理级语法槽×2 + SMF 逻辑×2 + 五类 6
 
 
 def test_command_rules_modes(seeded):
     d = _get("/api/v1/stats/command/rules?mode=ne")
     m = {(r["ne"], r["type"]): r["count"] for r in d["rows"]}
-    assert m[("UPCF", "命令数量")] == 2 and m[("UPCF", "参数数量")] == 3
+    # 命令不去重（分组求和）：UPCF = 20.10.2 的 2 条 + 20.16.2 的 1 条（CMD_B 跨版本重复计）
+    assert m[("UPCF", "命令数量")] == 3 and m[("UPCF", "参数数量")] == 4
     assert m[("UNC", "命令数量")] == 1
     assert not any(r["logical"] for r in d["rows"])  # 汇总模式无逻辑维度
     d2 = _get("/api/v1/stats/command/rules?mode=all")
     m2 = {r["type"]: r["count"] for r in d2["rows"]}
-    assert (m2["命令数量"], m2["参数数量"]) == (3, 6)  # 全局 DISTINCT=3，行数=6
+    assert (m2["命令数量"], m2["参数数量"]) == (5, 7)  # 分组求和 2+1+1+1=5；行数 7
     assert m2["图规则"] == 3
     assert d2["total"] == 7
 
 
 def test_command_rules_filters(seeded):
-    # 类型筛选：只看命令数量 → 3 物理级 + 1 逻辑行
+    # 类型筛选：只看命令数量 → 4 物理级 + 1 逻辑行
     d = _get("/api/v1/stats/command/rules?rule_types=cmd")
-    assert d["total"] == 4
+    assert d["total"] == 5
     assert {r["type"] for r in d["rows"]} == {"命令数量"}
     # 逻辑网元筛选：语法行只剩该逻辑网元行，五类不受影响
     d2 = _get("/api/v1/stats/command/rules?logical_ne=SMF")
@@ -313,11 +316,12 @@ def test_command_rules_filters(seeded):
     assert {(r["ne"], r["logical"], r["type"], r["count"]) for r in syn} == {
         ("UNC", "SMF", "命令数量", 1), ("UNC", "SMF", "参数数量", 1)}
     assert sum(1 for r in d2["rows"] if r["type"] == "图规则") == 2
-    # 版本筛选
-    assert _get("/api/v1/stats/command/rules?versions=20.16.2")["total"] == 0
+    # 版本筛选（UPCF 20.16.2 有语法行：命令+参数 2 行；五类无）
+    d4 = _get("/api/v1/stats/command/rules?versions=20.16.2")
+    assert d4["total"] == 2
     # 分页
     d3 = _get("/api/v1/stats/command/rules?page=2&size=5")
-    assert len(d3["rows"]) == 5 and d3["total"] == 14
+    assert len(d3["rows"]) == 5 and d3["total"] == 16
 
 
 def test_cache_refresh(seeded):

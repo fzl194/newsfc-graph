@@ -13,8 +13,9 @@
           { label: '特性任务 FeatureTask（D5）', value: d?.counts.feature_tasks ?? 0 },
           { label: '步骤任务 CompoundTask（D6）', value: d?.counts.compound_tasks ?? 0 },
         ]" accent="#0ea5e9" />
-      <StatCard title="知识关联出边" :total="d?.edges.merged_total ?? 0" total-label="合并边数"
-        :details="groupDetails" accent="#8b5cf6" hint="上下游/场景/域 成对合并取大" />
+      <StatCard title="知识关联边" :total="d?.edges.merged_total ?? 0" total-label="合并边数"
+        :details="groupDetails" accent="#8b5cf6"
+        hint="上下游/场景/域 成对合并取大；跨图谱边归出边方，三图谱合计=全库边" />
     </div>
 
     <section class="blk">

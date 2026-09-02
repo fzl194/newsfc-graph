@@ -348,8 +348,8 @@ export interface StatsCacheStatus {
 
 export interface CommandSummary {
   knowledge: { MMLCommand: number; ConfigObject: number; points: number }
+  /** 知识关联边（按出边方归属；三图谱合计 = 全库边，跨层一致） */
   edges: EdgesBlock
-  inbound: { raw: [string, number][] }
   /** 五类规则计数（命令/参数卡片已删，数值在规则表类型维度） */
   rules: {
     graph?: number

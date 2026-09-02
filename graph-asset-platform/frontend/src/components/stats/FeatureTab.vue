@@ -8,8 +8,9 @@
       <StatCard title="License 数量" :total="sum?.license_count ?? 0" total-label="License 知识条数"
         :details="[{ label: '覆盖 License 编号（跨版本合并计）', value: sum?.license_codes ?? 0 }]"
         accent="#0ea5e9" hint="多版本各计一条；编号跨版本合并后去重" />
-      <StatCard title="知识关联出边" :total="sum?.edges.merged_total ?? 0" total-label="合并边数（C5）"
-        :details="mergedDetails" accent="#8b5cf6" hint="包含子文档/属于特性 合并取大" />
+      <StatCard title="知识关联边" :total="sum?.edges.merged_total ?? 0" total-label="合并边数（C5）"
+        :details="mergedDetails" accent="#8b5cf6"
+        hint="包含子文档/属于特性 合并取大；跨图谱边归出边方，三图谱合计=全库边" />
     </div>
 
     <!-- ② 筛选条 -->

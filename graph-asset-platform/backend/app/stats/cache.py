@@ -88,8 +88,9 @@ def _build() -> dict:
     f = Filters()
     # 出/入边按 槽位×关系（供筛选后重组 merged 计数；知识行的出/入边合计由此求和）
     edges_out = core.edges_out_by_slot_rel(conn, COMMAND_TYPES)
-    edges_in = core.edges_in_by_slot_rel(conn, COMMAND_TYPES)              # 跨图谱（A5 卡）
-    edges_in_all = core.edges_in_by_slot_rel(conn, COMMAND_TYPES, cross_only=False)  # 全量（知识表入边列）
+    # 全量入边（知识表"入边数"列）。A5 跨图谱入边卡已删（2026-09-03 用户决策），
+    # 对应重查询（NOT EXISTS）随之移除——三图谱边卡按出边方归属，合计=全库边。
+    edges_in_all = core.edges_in_by_slot_rel(conn, COMMAND_TYPES, cross_only=False)
     out_map = {s: sum(rels.values()) for s, rels in edges_out.items()}
     in_map = {s: sum(rels.values()) for s, rels in edges_in_all.items()}
     # 知识行（含出/入边并入）
@@ -123,7 +124,7 @@ def _build() -> dict:
     return {
         "built_at": time.time(),
         "knowledge": knowledge,
-        "edges_out": edges_out, "edges_in": edges_in, "edges_in_all": edges_in_all,
+        "edges_out": edges_out, "edges_in_all": edges_in_all,
         "syntax_nv": syntax_nv, "lne_rows": lne_rows,
         "five_nv": five_nv,
         "feature": feature, "feature_edges": feature_edges,
@@ -183,12 +184,9 @@ def command_summary(f: Filters) -> dict:
     a2 = sum(r["ConfigObject"] for r in rows)
     slots = {(r["nf"], r["version"]) for r in rows}
     out_raw: dict[str, int] = {}
-    in_raw: dict[str, int] = {}
     for s in slots:
         for rel, n in d["edges_out"].get(s, {}).items():
             out_raw[rel] = out_raw.get(rel, 0) + n
-        for rel, n in d["edges_in"].get(s, {}).items():
-            in_raw[rel] = in_raw.get(rel, 0) + n
     merged, merged_total = merge_relations(out_raw)
     five: dict[str, int] = {}
     for k in RULE_TABLES:
@@ -202,7 +200,6 @@ def command_summary(f: Filters) -> dict:
             "merged": sorted(merged.items(), key=lambda kv: -kv[1]),
             "merged_total": merged_total,
         },
-        "inbound": {"raw": sorted(in_raw.items(), key=lambda kv: -kv[1])},
         "rules": five, "five_total": sum(five.values()),
     }
 
@@ -277,20 +274,22 @@ def command_rules(f: Filters, mode: str = "ne_version", page: int = 1,
                 if "param" in sel:
                     rows.append({**base, "type": "参数数量", "count": r["params"]})
             return
-        # 仅网元 / 仅版本 / 总计：集合并集推导 DISTINCT
+        # 仅网元 / 仅版本 / 总计：**命令不去重**（用户决策 2026-09-03）——分组
+        # 求和口径：各 (网元,版本) 组的命令数直接累加，同命令跨版本重复计
+        # （需求书 §5.1 B1 的"分组求和"口径，替代原集合并集去重）
         buckets: dict[str, dict] = {}
         for (ne, ver), cell in d["syntax_nv"].items():
             if not (_nf_match_rule(f, ne) and _ver_match(f, ver)):
                 continue
             key = {"ne": ne, "version": ver, "all": ""}[granularity]
-            b = buckets.setdefault(key, {"cmds": set(), "params": 0})
-            b["cmds"] |= cell["cmds"]
+            b = buckets.setdefault(key, {"cmd_sum": 0, "params": 0})
+            b["cmd_sum"] += len(cell["cmds"])
             b["params"] += cell["params"]
         for key, b in buckets.items():
             base = {"ne": key if granularity == "ne" else "",
                     "logical": "", "version": key if granularity == "version" else ""}
             if "cmd" in sel:
-                rows.append({**base, "type": "命令数量", "count": len(b["cmds"])})
+                rows.append({**base, "type": "命令数量", "count": b["cmd_sum"]})
             if "param" in sel:
                 rows.append({**base, "type": "参数数量", "count": b["params"]})
 
