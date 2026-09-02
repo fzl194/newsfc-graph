@@ -16,7 +16,7 @@
         </div>
       </header>
 
-      <!-- 三层图谱进展总览（stats_overview.json 手动维护；管理员可编辑） -->
+      <!-- 三层图谱进展总览（stats_overview.json 配置驱动；管理员可编辑） -->
       <section v-if="overview?.available && overview.config" class="overview stagger-in">
         <p v-if="overview.config.description" class="ov-desc">
           {{ overview.config.description }}
@@ -77,10 +77,10 @@
     </div>
   </div>
 
-  <!-- 管理员：总览编辑（JSON，等价手改 stats_overview.json） -->
+  <!-- 管理员：总览编辑（JSON 配置） -->
   <el-dialog v-model="editVisible" title="编辑三层图谱进展总览" width="720px">
     <p class="edit-hint">
-      完整 JSON 直接改（等价手改服务器 platform-data/stats_overview.json）。
+      三层图谱建设进展配置（存储于服务器配置文件）。
       cards 数量不限（建议 3 张对应三图谱）；每条指标 value 支持数字或文本，
       带 <code>progress</code>（0~100）会渲染进度条。保存时服务端校验。
     </p>
@@ -109,7 +109,7 @@ const admin = isAdmin()
 
 // 空配置模板（编辑弹窗 placeholder，也是首次配置的起点）
 const TEMPLATE = JSON.stringify({
-  description: '三层图谱建设进展总览（手动维护）。',
+  description: '三层图谱建设进展总览。',
   updated_at: '2026-09-03',
   cards: [
     {

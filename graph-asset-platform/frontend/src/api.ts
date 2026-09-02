@@ -470,7 +470,7 @@ export const statsFeatureMatrix = (p: StatsFilterParams = {}, page = 1, size = 2
 export const statsBusinessOverview = (): Promise<BusinessOverview> =>
   _req<BusinessOverview>(`${BASE}/stats/business/overview`)
 
-// 三层图谱进展总览（stats_overview.json，手动维护；管理员可页编辑）
+// 三层图谱进展总览（stats_overview.json 配置驱动；管理员可页编辑）
 export interface OverviewMetric {
   label: string
   value: string | number
