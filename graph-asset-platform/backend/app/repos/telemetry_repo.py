@@ -27,21 +27,39 @@ def _cutoff_iso(days: int):
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat() if days > 0 else None
 
 
-def aggregate_stats(conn: sqlite3.Connection, days: int = 30) -> dict:
+def _norm_bound(t: str, *, is_end: bool) -> str:
+    """时间窗边界归一：纯日期（YYYY-MM-DD，len 10）→ 起点补 T00:00:00 /
+    终点补 T23:59:59（ts 为完整 ISO8601，字典序比较需同量级——裸日期当终点
+    会把当天的完整时间戳全部排除）。"""
+    t = (t or "").strip()
+    if len(t) == 10:
+        return f"{t}T23:59:59" if is_end else f"{t}T00:00:00"
+    return t
+
+
+def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
+                    start: str = "", end: str = "") -> dict:
     """level=object + caller∈{skill,mcp} + endpoint∈取用口径，按 type/id/user/
     operator/session + 小时桶。小时桶在 Python 算（SQLite strftime 不认 ISO 带时区 T 格式）。
 
     占位符动态生成（对抗审查 B4：SQL `IN (?,?)` 写死与 _STATS_ENDPOINTS 扩容不匹配）。
+    时间窗（2026-09-03，外部系统对接）：``start``/``end``（ISO8601 或纯日期，
+    纯日期归一为当天起止；可只给一端）优先于 ``days``（近 N 天）。
     """
     ep_ph = ",".join("?" * len(_STATS_ENDPOINTS))
     ca_ph = ",".join("?" * len(_STATS_CALLERS))
     sql = (f"SELECT obj_type, obj_id, user, operator, session_id, ts FROM telemetry "
            f"WHERE level='object' AND caller IN ({ca_ph}) AND endpoint IN ({ep_ph})")
     params = [*list(_STATS_CALLERS), *list(_STATS_ENDPOINTS)]
-    c = _cutoff_iso(days)
+    start = _norm_bound(start, is_end=False)
+    end = _norm_bound(end, is_end=True)
+    c = start if start else _cutoff_iso(days)
     if c:
         sql += " AND ts >= ?"
         params.append(c)
+    if end:
+        sql += " AND ts <= ?"
+        params.append(end)
     by_type, by_id, id_type, by_user, by_operator, by_hour, sessions = {}, {}, {}, {}, {}, {}, set()
     for r in conn.execute(sql, params).fetchall():
         t = r["obj_type"] or "?"
@@ -87,19 +105,25 @@ def _parse_cursor(since: str) -> tuple[str, int]:
     return since, 0
 
 
-def list_skill_usage(conn: sqlite3.Connection, since: str = "", limit: int = 1000) -> dict:
+def list_skill_usage(conn: sqlite3.Connection, since: str = "", limit: int = 1000,
+                     start: str = "", end: str = "") -> dict:
     """取用明细增量流（与 ``aggregate_stats`` 同口径，返回原始明细行）。
 
     ts 存 ISO8601 UTC，字典序=时间序。游标语义（next_since 不透明，消费方原样回传）：
-      - since 留空 → 全量起点；
+      - since 留空 → 以 ``start``（若有）为起点，否则全量起点；
       - 纯 ISO8601 → ``ts >= 该时间``（含边界起点，便于按时间引导/过滤）；
       - 'ts|rowid' → ``(ts, rowid)`` 精确推进位，跨同 ts 行不卡死、不重复。
+    时间窗（2026-09-03，外部系统对接）：``start``/``end``（ISO8601 或纯日期，
+    纯日期归一为当天起止）限定窗口；``end`` 上界在翻页 WHERE 中持续生效，
+    与游标可并用（首轮 since 空 + start/end，后续轮原样回传 next_since）。
     取 limit+1 行判断 has_more，返回前 limit 行；无行时 next_since 回填 since。
     """
     ep_ph = ",".join("?" * len(_STATS_ENDPOINTS))
     ca_ph = ",".join("?" * len(_STATS_CALLERS))
     where = [f"level='object'", f"caller IN ({ca_ph})", f"endpoint IN ({ep_ph})"]
     params = [*list(_STATS_CALLERS), *list(_STATS_ENDPOINTS)]
+    start = _norm_bound(start, is_end=False)
+    end = _norm_bound(end, is_end=True)
     if since:
         cur_ts, cur_rowid = _parse_cursor(since)
         if cur_rowid > 0:
@@ -108,6 +132,12 @@ def list_skill_usage(conn: sqlite3.Connection, since: str = "", limit: int = 100
         else:
             where.append("ts >= ?")
             params.append(cur_ts)
+    elif start:
+        where.append("ts >= ?")
+        params.append(start)
+    if end:
+        where.append("ts <= ?")
+        params.append(end)
     sql = ("SELECT ts, endpoint, obj_id, obj_type, user, operator, session_id, rowid FROM telemetry "
            "WHERE " + " AND ".join(where) + " ORDER BY ts ASC, rowid ASC LIMIT ?")
     params.append(limit + 1)

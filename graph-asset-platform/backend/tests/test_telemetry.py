@@ -252,3 +252,47 @@ def test_list_skill_usage_tie_ts_advances_without_dup(tmp_path, monkeypatch):
             break
     assert seen == ["O0", "O1", "O2", "O3", "O4"]  # 无重复，全部推进
     assert rounds == 3  # 2+2+1
+
+
+# ---------- 时间窗（2026-09-03，外部系统对接：start/end 优先于 days）----------
+
+def _win_seed(db):
+    _seed(db, [
+        {"ts": "2026-08-31T10:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "id": "AUG31", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T08:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "id": "SEP1_AM", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T20:00:00+00:00", "user": "sk", "operator": "", "caller": "mcp",
+         "endpoint": "mcp:get_md", "id": "SEP1_PM", "type": "MMLCommand", "level": "object"},
+        {"ts": "2026-09-02T09:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "id": "SEP2", "type": "Feature", "level": "object"},
+    ])
+
+
+def test_stats_time_window(tmp_path, monkeypatch):
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    _win_seed(db)
+    from app.telemetry.aggregator import aggregate_stats
+    # 纯日期窗口：2026-09-01 当天（含 mcp 行）= 2；days 被忽略（否则全 4 条也含 8/31）
+    r = aggregate_stats(days=365, start="2026-09-01", end="2026-09-01")
+    assert {i["id"] for i in r["top_ids"]} == {"SEP1_AM", "SEP1_PM"}
+    # 只给起点：09-01 起 3 条
+    assert aggregate_stats(start="2026-09-01")["total"] == 3
+    # 只给终点：09-01 前 1 条
+    assert aggregate_stats(end="2026-08-31")["total"] == 1
+
+
+def test_skill_usage_time_window_and_paging(tmp_path, monkeypatch):
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    _win_seed(db)
+    from app.telemetry.aggregator import list_skill_usage
+    # 窗口首轮：09-01~09-02 共 3 条；limit=2 翻页，end 上界全程生效
+    r = list_skill_usage(limit=2, start="2026-09-01", end="2026-09-02")
+    assert [e["obj_id"] for e in r["events"]] == ["SEP1_AM", "SEP1_PM"]
+    assert r["has_more"] is True
+    r2 = list_skill_usage(since=r["next_since"], limit=2,
+                          start="2026-09-01", end="2026-09-02")
+    assert [e["obj_id"] for e in r2["events"]] == ["SEP2"]
+    assert r2["has_more"] is False
+    # 无窗口 + 全量起点 = 4 条
+    assert list_skill_usage(limit=10)["next_since"] != ""
