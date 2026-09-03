@@ -13,9 +13,10 @@ def aggregate_stats(days: int = 30, start: str = "", end: str = "") -> dict:
 
 
 def list_skill_usage(since: str = "", limit: int = 1000,
-                     start: str = "", end: str = "") -> dict:
-    """SKILL 取用明细增量流（原始事件 + next_since 游标 + has_more）。"""
-    return telemetry_repo.list_skill_usage(get_shared_db(), since, limit, start, end)
+                     start: str = "", end: str = "", scope: str = "take") -> dict:
+    """SKILL 取用明细增量流（原始事件 + next_since 游标 + has_more）。
+    scope=all 为底表全量口径（含检索工具与 params/result，2026-09-03）。"""
+    return telemetry_repo.list_skill_usage(get_shared_db(), since, limit, start, end, scope)
 
 
 def aggregate_activity(username: str, days: int = 30) -> list:

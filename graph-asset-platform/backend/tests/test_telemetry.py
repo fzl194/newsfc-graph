@@ -31,6 +31,7 @@ def _seed(db, rows):
             caller=r.get("caller", ""), endpoint=r.get("endpoint", ""),
             obj_id=r.get("id", ""), obj_type=r.get("type", ""),
             user=r.get("user", ""), operator=r.get("operator", ""),
+            params=r.get("params", ""), result=r.get("result", ""),
         )
     db.commit()
 
@@ -296,3 +297,38 @@ def test_skill_usage_time_window_and_paging(tmp_path, monkeypatch):
     assert r2["has_more"] is False
     # 无窗口 + 全量起点 = 4 条
     assert list_skill_usage(limit=10)["next_since"] != ""
+
+
+def test_skill_usage_scope_all_raw_table(tmp_path, monkeypatch):
+    """scope=all 底表：含检索工具 tool 行（params/result/level），take 口径不变。"""
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    _seed(db, [
+        {"ts": "2026-09-01T08:00:00+00:00", "user": "sk", "operator": "E1", "caller": "skill",
+         "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T09:00:00+00:00", "user": "sk", "operator": "E1", "caller": "mcp",
+         "endpoint": "mcp:search_objects", "level": "tool", "params": '{"q": "AMF", "layer": "命令图谱"}',
+         "result": '{"total": 12, "returned": 12, "top_ids": ["A", "B"]}'},
+        {"ts": "2026-09-01T10:00:00+00:00", "user": "sk", "operator": "E1", "caller": "mcp",
+         "endpoint": "mcp:search_md", "level": "tool", "params": '{"q": "扩容"}',
+         "result": '{"total": 3, "returned": 3}'},
+    ])
+    from app.telemetry.aggregator import list_skill_usage
+    # take（默认）：只有对象级行
+    take = list_skill_usage(limit=10)
+    assert [e["endpoint"] for e in take["events"]] == ["/md"]
+    assert "params" not in take["events"][0]
+    # all：3 行全出，tool 行带 level/params/result（解析回对象）
+    allr = list_skill_usage(limit=10, scope="all")
+    eps = [e["endpoint"] for e in allr["events"]]
+    assert eps == ["/md", "mcp:search_objects", "mcp:search_md"]
+    so = allr["events"][1]
+    assert so["level"] == "tool" and so["obj_id"] == ""
+    assert so["params"] == {"q": "AMF", "layer": "命令图谱"}
+    assert so["result"]["total"] == 12
+    assert allr["events"][0]["level"] == "object"
+    # 时间窗 + all 翻页 end 持续生效
+    r1 = list_skill_usage(limit=2, scope="all", start="2026-09-01", end="2026-09-01")
+    assert len(r1["events"]) == 2 and r1["has_more"] is True
+    r2 = list_skill_usage(since=r1["next_since"], limit=2, scope="all",
+                          start="2026-09-01", end="2026-09-01")
+    assert [e["endpoint"] for e in r2["events"]] == ["mcp:search_md"]

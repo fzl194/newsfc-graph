@@ -21,13 +21,17 @@ def telemetry_skill_usage(
     limit: int = Query(default=1000, ge=1, le=10000, description="单批最大行数"),
     start: str = Query(default="", description="时间窗起点（ISO8601 或纯日期；首轮 since 空时生效）"),
     end: str = Query(default="", description="时间窗终点（ISO8601 或纯日期=含当天）；翻页全程生效"),
+    scope: str = Query(default="take", description="take=取用口径（默认，4 端点对象级）；all=底表全量（暴露面 7 端点，含检索工具的 params/result 与 level 字段，供离线分析）"),
 ):
-    """SKILL 取用明细增量流（供外部系统对接）。
+    """SKILL 取用明细增量流 / 底表导出（供外部系统对接）。
 
-    口径同 stats（level=object + caller∈{skill,mcp} + endpoint∈取用四端点），返回原始明细而非聚合：
-    {events:[{ts, endpoint, obj_id, obj_type, user, operator, session_id}], next_since, has_more}。
-    消费方把本批 next_since 作为下次 since 原样回传，即可增量推进（next_since 为不透明游标）。
-    时间窗用法（2026-09-03）：?start=2026-09-01&end=2026-09-02 首轮拉取，翻页时
-    原样回传 next_since 并**继续携带 start/end**（end 上界全程生效）。
+    - scope=take（默认，向后兼容）：取用口径 4 端点（/md、/domains、
+      mcp:get_md、mcp:get_domains）的对象级行；
+    - scope=all：**底表全量**——暴露面全部调用（+ mcp:search_objects /
+      mcp:search_md / mcp:get_object），level 含 object+tool；tool 行带
+      params（业务入参）/result（输出摘要）与 level 字段。
+
+    输出：{events:[...], next_since, has_more}。消费方把本批 next_since 作为下次
+    since 原样回传即可增量推进（翻页时继续携带 start/end/scope）。
     """
-    return list_skill_usage(since, limit, start, end)
+    return list_skill_usage(since, limit, start, end, scope)
