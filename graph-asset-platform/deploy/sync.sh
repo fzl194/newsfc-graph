@@ -141,10 +141,14 @@ cmd_apply() {
 
     mkdir -p backend frontend
     SWAP_ACTIVE=true
-    # 备份旧目录 → 换新 → 成功后清备份（中断由 trap 回滚）
+    # 首次部署（内网无 backend/ frontend/ 子目录）：mkdir -p 创建的是空目录，
+    # 直接 mv 会把源移进"空目录名"里——frontend/dist 移进 frontend/ 变成
+    # frontend/frontend/dist/... 嵌套错位。先清空目标子目录（不动同级其它文件），
+    # 旧文件改名备份可选。
     rm -rf backend/app.old frontend/dist.old
-    [ -d backend/app ] && mv backend/app backend/app.old
-    [ -d frontend/dist ] && mv frontend/dist frontend/dist.old
+    [ -d backend/app ] && [ -n "$(ls -A backend/app 2>/dev/null)" ] && mv backend/app backend/app.old
+    [ -d frontend/dist ] && [ -n "$(ls -A frontend/dist 2>/dev/null)" ] && mv frontend/dist frontend/dist.old
+    rm -rf backend/app frontend/dist 2>/dev/null || true
     mv "$STAGE_DIR/backend/app" backend/app
     mv "$STAGE_DIR/frontend/dist" frontend/dist
     mkdir -p "$MANIFEST_BASELINE_DIR"
