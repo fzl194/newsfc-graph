@@ -470,6 +470,49 @@ export const statsFeatureMatrix = (p: StatsFilterParams = {}, page = 1, size = 2
 export const statsBusinessOverview = (): Promise<BusinessOverview> =>
   _req<BusinessOverview>(`${BASE}/stats/business/overview`)
 
+// 底表行（2026-09-04 重定口径：call=调用级默认，object=对象级细粒度）
+export interface TelemetryUsageRow {
+  ts: string
+  caller: string
+  endpoint: string
+  obj_id: string
+  obj_type: string
+  user: string
+  operator: string
+  session_id: string
+  level: string
+  params?: unknown
+  result?: unknown
+}
+
+export interface TelemetryUsageQuery {
+  scope?: 'call' | 'object' | 'all'
+  start?: string
+  end?: string
+  endpoint?: string
+  q?: string
+  page?: number
+  size?: number
+}
+
+function usageQs(p: TelemetryUsageQuery): string {
+  const parts: string[] = []
+  if (p.scope) parts.push(`scope=${p.scope}`)
+  if (p.start) parts.push(`start=${encodeURIComponent(p.start)}`)
+  if (p.end) parts.push(`end=${encodeURIComponent(p.end)}`)
+  if (p.endpoint) parts.push(`endpoint=${encodeURIComponent(p.endpoint)}`)
+  if (p.q) parts.push(`q=${encodeURIComponent(p.q)}`)
+  if (p.page) parts.push(`page=${p.page}`)
+  if (p.size) parts.push(`size=${p.size}`)
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
+/** 运维页底表表格：时间倒序 + 服务端分页 + 筛选（粒度/时间/端点/账号工号） */
+export const fetchTelemetryUsage = (
+  p: TelemetryUsageQuery = {},
+): Promise<{ rows: TelemetryUsageRow[]; total: number }> =>
+  _req(`${BASE}/telemetry/usage${usageQs(p)}`)
+
 // 三层图谱进展总览（stats_overview.json 配置驱动；管理员可页编辑）
 export interface OverviewMetric {
   label: string

@@ -21,17 +21,30 @@ def telemetry_skill_usage(
     limit: int = Query(default=1000, ge=1, le=10000, description="单批最大行数"),
     start: str = Query(default="", description="时间窗起点（ISO8601 或纯日期；首轮 since 空时生效）"),
     end: str = Query(default="", description="时间窗终点（ISO8601 或纯日期=含当天）；翻页全程生效"),
-    scope: str = Query(default="take", description="take=取用口径（默认，4 端点对象级）；all=底表全量（暴露面 7 端点，含检索工具的 params/result 与 level 字段，供离线分析）"),
+    scope: str = Query(default="call", description="call=调用级（默认，每次调用 1 行：REST /md、/domains + MCP 5 工具，含 params/result）；object=对象级细粒度（每对象 1 行，单独导出用）；all=两类全含"),
 ):
-    """SKILL 取用明细增量流 / 底表导出（供外部系统对接）。
+    """底表导出（供外部系统对接）。
 
-    - scope=take（默认，向后兼容）：取用口径 4 端点（/md、/domains、
-      mcp:get_md、mcp:get_domains）的对象级行；
-    - scope=all：**底表全量**——暴露面全部调用（+ mcp:search_objects /
-      mcp:search_md / mcp:get_object），level 含 object+tool；tool 行带
-      params（业务入参）/result（输出摘要）与 level 字段。
-
-    输出：{events:[...], next_since, has_more}。消费方把本批 next_since 作为下次
-    since 原样回传即可增量推进（翻页时继续携带 start/end/scope）。
+    输出：{events:[{ts, caller, endpoint, obj_id, obj_type, user, operator,
+    session_id, level, params, result}], next_since, has_more}（ts 升序）。
+    消费方把本批 next_since 作为下次 since 原样回传即可增量推进
+    （翻页时继续携带 start/end/scope）。caller 恒为 skill/mcp。
     """
     return list_skill_usage(since, limit, start, end, scope)
+
+
+@router.get("/telemetry/usage")
+def telemetry_usage_table(
+    scope: str = Query(default="call", description="call|object|all，同 skill-usage"),
+    start: str = Query(default="", description="时间窗起点（ISO8601 或纯日期）"),
+    end: str = Query(default="", description="时间窗终点（ISO8601 或纯日期=含当天）"),
+    endpoint: str = Query(default="", description="端点多选（逗号分隔，取值：/md,/domains,mcp:get_md,mcp:get_domains,mcp:search_objects,mcp:search_md,mcp:get_object）"),
+    q: str = Query(default="", description="账号/工号子串过滤"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=200),
+):
+    """运维页底表表格：时间倒序 + 服务端分页 + 筛选。返回 {rows, total}。"""
+    from ..telemetry.aggregator import list_usage_table
+    eps = tuple(e.strip() for e in endpoint.split(",") if e.strip())
+    return list_usage_table(scope=scope, start=start, end=end,
+                            endpoints=eps, user_like=q.strip(), page=page, size=size)

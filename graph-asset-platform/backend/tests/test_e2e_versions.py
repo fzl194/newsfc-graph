@@ -222,7 +222,7 @@ def test_telemetry_records_mcp_calls(tmp_data_dir, monkeypatch):
         out = _mcp(c, "get_md", {**ctx, "ids": [ACT_DEMO]}, key="sk")
         assert out[ACT_DEMO]["version"] == "20.16.2"
         _mcp(c, "get_domains", ctx, key="sk")
-        usage = c.get("/api/v1/telemetry/skill-usage").json()
+        usage = c.get("/api/v1/telemetry/skill-usage?scope=object").json()  # 对象级归因断言
         events = usage["events"]
         md_ev = [e for e in events if e["endpoint"] == "mcp:get_md"
                  and e.get("obj_id") == ACT_DEMO]

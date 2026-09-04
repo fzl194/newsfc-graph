@@ -9,12 +9,15 @@
       </header>
 
       <TelemetrySection />
+
+      <TelemetryUsageTable />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import TelemetrySection from '../components/TelemetrySection.vue'
+import TelemetryUsageTable from '../components/TelemetryUsageTable.vue'
 </script>
 
 <style scoped>

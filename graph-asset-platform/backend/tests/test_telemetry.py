@@ -184,12 +184,13 @@ def test_list_skill_usage_filters_to_skill_objects_only(tmp_path, monkeypatch):
         {"ts": _now(), "user": "sk", "caller": "skill", "endpoint": "/fs/upload", "id": "p", "level": "object"},                          # 其它 endpoint 排除
     ])
     from app.telemetry.aggregator import list_skill_usage
-    r = list_skill_usage(limit=100)
+    r = list_skill_usage(limit=100, scope="object")
     assert len(r["events"]) == 2
     assert {e["endpoint"] for e in r["events"]} == {"/md", "/domains"}
     assert all(e["user"] == "sk" for e in r["events"])
-    assert all(set(e) == {"ts", "endpoint", "obj_id", "obj_type", "user", "operator",
-                          "session_id"} for e in r["events"])  # 不泄露 rowid；session_id 为 MCP 服务化新增列
+    assert all(e["caller"] == "skill" for e in r["events"])
+    assert all(set(e) == {"ts", "caller", "endpoint", "obj_id", "obj_type", "user",
+                          "operator", "session_id", "level"} for e in r["events"])  # 不泄露 rowid
 
 
 def test_list_skill_usage_since_inclusive_and_cursor(tmp_path, monkeypatch):
@@ -205,17 +206,17 @@ def test_list_skill_usage_since_inclusive_and_cursor(tmp_path, monkeypatch):
     ])
     from app.telemetry.aggregator import list_skill_usage
     # since=t1 含边界 → B、C；next_since 落在 C
-    r = list_skill_usage(since=t1, limit=100)
+    r = list_skill_usage(since=t1, limit=100, scope="object")
     assert [e["obj_id"] for e in r["events"]] == ["B", "C"]
     assert r["next_since"].split("|", 1)[0] == t2
     assert r["has_more"] is False
     # limit=1 → 只 B，has_more=True，next_since 落在 B
-    r2 = list_skill_usage(since=t1, limit=1)
+    r2 = list_skill_usage(since=t1, limit=1, scope="object")
     assert [e["obj_id"] for e in r2["events"]] == ["B"]
     assert r2["has_more"] is True
     assert r2["next_since"].split("|", 1)[0] == t1
     # 透传 next_since 推进 → 只剩 C，不再带 B（不重复）
-    r3 = list_skill_usage(since=r2["next_since"], limit=100)
+    r3 = list_skill_usage(since=r2["next_since"], limit=100, scope="object")
     assert [e["obj_id"] for e in r3["events"]] == ["C"]
 
 
@@ -226,7 +227,7 @@ def test_list_skill_usage_empty_since_bootstrap(tmp_path, monkeypatch):
         {"ts": "2026-01-01T00:00:00+00:00", "user": "sk", "caller": "skill", "endpoint": "/md", "id": "A", "type": "Feature", "level": "object"},
     ])
     from app.telemetry.aggregator import list_skill_usage
-    r = list_skill_usage(limit=100)
+    r = list_skill_usage(limit=100, scope="object")
     assert len(r["events"]) == 1
     # 未来时间起点 → 空，next_since 回填传入的 since
     future = "2099-01-01T00:00:00+00:00"
@@ -245,7 +246,7 @@ def test_list_skill_usage_tie_ts_advances_without_dup(tmp_path, monkeypatch):
     from app.telemetry.aggregator import list_skill_usage
     seen, cursor, rounds = [], "", 0
     while rounds < 10:
-        r = list_skill_usage(since=cursor, limit=2)
+        r = list_skill_usage(since=cursor, limit=2, scope="object")
         seen += [e["obj_id"] for e in r["events"]]
         cursor = r["next_since"]
         rounds += 1
@@ -288,47 +289,69 @@ def test_skill_usage_time_window_and_paging(tmp_path, monkeypatch):
     _win_seed(db)
     from app.telemetry.aggregator import list_skill_usage
     # 窗口首轮：09-01~09-02 共 3 条；limit=2 翻页，end 上界全程生效
-    r = list_skill_usage(limit=2, start="2026-09-01", end="2026-09-02")
+    r = list_skill_usage(limit=2, start="2026-09-01", end="2026-09-02", scope="object")
     assert [e["obj_id"] for e in r["events"]] == ["SEP1_AM", "SEP1_PM"]
     assert r["has_more"] is True
     r2 = list_skill_usage(since=r["next_since"], limit=2,
-                          start="2026-09-01", end="2026-09-02")
+                          start="2026-09-01", end="2026-09-02", scope="object")
     assert [e["obj_id"] for e in r2["events"]] == ["SEP2"]
     assert r2["has_more"] is False
     # 无窗口 + 全量起点 = 4 条
-    assert list_skill_usage(limit=10)["next_since"] != ""
+    assert list_skill_usage(limit=10, scope="object")["next_since"] != ""
 
 
-def test_skill_usage_scope_all_raw_table(tmp_path, monkeypatch):
-    """scope=all 底表：含检索工具 tool 行（params/result/level），take 口径不变。"""
+def test_skill_usage_scopes_call_object_all(tmp_path, monkeypatch):
+    """三口径（2026-09-04 重定）：call=调用级（默认，REST 调用行+MCP 工具行）；
+    object=对象级细粒度；all=全含。每行显式 caller。"""
     db = _use_tmp_telemetry(tmp_path, monkeypatch)
     _seed(db, [
-        {"ts": "2026-09-01T08:00:00+00:00", "user": "sk", "operator": "E1", "caller": "skill",
-         "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T08:00:00+00:00", "user": "sk", "caller": "skill",
+         "endpoint": "/md", "level": "tool", "params": '{"ids": ["F@1", "F@2"], "version": null}',
+         "result": '{"ok": 2, "error": 0}'},
         {"ts": "2026-09-01T09:00:00+00:00", "user": "sk", "operator": "E1", "caller": "mcp",
-         "endpoint": "mcp:search_objects", "level": "tool", "params": '{"q": "AMF", "layer": "命令图谱"}',
-         "result": '{"total": 12, "returned": 12, "top_ids": ["A", "B"]}'},
-        {"ts": "2026-09-01T10:00:00+00:00", "user": "sk", "operator": "E1", "caller": "mcp",
-         "endpoint": "mcp:search_md", "level": "tool", "params": '{"q": "扩容"}',
-         "result": '{"total": 3, "returned": 3}'},
+         "endpoint": "mcp:search_objects", "level": "tool", "params": '{"q": "AMF"}',
+         "result": '{"total": 12, "returned": 12}'},
+        {"ts": "2026-09-01T08:00:01+00:00", "user": "sk", "caller": "skill",
+         "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T08:00:02+00:00", "user": "sk", "caller": "skill",
+         "endpoint": "/md", "id": "F@2", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T10:00:00+00:00", "user": "fe", "caller": "web",
+         "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
+        {"ts": "2026-09-01T11:00:00+00:00", "user": "sk", "caller": "skill",
+         "endpoint": "/fs/upload", "level": "request"},
     ])
     from app.telemetry.aggregator import list_skill_usage
-    # take（默认）：只有对象级行
-    take = list_skill_usage(limit=10)
-    assert [e["endpoint"] for e in take["events"]] == ["/md"]
-    assert "params" not in take["events"][0]
-    # all：3 行全出，tool 行带 level/params/result（解析回对象）
-    allr = list_skill_usage(limit=10, scope="all")
-    eps = [e["endpoint"] for e in allr["events"]]
-    assert eps == ["/md", "mcp:search_objects", "mcp:search_md"]
-    so = allr["events"][1]
-    assert so["level"] == "tool" and so["obj_id"] == ""
-    assert so["params"] == {"q": "AMF", "layer": "命令图谱"}
-    assert so["result"]["total"] == 12
-    assert allr["events"][0]["level"] == "object"
-    # 时间窗 + all 翻页 end 持续生效
-    r1 = list_skill_usage(limit=2, scope="all", start="2026-09-01", end="2026-09-01")
-    assert len(r1["events"]) == 2 and r1["has_more"] is True
-    r2 = list_skill_usage(since=r1["next_since"], limit=2, scope="all",
-                          start="2026-09-01", end="2026-09-01")
-    assert [e["endpoint"] for e in r2["events"]] == ["mcp:search_md"]
+    call = list_skill_usage(limit=10)
+    assert [e["endpoint"] for e in call["events"]] == ["/md", "mcp:search_objects"]
+    assert call["events"][0]["caller"] == "skill"
+    assert call["events"][0]["params"] == {"ids": ["F@1", "F@2"], "version": None}
+    assert call["events"][0]["result"] == {"ok": 2, "error": 0}
+    assert call["events"][1]["caller"] == "mcp" and call["events"][1]["operator"] == "E1"
+    obj = list_skill_usage(limit=10, scope="object")
+    assert [e["obj_id"] for e in obj["events"]] == ["F@1", "F@2"]
+    assert "params" not in obj["events"][0] and obj["events"][0]["caller"] == "skill"
+    assert len(list_skill_usage(limit=10, scope="all")["events"]) == 4
+
+
+def test_usage_table_filters_and_paging(tmp_path, monkeypatch):
+    """运维页底表表格：时间倒序 + 端点/账号筛选 + 分页 total。"""
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    _seed(db, [
+        {"ts": "2026-09-01T08:00:00+00:00", "user": "a1", "operator": "E1", "caller": "skill",
+         "endpoint": "/md", "level": "tool", "params": "{}", "result": '{"ok": 1}'},
+        {"ts": "2026-09-02T08:00:00+00:00", "user": "a2", "operator": "E2", "caller": "mcp",
+         "endpoint": "mcp:get_md", "level": "tool"},
+        {"ts": "2026-09-03T08:00:00+00:00", "user": "a1", "operator": "", "caller": "skill",
+         "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
+    ])
+    from app.telemetry.aggregator import list_usage_table
+    t = list_usage_table()
+    assert [r["endpoint"] for r in t["rows"]] == ["mcp:get_md", "/md"] and t["total"] == 2
+    t2 = list_usage_table(endpoints=("mcp:get_md",))
+    assert t2["total"] == 1 and t2["rows"][0]["endpoint"] == "mcp:get_md"
+    t3 = list_usage_table(user_like="E2")
+    assert t3["total"] == 1 and t3["rows"][0]["user"] == "a2"
+    t4 = list_usage_table(scope="object", page=1, size=1)
+    assert t4["total"] == 1 and len(t4["rows"]) == 1
+    t5 = list_usage_table(start="2026-09-02", end="2026-09-02")
+    assert t5["total"] == 1 and t5["rows"][0]["endpoint"] == "mcp:get_md"

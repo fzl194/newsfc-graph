@@ -13,10 +13,15 @@ def aggregate_stats(days: int = 30, start: str = "", end: str = "") -> dict:
 
 
 def list_skill_usage(since: str = "", limit: int = 1000,
-                     start: str = "", end: str = "", scope: str = "take") -> dict:
-    """SKILL 取用明细增量流（原始事件 + next_since 游标 + has_more）。
-    scope=all 为底表全量口径（含检索工具与 params/result，2026-09-03）。"""
+                     start: str = "", end: str = "", scope: str = "call") -> dict:
+    """底表导出（原始事件 + next_since 游标 + has_more）。
+    scope=call（默认，调用级）| object（对象级细粒度）| all（2026-09-04 重定）。"""
     return telemetry_repo.list_skill_usage(get_shared_db(), since, limit, start, end, scope)
+
+
+def list_usage_table(**kw) -> dict:
+    """运维页底表表格：时间倒序 + 服务端分页 + 筛选（scope/时间/端点/账号工号）。"""
+    return telemetry_repo.list_usage_table(get_shared_db(), **kw)
 
 
 def aggregate_activity(username: str, days: int = 30) -> list:

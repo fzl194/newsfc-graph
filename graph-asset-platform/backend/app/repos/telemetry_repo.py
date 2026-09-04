@@ -11,11 +11,19 @@ from datetime import datetime, timedelta, timezone
 # 取用统计口径：SKILL 旧两接口（历史行）+ MCP 对应工具（新行）——无缝衔接
 _STATS_ENDPOINTS = ("/md", "/domains", "mcp:get_md", "mcp:get_domains")
 _STATS_CALLERS = ("skill", "mcp")
-# 底表全量口径（2026-09-03 scope=all，用户要求"所有暴露给用户的都导出"）：
-# 取用 4 端点 + 检索 3 工具；level 含 object（每对象一行）与 tool（每次调用一行，
-# 带 params/result）。REST 请求级/网页端不在暴露面定义内。
-_ALL_ENDPOINTS = _STATS_ENDPOINTS + (
-    "mcp:search_objects", "mcp:search_md", "mcp:get_object")
+# 底表口径（2026-09-04 用户重定）：
+# - call（默认）：**调用级**——每次调用一行。REST /md、/domains 各 1 行
+#   （level=tool，含 params/result）+ MCP 5 工具每调用 1 行（level=tool）。
+# - object：**对象级**细粒度——每取一个对象一行（get_md/get_domains/REST，
+#   level=object），供单独导出；运维页统计热榜同此数据源。
+# - all：两类全含。
+# caller 恒为 skill/mcp（web 不在暴露面）；网页端浏览不打点。
+_CALL_ENDPOINTS = ("/md", "/domains", "mcp:get_md", "mcp:get_domains",
+                   "mcp:search_objects", "mcp:search_md", "mcp:get_object")
+_SCOPE_LEVELS = {"call": ("tool",), "object": ("object",),
+                 "all": ("object", "tool")}
+_SCOPE_ENDPOINTS = {"call": _CALL_ENDPOINTS, "object": _STATS_ENDPOINTS,
+                    "all": _CALL_ENDPOINTS}
 
 
 def insert(conn: sqlite3.Connection, *, ts: str, level: str, caller: str,
@@ -111,29 +119,50 @@ def _parse_cursor(since: str) -> tuple[str, int]:
     return since, 0
 
 
+def _jload(v: str):
+    """params/result 列存 JSON 字符串 → 解析回对象（失败原样返回，底表不丢信息）。"""
+    if not v:
+        return None
+    try:
+        return json.loads(v)
+    except (ValueError, TypeError):
+        return v
+
+
+def _event_of(r, *, with_payload: bool) -> dict:
+    """telemetry 行 → 底表 event（caller 恒显式；payload 仅调用级含）。"""
+    e = {"ts": r["ts"], "caller": r["caller"], "endpoint": r["endpoint"],
+         "obj_id": r["obj_id"], "obj_type": r["obj_type"], "user": r["user"],
+         "operator": r["operator"], "session_id": r["session_id"] or "",
+         "level": r["level"] or ""}
+    if with_payload:
+        for k, col in (("params", r["params"]), ("result", r["result"])):
+            v = _jload(col)
+            if v is not None:
+                e[k] = v
+    return e
+
+
 def list_skill_usage(conn: sqlite3.Connection, since: str = "", limit: int = 1000,
-                     start: str = "", end: str = "", scope: str = "take") -> dict:
-    """取用明细增量流（原始事件 + next_since 游标 + has_more）。
+                     start: str = "", end: str = "", scope: str = "call") -> dict:
+    """底表导出：原始事件 + next_since 游标 + has_more（ts 升序，供外部拉取拼接）。
 
-    scope（2026-09-03）：
-      - ``take``（默认，向后兼容）：取用口径——level=object，4 端点
-        （/md、/domains、mcp:get_md、mcp:get_domains），每对象一行；
-      - ``all``：**底表全量**——暴露面全部端点（4 取用 + 3 检索工具），
-        level 含 object+tool；tool 行带 params（业务入参 JSON）/result
-        （输出结构化摘要 JSON，原样解析回对象）与 level 字段，供离线分析。
-
-    ts 存 ISO8601 UTC，字典序=时间序。游标语义（next_since 不透明，消费方原样回传）：
-      - since 留空 → 以 ``start``（若有）为起点，否则全量起点；
-      - 纯 ISO8601 → ``ts >= 该时间``；'ts|rowid' → 精确推进位（同 ts 多行不重不漏）。
-    时间窗：``start``/``end``（ISO8601 或纯日期归一当天起止）；end 翻页全程生效。
-    取 limit+1 行判断 has_more；无行时 next_since 回填 since。
+    scope（2026-09-04 用户重定）：
+      - ``call``（默认）：**调用级**——REST /md、/domains 每请求 1 行 +
+        MCP 5 工具每调用 1 行（level=tool，含 params/result）；
+      - ``object``：**对象级**细粒度——每取一个对象 1 行（level=object，4 端点）；
+      - ``all``：两类全含。
+    每行显式带 caller（skill/mcp）。游标语义（next_since 不透明，原样回传）：
+    since 留空 → 以 start（若有）为起点；'ts|rowid' → 精确推进（同 ts 多行不重不漏）。
+    时间窗 start/end（ISO8601 或纯日期归一当天起止）；end 翻页全程生效。
     """
-    endpoints = _ALL_ENDPOINTS if scope == "all" else _STATS_ENDPOINTS
+    levels = _SCOPE_LEVELS.get(scope, _SCOPE_LEVELS["call"])
+    endpoints = _SCOPE_ENDPOINTS.get(scope, _SCOPE_ENDPOINTS["call"])
+    lv_ph = ",".join("?" * len(levels))
     ep_ph = ",".join("?" * len(endpoints))
     ca_ph = ",".join("?" * len(_STATS_CALLERS))
-    level_cond = "(level='object' OR level='tool')" if scope == "all" else "level='object'"
-    where = [level_cond, f"caller IN ({ca_ph})", f"endpoint IN ({ep_ph})"]
-    params = [*list(_STATS_CALLERS), *list(endpoints)]
+    where = [f"level IN ({lv_ph})", f"caller IN ({ca_ph})", f"endpoint IN ({ep_ph})"]
+    params = [*levels, *list(_STATS_CALLERS), *list(endpoints)]
     start = _norm_bound(start, is_end=False)
     end = _norm_bound(end, is_end=True)
     if since:
@@ -151,33 +180,54 @@ def list_skill_usage(conn: sqlite3.Connection, since: str = "", limit: int = 100
         where.append("ts <= ?")
         params.append(end)
     sql = ("SELECT ts, endpoint, obj_id, obj_type, user, operator, session_id, "
-           "params, result, level, rowid FROM telemetry "
+           "params, result, level, caller, rowid FROM telemetry "
            "WHERE " + " AND ".join(where) + " ORDER BY ts ASC, rowid ASC LIMIT ?")
     params.append(limit + 1)
     rows = conn.execute(sql, params).fetchall()
-
-    def _jload(v: str):
-        """params/result 列存 JSON 字符串 → 解析回对象（失败原样返回，底表不丢信息）。"""
-        if not v:
-            return None
-        try:
-            return json.loads(v)
-        except (ValueError, TypeError):
-            return v
-
     returned = rows[:limit]
-    events = []
-    for r in returned:
-        e = {"ts": r["ts"], "endpoint": r["endpoint"], "obj_id": r["obj_id"],
-             "obj_type": r["obj_type"], "user": r["user"], "operator": r["operator"],
-             "session_id": r["session_id"] or ""}
-        if scope == "all":
-            e["level"] = r["level"] or ""
-            e["params"] = _jload(r["params"])
-            e["result"] = _jload(r["result"])
-        events.append(e)
+    events = [_event_of(r, with_payload=True) for r in returned]
     next_since = f"{returned[-1]['ts']}|{returned[-1]['rowid']}" if returned else (since or "")
     return {"events": events, "next_since": next_since, "has_more": len(rows) > limit}
+
+
+def list_usage_table(conn: sqlite3.Connection, *, scope: str = "call",
+                     start: str = "", end: str = "", endpoints: tuple = (),
+                     user_like: str = "", page: int = 1, size: int = 50) -> dict:
+    """运维页底表表格（2026-09-04）：**时间倒序** + 服务端分页 + 筛选。
+
+    筛选：scope 粒度（call/object/all）+ 时间窗 + 端点多选 + 账号/工号子串。
+    返回 {rows, total}；行结构与 list_skill_usage 一致（含 caller，payload 仅调用级）。
+    """
+    levels = _SCOPE_LEVELS.get(scope, _SCOPE_LEVELS["call"])
+    eps = tuple(e for e in endpoints if e in _CALL_ENDPOINTS) or _SCOPE_ENDPOINTS.get(
+        scope, _SCOPE_ENDPOINTS["call"])
+    lv_ph = ",".join("?" * len(levels))
+    ep_ph = ",".join("?" * len(eps))
+    ca_ph = ",".join("?" * len(_STATS_CALLERS))
+    where = [f"level IN ({lv_ph})", f"caller IN ({ca_ph})", f"endpoint IN ({ep_ph})"]
+    params = [*levels, *list(_STATS_CALLERS), *list(eps)]
+    start = _norm_bound(start, is_end=False)
+    end = _norm_bound(end, is_end=True)
+    if start:
+        where.append("ts >= ?")
+        params.append(start)
+    if end:
+        where.append("ts <= ?")
+        params.append(end)
+    if user_like:
+        where.append("(user LIKE ? OR operator LIKE ?)")
+        params += [f"%{user_like}%", f"%{user_like}%"]
+    cond = " AND ".join(where)
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM telemetry WHERE {cond}", params).fetchone()[0]
+    page = max(1, page or 1)
+    size = min(max(1, size or 50), 200)
+    rows = conn.execute(
+        "SELECT ts, endpoint, obj_id, obj_type, user, operator, session_id, "
+        "params, result, level, caller FROM telemetry "
+        f"WHERE {cond} ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
+        (*params, size, (page - 1) * size)).fetchall()
+    return {"rows": [_event_of(r, with_payload=True) for r in rows], "total": total}
 
 
 def aggregate_activity(conn: sqlite3.Connection, username: str, days: int = 30) -> list:

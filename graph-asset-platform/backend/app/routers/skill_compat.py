@@ -21,6 +21,15 @@ from ..version import is_newer
 router = APIRouter()
 
 
+def _record_call(endpoint: str, request: Request, params: dict, result: dict) -> None:
+    """调用级行（2026-09-04 用户决策：底表默认=每次调用一行）：一次 HTTP 请求
+    记一条 level=tool 行（与 MCP 工具行同构），params/result 为 JSON 字符串。"""
+    import json as _json
+    record(endpoint, user=request.state.user, caller=request.state.caller,
+           level="tool", params=_json.dumps(params, ensure_ascii=False),
+           result=_json.dumps(result, ensure_ascii=False))
+
+
 @router.post("/domains")
 def list_domains_with_md(request: Request):
     """一次性返回全部业务域的完整 md（``[{id, name, md}, ...]``）。
@@ -40,6 +49,8 @@ def list_domains_with_md(request: Request):
         {"id": id_, "name": obj.frontmatter.get("name"), "md": obj.raw_md}
         for id_, obj in latest.items()
     ]
+    # 调用级 1 行（底表默认口径）+ 对象级每域 1 行（运维页统计热榜用）
+    _record_call("/domains", request, params={}, result={"domains": len(out)})
     for item in out:
         record("/domains", item["id"], "BusinessDomain",
                user=request.state.user, caller=request.state.caller,
@@ -88,4 +99,9 @@ def batch_md(req: BatchMdRequest, request: Request):
         out[id_] = {"version": obj.version, "md": obj.raw_md}
         record("/md", id_, obj.type, user=request.state.user,
                caller=request.state.caller, level="object")
+    # 调用级 1 行（底表默认口径；对象级行上方逐 id 已记）
+    ok = sum(1 for v in out.values() if "md" in v)
+    _record_call("/md", request,
+                 params={"ids": list(dict.fromkeys(req.ids)), "version": req.version},
+                 result={"ok": ok, "error": len(out) - ok})
     return out
