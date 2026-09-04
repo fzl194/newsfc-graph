@@ -18,6 +18,7 @@ graph-asset-platform/frontend/dist/
 .vite/
 
 # ===== 运行时数据（真实图谱索引/用户明文KEY/打点/测试运行，全部本地）=====
+.mcp.json
 graph-asset-platform/platform-data/
 graph-asset-platform/e2e-data/
 *.db
