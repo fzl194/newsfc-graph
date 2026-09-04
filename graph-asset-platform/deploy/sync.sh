@@ -32,6 +32,7 @@ cd "$ROOT"
 IMAGE_NAME="${IMAGE_NAME:-graph-asset-platform:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-gap}"
 HOST_PORT="${GAP_PORT:-80}"                   # 宿主机端口（默认 80；本机测试用 GAP_PORT=18000）
+NETWORK_NAME="${GAP_NETWORK:-gap-net}"        # 自定义网桥（默认 bridge 在内网机 -p 不生效，2026-09-04）
 DATA_DIR="$ROOT/deploy/platform-data"
 MANIFEST_BASELINE_DIR=".gap-sync-last"        # 依赖清单基线（apply 侧维护，gitignore）
 STAGE_DIR=""
@@ -125,8 +126,9 @@ cmd_apply() {
     [ -d frontend/dist ] && mv frontend/dist frontend/dist.old
     mv "$STAGE_DIR/backend/app" backend/app
     mv "$STAGE_DIR/frontend/dist" frontend/dist
+    mkdir -p "$MANIFEST_BASELINE_DIR"
     for m in pyproject.toml package.json; do
-        [ -f "$STAGE_DIR/$m" ] && cp -f "$STAGE_DIR/$m" "$m"
+        [ -f "$STAGE_DIR/$m" ] && cp -f "$STAGE_DIR/$m" "$MANIFEST_BASELINE_DIR/$m"
     done
     rm -rf backend/app.old frontend/dist.old
     SWAP_ACTIVE=false
@@ -145,8 +147,13 @@ start_container() {
         || die "本地没有镜像 $IMAGE_NAME——首次部署请先 docker load 全量镜像 tar"
     mkdir -p "$DATA_DIR"
 
+    # ⚠ 内网那台机器 docker 默认 bridge 端口转发失效（PortBindings 有值但
+    # NetworkSettings.Ports 空、宿主机不监听）——必须走自定义网桥才落地。
+    docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 \
+        || docker network create "$NETWORK_NAME" >/dev/null
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
+        --network "$NETWORK_NAME" \
         -p "$HOST_PORT:8000" \
         -e GAP_DATA_DIR=/data \
         -v "$DATA_DIR:/data" \
