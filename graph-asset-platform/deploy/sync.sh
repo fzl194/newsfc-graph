@@ -97,26 +97,42 @@ cmd_pack() {
     echo "  bash deploy/sync.sh apply $out"
 }
 
-# ── 依赖清单基线 ────────────────────────────────────────────
+# ── 依赖清单基线（2026-09-04 改：首次部署豁免，后续仅 warn 不阻断）──
 check_manifests() {
-    # 包内 pyproject.toml / package.json 与内网基线比对：变了说明依赖可能变过，
-    # 本包只换代码不换镜像 → 提醒（不阻断，由人判断）。
-    local changed=()
+    # 包内 pyproject.toml / package.json 与内网基线比对：
+    # - 首次部署（无基线）：直接落基线不告警；
+    # - 后续部署有基线 + 包内无 manifest（运维侧未挂载源码目录常见）：跳过；
+    # - 有基线 + 包内有 manifest + 不一致：⚠ warn（提醒人评估是否重导镜像）但不 exit。
+    local m
+    if [ ! -d "$MANIFEST_BASELINE_DIR" ]; then
+        mkdir -p "$MANIFEST_BASELINE_DIR"
+        for m in pyproject.toml package.json; do
+            [ -f "$STAGE_DIR/$m" ] && cp -f "$STAGE_DIR/$m" "$MANIFEST_BASELINE_DIR/$m"
+        done
+        return 0
+    fi
+    local have_baseline=0
     for m in pyproject.toml package.json; do
-        [ -f "$m" ] || continue
-        if [ -f "$MANIFEST_BASELINE_DIR/$m" ]; then
-            if ! diff -q "$m" "$MANIFEST_BASELINE_DIR/$m" >/dev/null 2>&1; then
-                changed+=("$m")
-            fi
+        [ -f "$MANIFEST_BASELINE_DIR/$m" ] && have_baseline=1 && break
+    done
+    [ $have_baseline -eq 0 ] && return 0
+
+    local changed=()
+    local have_pkg=0
+    for m in pyproject.toml package.json; do
+        [ -f "$STAGE_DIR/$m" ] && have_pkg=1
+        if [ -f "$MANIFEST_BASELINE_DIR/$m" ] && [ -f "$STAGE_DIR/$m" ] \
+            && ! diff -q "$MANIFEST_BASELINE_DIR/$m" "$STAGE_DIR/$m" >/dev/null 2>&1; then
+            changed+=("$m")
         fi
     done
     if [ ${#changed[@]} -gt 0 ]; then
         echo "⚠ 警告：依赖清单与上次不同（${changed[*]}）——pip/npm 依赖可能已变化。" >&2
         echo "  本脚本只同步代码；若新功能依赖新包，请在外网重新导全量镜像（docker save）并 docker load。" >&2
     fi
-    mkdir -p "$MANIFEST_BASELINE_DIR"
+    [ $have_pkg -eq 0 ] && return 0
     for m in pyproject.toml package.json; do
-        [ -f "$m" ] && cp -f "$m" "$MANIFEST_BASELINE_DIR/$m"
+        [ -f "$STAGE_DIR/$m" ] && cp -f "$STAGE_DIR/$m" "$MANIFEST_BASELINE_DIR/$m"
     done
 }
 
