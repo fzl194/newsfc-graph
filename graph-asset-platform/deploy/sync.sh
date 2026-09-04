@@ -26,15 +26,32 @@ if [ -n "${MSYSTEM:-}" ] || [ -n "${MSYS:-}" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"          # graph-asset-platform/
+# 布局自适应（2026-09-04 内网实际：sync.sh 直接放在 graph-asset-platform/ 下，
+# platform-data/backend/frontend 与之同级，无 deploy/ 子目录；仓库布局则在 deploy/ 里）：
+#   上一级有 backend/ → 脚本在 <root>/deploy/（仓库布局）
+#   本级有 backend/ 或 platform-data/ → 脚本在 <root>/（内网扁平布局）
+if [ -d "$SCRIPT_DIR/../backend" ] || [ -d "$SCRIPT_DIR/../platform-data" ]; then
+    ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+elif [ -d "$SCRIPT_DIR/backend" ] || [ -d "$SCRIPT_DIR/platform-data" ]; then
+    ROOT="$SCRIPT_DIR"
+else
+    ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"      # 兜底：按仓库布局
+fi
 cd "$ROOT"
+# 数据目录：优先 GAP_DATA_DIR 显式指定 → deploy/platform-data（仓库布局）→ platform-data（扁平布局）
+if [ -n "${GAP_DATA_DIR:-}" ]; then
+    DATA_DIR="$GAP_DATA_DIR"
+elif [ -d "$ROOT/deploy/platform-data" ]; then
+    DATA_DIR="$ROOT/deploy/platform-data"
+else
+    DATA_DIR="$ROOT/platform-data"
+fi
 
 IMAGE_NAME="${IMAGE_NAME:-graph-asset-platform:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-gap}"
 HOST_PORT="${GAP_PORT:-80}"                   # 宿主机端口（默认 80；本机测试用 GAP_PORT=18000）
 NETWORK_NAME="${GAP_NETWORK:-gap-net}"        # 自定义网桥（默认 bridge 在内网机 -p 不生效，2026-09-04）
-DATA_DIR="$ROOT/deploy/platform-data"
-MANIFEST_BASELINE_DIR=".gap-sync-last"        # 依赖清单基线（apply 侧维护，gitignore）
+MANIFEST_BASELINE_DIR="$ROOT/.gap-sync-last"  # 依赖清单基线（apply 侧维护，gitignore）
 STAGE_DIR=""
 SWAP_ACTIVE=false
 
@@ -71,7 +88,8 @@ cmd_pack() {
     ts="$(date +%Y%m%d-%H%M)"
     out="$ROOT/gap-sync-$ts.tar.gz"
     tar -czf "$out" -C "$STAGE_DIR" .
-    sha256sum "$out" > "$out.sha256"
+    # sha256 只记文件名（不记打包机绝对路径——内网 sha256sum -c 才能对上）
+    (cd "$ROOT" && sha256sum "${out##*/}" > "${out}.sha256")
 
     echo "=== [3/3] 完成 ==="
     /usr/bin/ls -lh "$out" "$out.sha256" 2>/dev/null || ls -lh "$out" "$out.sha256"
@@ -106,11 +124,14 @@ check_manifests() {
 cmd_apply() {
     local pkg="${1:-}"
     [ -n "$pkg" ] || die "用法：bash deploy/sync.sh apply <gap-sync-*.tar.gz>"
-    [ -f "$pkg" ] || die "包不存在：$pkg"
+    # 相对路径先转绝对（ROOT cd 之后原相对路径会失效——内网"包不存在"的根因）
+    [ -f "$pkg" ] && pkg="$(cd "$(dirname "$pkg")" && pwd)/$(basename "$pkg")"
+    [ -f "$pkg" ] || die "包不存在：$pkg（注意 cd 到 graph-asset-platform/ 再执行，或传绝对路径）"
     [ -f "$pkg.sha256" ] || die "缺少校验文件：$pkg.sha256（两个文件要一起传）"
 
     echo "=== [1/4] 校验包完整性 ==="
-    sha256sum -c "$pkg.sha256" || die "校验失败，包可能传输损坏，请重传"
+    (cd "$(dirname "$pkg")" && sha256sum -c "$(basename "$pkg").sha256") \
+        || die "校验失败，包可能传输损坏，请重传"
 
     echo "=== [2/4] 解包并原子替换代码（数据目录不动）==="
     STAGE_DIR="$(mktemp -d "$ROOT/.gap-sync-stage.XXXXXX")"
