@@ -77,12 +77,15 @@ export const login = (username: string, key: string): Promise<LoginUser> =>
 
 // SKILL 取用频次聚合（统计页 TelemetrySection 用）
 export interface TelemetryStats {
+  /** 累计调用次数（调用级，一次 /md 或 MCP 工具=1 次） */
   total: number
-  by_type: Record<string, number>
-  top_ids: { id: string; type: string; count: number }[]
-  timeline: { date: string; count: number }[]
+  by_endpoint: Record<string, number>
+  top_users: { user: string; count: number }[]
+  /** 自适应粒度：≤2天按小时、>2天按天（granularity 标识） */
+  timeline: { date: string; count: number; granularity: 'hour' | 'day' }[]
   by_user: Record<string, number>
   by_operator: Record<string, number>
+  by_session: number
 }
 
 export const fetchTelemetryStats = (days = 30): Promise<TelemetryStats> =>

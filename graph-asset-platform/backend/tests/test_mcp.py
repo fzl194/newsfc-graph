@@ -252,9 +252,9 @@ def test_telemetry_three_levels_and_stats(tmp_data_dir, monkeypatch):
     st = aggregate_stats(s.db)
     assert st["total"] >= 1
     assert st["by_session"] >= 1
-    # skill 历史行与新 mcp 行同口径并存
+    # skill 历史行与新 mcp 行同口径并存（stats 已改调用级 2026-09-04：tool 行 +1）
     from app.telemetry.recorder import record
-    record("/md", "X@1", "Feature", user="sk", caller="skill", level="object")
+    record("/md", user="sk", caller="skill", level="tool")
     assert _tel_flush()
     st2 = aggregate_stats(s.db)
     assert st2["total"] == st["total"] + 1

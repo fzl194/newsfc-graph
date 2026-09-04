@@ -53,18 +53,22 @@ def _norm_bound(t: str, *, is_end: bool) -> str:
 
 def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
                     start: str = "", end: str = "") -> dict:
-    """level=object + caller∈{skill,mcp} + endpoint∈取用口径，按 type/id/user/
-    operator/session + 小时桶。小时桶在 Python 算（SQLite strftime 不认 ISO 带时区 T 格式）。
+    """**调用级**聚合（2026-09-04 用户重定）：level=tool + caller∈{skill,mcp} +
+    endpoint∈全暴露面 7 端点（REST /md、/domains + MCP 5 工具）。
+    一次 REST /md（不管带几个 id）= 1 次调用；一次 MCP 工具调用 = 1 次。
 
-    占位符动态生成（对抗审查 B4：SQL `IN (?,?)` 写死与 _STATS_ENDPOINTS 扩容不匹配）。
-    时间窗（2026-09-03，外部系统对接）：``start``/``end``（ISO8601 或纯日期，
-    纯日期归一为当天起止；可只给一端）优先于 ``days``（近 N 天）。
+    返回：total=累计调用次数；by_endpoint=按端点计数；top_users=最活跃用户 TOP10
+    （按调用次数，优先工号展示，无工号则账号）；timeline=**自适应粒度**时间桶
+    （时间窗 ≤2 天按小时、>2 天按天）；by_user/by_operator/by_session 同调用级。
+
+    占位符动态生成（对抗审查 B4）。时间窗：start/end（ISO8601 或纯日期归一）
+    优先于 days（近 N 天）。
     """
-    ep_ph = ",".join("?" * len(_STATS_ENDPOINTS))
+    ep_ph = ",".join("?" * len(_CALL_ENDPOINTS))
     ca_ph = ",".join("?" * len(_STATS_CALLERS))
-    sql = (f"SELECT obj_type, obj_id, user, operator, session_id, ts FROM telemetry "
-           f"WHERE level='object' AND caller IN ({ca_ph}) AND endpoint IN ({ep_ph})")
-    params = [*list(_STATS_CALLERS), *list(_STATS_ENDPOINTS)]
+    sql = (f"SELECT endpoint, user, operator, session_id, ts FROM telemetry "
+           f"WHERE level='tool' AND caller IN ({ca_ph}) AND endpoint IN ({ep_ph})")
+    params = [*list(_STATS_CALLERS), *list(_CALL_ENDPOINTS)]
     start = _norm_bound(start, is_end=False)
     end = _norm_bound(end, is_end=True)
     c = start if start else _cutoff_iso(days)
@@ -74,14 +78,33 @@ def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
     if end:
         sql += " AND ts <= ?"
         params.append(end)
-    by_type, by_id, id_type, by_user, by_operator, by_hour, sessions = {}, {}, {}, {}, {}, {}, set()
+
+    # 自适应粒度：算出窗口实际跨度决定小时/天（统一补 UTC 时区防 naive/aware 混减）
+    def _aware(ts_iso: str) -> datetime:
+        dt = datetime.fromisoformat(ts_iso)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    span_hours = 999.0
+    try:
+        now = datetime.now(timezone.utc)
+        t_start = _aware(c) if c else now - timedelta(days=days)
+        t_end = _aware(end) if end else now
+        span_hours = (t_end - t_start).total_seconds() / 3600
+    except ValueError:
+        pass
+    by_day = span_hours > 48
+
+    by_endpoint: dict[str, int] = {}
+    by_user: dict[str, int] = {}
+    by_operator: dict[str, int] = {}
+    sessions: set = set()
+    by_bucket: dict[str, int] = {}
+    total = 0
     for r in conn.execute(sql, params).fetchall():
-        t = r["obj_type"] or "?"
-        i = r["obj_id"] or "?"
+        total += 1
+        ep = r["endpoint"] or "?"
+        by_endpoint[ep] = by_endpoint.get(ep, 0) + 1
         u = r["user"] or "?"
-        by_type[t] = by_type.get(t, 0) + 1
-        by_id[i] = by_id.get(i, 0) + 1
-        id_type[i] = t
         by_user[u] = by_user.get(u, 0) + 1
         op = r["operator"] or ""
         if op:
@@ -91,16 +114,26 @@ def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
             sessions.add(sid)
         try:
             dt = datetime.fromisoformat((r["ts"] or "").replace("Z", "+00:00"))
-            hour = dt.strftime("%m-%d %H:00")
-            by_hour[hour] = by_hour.get(hour, 0) + 1
+            bucket = dt.strftime("%m-%d") if by_day else dt.strftime("%m-%d %H:00")
+            by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
         except ValueError:
             continue
-    top_ids = sorted(by_id.items(), key=lambda x: -x[1])[:20]
-    timeline = [{"date": d, "count": n} for d, n in sorted(by_hour.items())]
+
+    timeline = [{"date": d, "count": n, "granularity": "day" if by_day else "hour"}
+                for d, n in sorted(by_bucket.items())]
+
+    # 最活跃用户 TOP10：按调用次数，工号优先展示（同一工号可能对应同一账号）
+    user_calls: dict[str, int] = {}
+    for r in conn.execute(sql, params).fetchall():
+        label = r["operator"] or r["user"] or "?"
+        user_calls[label] = user_calls.get(label, 0) + 1
+    top_users = [{"user": u, "count": c}
+                 for u, c in sorted(user_calls.items(), key=lambda x: -x[1])[:10]]
+
     return {
-        "total": sum(by_type.values()),
-        "by_type": by_type,
-        "top_ids": [{"id": i, "type": id_type.get(i, "?"), "count": c} for i, c in top_ids],
+        "total": total,
+        "by_endpoint": by_endpoint,
+        "top_users": top_users,
         "timeline": timeline,
         "by_user": by_user,
         "by_operator": by_operator,

@@ -2,8 +2,8 @@
   <section class="telemetry-section stagger-in">
     <header class="ts-head">
       <div>
-        <h2 class="ts-title">SKILL 取用频次</h2>
-        <p class="ts-sub">只统计 SKILL 的 /domains + /md（按对象）</p>
+        <h2 class="ts-title">调用统计</h2>
+        <p class="ts-sub">REST /md、/domains + MCP 5 工具——每次调用算 1 次（不管带几个对象）</p>
       </div>
       <div class="ts-controls">
         <div class="days-tabs">
@@ -14,7 +14,7 @@
             @click="days = d; load()"
           >{{ d === 1 ? '今天' : `近 ${d} 天` }}</button>
         </div>
-        <span class="ts-total">共 {{ formatNum(stats?.total ?? 0) }} 次取用</span>
+        <span class="ts-total">共 {{ formatNum(stats?.total ?? 0) }} 次调用</span>
       </div>
     </header>
 
@@ -31,17 +31,31 @@
         <rect x="9" y="13" width="6" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5" />
         <path d="M10.5 16h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
       </svg>
-      <div class="empty-title">暂无取用记录</div>
-      <div class="empty-sub">SKILL 调用 /domains 或 /md 后，取用频次将在此聚合展示</div>
+      <div class="empty-title">暂无调用记录</div>
+      <div class="empty-sub">Agent 通过 REST /md、/domains 或 MCP 工具调用后，将在此聚合展示</div>
     </div>
 
     <div v-else class="ts-grid">
-      <!-- 按 type 横条 -->
+      <!-- 调用趋势曲线（自适应粒度：≤2天按小时，>2天按天） -->
+      <div class="ts-block ts-block-wide">
+        <div class="block-title">
+          调用趋势（{{ stats.timeline[0]?.granularity === 'day' ? '按天' : '按小时' }}）
+        </div>
+        <v-chart
+          v-if="stats.timeline.length >= 1"
+          class="trend-chart"
+          :option="chartOption"
+          autoresize
+        />
+        <div v-else class="trend-empty">暂无调用记录</div>
+      </div>
+
+      <!-- 按端点分布 -->
       <div class="ts-block">
-        <div class="block-title">按类型</div>
+        <div class="block-title">按端点</div>
         <div class="type-rows">
-          <div v-for="r in typeRows" :key="r.type" class="type-row">
-            <span class="type-label">{{ typeLabel(r.type) }}</span>
+          <div v-for="r in endpointRows" :key="r.endpoint" class="type-row">
+            <span class="type-label mono">{{ r.endpoint }}</span>
             <div class="type-bar-wrap">
               <div class="type-bar" :style="{ width: r.pct + '%' }" />
             </div>
@@ -50,33 +64,26 @@
         </div>
       </div>
 
-      <!-- 热门对象 top-N -->
+      <!-- 最活跃用户 TOP10 -->
       <div class="ts-block">
-        <div class="block-title">热门对象 Top {{ stats.top_ids.length }}</div>
+        <div class="block-title">最活跃用户 Top {{ stats.top_users.length }}</div>
         <ol class="top-list">
-          <li
-            v-for="(t, i) in stats.top_ids"
-            :key="t.id"
-            class="top-item top-item--link"
-            :title="`在图谱中查看 ${t.id}`"
-            @click="goObject(t.id)"
-          >
+          <li v-for="(t, i) in stats.top_users" :key="t.user" class="top-item">
             <span class="top-rank">{{ i + 1 }}</span>
-            <span class="top-id mono">{{ t.id }}</span>
-            <span class="top-type">{{ typeLabel(t.type) }}</span>
+            <span class="top-id mono">{{ t.user }}</span>
             <span class="top-count mono">{{ formatNum(t.count) }}</span>
           </li>
         </ol>
       </div>
 
-      <!-- 按用户（SKILL） -->
+      <!-- 按用户（账号） -->
       <div class="ts-block ts-block--user">
         <div class="block-title">
           <svg class="block-ic" width="13" height="13" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="8" r="3.2" stroke="currentColor" stroke-width="1.7" />
             <path d="M5 20c0-3.3 3.1-6 7-6s7 2.7 7 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
           </svg>
-          按用户（SKILL）
+          按用户（账号）
         </div>
         <div class="type-rows">
           <div v-for="(c, u) in stats.by_user" :key="u" class="type-row type-row--kv">
@@ -87,14 +94,14 @@
         </div>
       </div>
 
-      <!-- 按工号（SKILL 使用者） -->
+      <!-- 按工号 -->
       <div class="ts-block ts-block--operator">
         <div class="block-title">
           <svg class="block-ic" width="13" height="13" viewBox="0 0 24 24" fill="none">
             <rect x="4" y="5" width="16" height="14" rx="2" stroke="currentColor" stroke-width="1.7" />
             <path d="M8 10h8M8 13h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
           </svg>
-          按工号（SKILL 使用者）
+          按工号
         </div>
         <div class="type-rows">
           <div v-for="(c, op) in stats.by_operator" :key="op" class="type-row type-row--kv">
@@ -104,25 +111,12 @@
           <div v-if="!Object.keys(stats.by_operator).length" class="block-mini-empty">无记录</div>
         </div>
       </div>
-
-      <!-- 时间趋势（按小时，echarts 圆滑曲线 + Y 轴 + tooltip） -->
-      <div class="ts-block ts-block-wide">
-        <div class="block-title">时间趋势（按小时）</div>
-        <v-chart
-          v-if="stats.timeline.length >= 1"
-          class="trend-chart"
-          :option="chartOption"
-          autoresize
-        />
-        <div v-else class="trend-empty">暂无取用记录</div>
-      </div>
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -135,31 +129,16 @@ use([CanvasRenderer, LineChart, GridComponent, TooltipComponent])
 const stats = ref<TelemetryStats | null>(null)
 const days = ref(1) // 默认今天
 const err = ref('')
-const router = useRouter()
 
-// 点热门对象 → 跳图谱浏览页定位该对象（BrowserView 读 ?o=id 自动定位）
-function goObject(id: string): void {
-  router.push({ path: '/', query: { o: id } })
-}
-
-const TYPE_LABELS: Record<string, string> = {
-  MMLCommand: '命令', ConfigObject: '配置对象', Feature: '特性', License: 'License',
-  AtomTask: '原子Task', CompoundTask: '步骤Task', FeatureTask: '特性Task', Task: '任务',
-  BusinessDomain: '业务域', NetworkScenario: '场景', ConfigurationSolution: '方案',
-}
-
-function typeLabel(t: string): string {
-  return TYPE_LABELS[t] ?? t
-}
 function formatNum(n: number): string {
   return n.toLocaleString('zh-CN')
 }
 
-const typeRows = computed(() => {
+const endpointRows = computed(() => {
   if (!stats.value) return []
-  const entries = Object.entries(stats.value.by_type).sort((a, b) => b[1] - a[1])
+  const entries = Object.entries(stats.value.by_endpoint).sort((a, b) => b[1] - a[1])
   const max = entries[0]?.[1] || 1
-  return entries.map(([type, count]) => ({ type, count, pct: Math.round((count / max) * 100) }))
+  return entries.map(([endpoint, count]) => ({ endpoint, count, pct: Math.round((count / max) * 100) }))
 })
 
 // echarts 配置：圆滑曲线（smooth）+ 面积渐变 + X/Y 轴 + tooltip
@@ -277,106 +256,90 @@ onMounted(load)
   border-color: var(--border);
   background: var(--bg-elev);
 }
-.ts-block--user {
-  border-left: 3px solid var(--accent);
-}
-.ts-block--operator {
-  border-left: 3px solid #0891b2;
-}
-
 .block-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: var(--space-2);
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: var(--space-3);
 }
 .block-ic {
   color: var(--text-faint);
-  flex-shrink: 0;
 }
-.ts-block--user .block-ic {
-  color: var(--accent);
-}
-.ts-block--operator .block-ic {
-  color: #0891b2;
+.block-mini-empty {
+  font-size: 12px;
+  color: var(--text-faint);
+  padding: var(--space-1) 0;
 }
 
 .type-rows {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
 }
 .type-row {
   display: grid;
-  grid-template-columns: 70px 1fr 50px;
+  grid-template-columns: minmax(80px, auto) 1fr auto;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   font-size: 12.5px;
 }
 .type-row--kv {
   grid-template-columns: 1fr auto;
-  padding: 3px 0;
-}
-.type-bar-wrap {
-  height: 8px;
-  background: var(--bg-sunken);
-  border-radius: 999px;
-  overflow: hidden;
-}
-.type-bar {
-  height: 100%;
-  background: var(--accent);
-  border-radius: 999px;
-  transition: width var(--dur) var(--ease);
-}
-.type-count {
-  text-align: right;
-  color: var(--text);
-  font-weight: 600;
 }
 .type-label {
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  min-width: 0;
 }
+.type-bar-wrap {
+  height: 6px;
+  background: var(--bg-sunken);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.type-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--dur) var(--ease);
+}
+.type-count {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .top-list {
   list-style: none;
   margin: 0;
   padding: 0;
+  counter-reset: rank;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  max-height: 280px;
+  overflow-y: auto;
 }
 .top-item {
   display: grid;
-  grid-template-columns: 24px 1fr auto auto;
+  grid-template-columns: 24px 1fr auto;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   font-size: 12.5px;
-  padding: 3px 6px;
-  margin: 0 -6px;
-}
-.top-item--link {
-  cursor: pointer;
-  border-radius: 4px;
-  transition: background var(--dur-fast) var(--ease);
-}
-.top-item--link:hover {
-  background: var(--accent-soft);
-}
-.top-item--link:hover .top-id {
-  color: var(--accent);
+  padding: 3px 0;
 }
 .top-rank {
-  color: var(--text-faint);
+  font-family: var(--display);
+  font-size: 12px;
   font-weight: 600;
+  color: var(--text-faint);
+  text-align: center;
 }
 .top-id {
   color: var(--text);
@@ -386,102 +349,72 @@ onMounted(load)
 }
 .top-type {
   font-size: 11px;
-  color: var(--text-muted);
-  background: var(--bg-sunken);
-  padding: 1px 6px;
-  border-radius: 4px;
+  color: var(--text-faint);
+  flex-shrink: 0;
 }
 .top-count {
   color: var(--text);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
-/* echarts 时间趋势 */
 .trend-chart {
   width: 100%;
-  height: 200px;
+  height: 220px;
 }
 .trend-empty {
-  height: 200px;
-  display: grid;
-  place-items: center;
-  font-size: 12px;
-  color: var(--text-faint);
-  background: var(--bg-sunken);
-  border-radius: var(--radius-sm);
-}
-
-.block-mini-empty {
-  font-size: 11.5px;
-  color: var(--text-faint);
-  padding: var(--space-2) 0;
-  text-align: center;
-}
-
-.ts-empty {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-8) var(--space-4);
-  text-align: center;
-}
-.ts-empty .state-icon {
-  color: var(--text-faint);
-  opacity: 0.55;
-  margin-bottom: var(--space-1);
-}
-.empty-title {
-  font-family: var(--display);
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-muted);
-}
-.empty-sub {
+  justify-content: center;
+  height: 160px;
   font-size: 12.5px;
   color: var(--text-faint);
-  max-width: 360px;
-  line-height: 1.55;
 }
 
 .ts-err {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  font-size: 12.5px;
-  color: var(--danger);
   padding: var(--space-3) var(--space-4);
-  background: rgba(220, 38, 38, 0.06);
-  border: 1px solid rgba(220, 38, 38, 0.18);
+  background: #fef2f2;
+  border: 1px solid #fecaca;
   border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: 12.5px;
 }
-.ts-err .state-icon {
-  flex-shrink: 0;
+.ts-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-8);
+  text-align: center;
+  color: var(--text-faint);
 }
-
-@media (max-width: 720px) {
-  .ts-grid {
-    grid-template-columns: 1fr;
-  }
+.empty-title {
+  font-family: var(--display);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.empty-sub {
+  font-size: 12.5px;
 }
 
 .days-tabs {
-  display: inline-flex;
+  display: flex;
+  gap: 4px;
   background: var(--bg-sunken);
-  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 2px;
-  gap: 2px;
-  flex-shrink: 0;
+  padding: 3px;
 }
 .days-tab {
+  background: none;
   border: none;
-  background: transparent;
   font-size: 12px;
-  font-family: var(--sans);
-  color: var(--text-muted);
   padding: 4px 12px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
   cursor: pointer;
   transition: all var(--dur-fast) var(--ease);
 }
@@ -490,7 +423,7 @@ onMounted(load)
 }
 .days-tab--active {
   background: var(--bg-elev);
-  color: var(--accent);
+  color: var(--text);
   font-weight: 600;
   box-shadow: var(--shadow-sm);
 }

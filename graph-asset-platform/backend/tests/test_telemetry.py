@@ -123,23 +123,53 @@ def test_purge_historical_request_rows_once(tmp_path, monkeypatch):
 
 # ---------- aggregator ----------
 
-def test_aggregate_stats_skill_objects_only(tmp_path, monkeypatch):
+def test_aggregate_stats_call_level(tmp_path, monkeypatch):
+    """调用级口径（2026-09-04 重定）：level=tool + 7 端点；一次调用=1 次。"""
     db = _use_tmp_telemetry(tmp_path, monkeypatch)
     _seed(db, [
-        {"ts": _now(), "user": "sk1", "operator": "EMP001", "caller": "skill", "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
-        {"ts": _now(), "user": "sk1", "operator": "EMP001", "caller": "skill", "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
-        {"ts": _now(), "user": "sk2", "operator": "EMP002", "caller": "skill", "endpoint": "/domains", "id": "BD@x", "type": "BusinessDomain", "level": "object"},
-        {"ts": _now(), "user": "fe", "operator": "", "caller": "web", "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},  # web 不计
-        {"ts": _now(), "user": "fe", "caller": "web", "endpoint": "/api/v1/stats", "level": "request"},  # request 不计
+        # 2 次调用（tool 行）
+        {"ts": _now(), "user": "sk1", "operator": "EMP001", "caller": "skill",
+         "endpoint": "/md", "level": "tool", "params": '{"ids": ["F@1", "F@2"], "version": null}',
+         "result": '{"ok": 2, "error": 0}'},
+        {"ts": _now(), "user": "sk1", "operator": "EMP001", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
+        {"ts": _now(), "user": "sk2", "operator": "EMP002", "caller": "mcp",
+         "endpoint": "mcp:search_md", "level": "tool"},
+        # 对象级行不计入调用级统计
+        {"ts": _now(), "user": "sk1", "operator": "EMP001", "caller": "skill",
+         "endpoint": "/md", "id": "F@1", "type": "Feature", "level": "object"},
+        {"ts": _now(), "user": "sk1", "operator": "EMP001", "caller": "skill",
+         "endpoint": "/md", "id": "F@2", "type": "Feature", "level": "object"},
+        # web/request 不计
+        {"ts": _now(), "user": "fe", "caller": "web", "endpoint": "/md", "level": "tool"},
+        {"ts": _now(), "user": "fe", "caller": "web", "endpoint": "/api/v1/stats", "level": "request"},
     ])
     from app.telemetry.aggregator import aggregate_stats
     r = aggregate_stats(days=30)
-    assert r["total"] == 3
-    assert r["by_type"]["Feature"] == 2
+    assert r["total"] == 3  # 2 次 /md + 1 次 mcp:search_md
+    assert r["by_endpoint"]["/md"] == 2
+    assert r["by_endpoint"]["mcp:search_md"] == 1
+    assert "by_type" not in r and "top_ids" not in r  # 对象级口径不再返回
     assert r["by_user"] == {"sk1": 2, "sk2": 1}
     assert r["by_operator"] == {"EMP001": 2, "EMP002": 1}
-    assert r["top_ids"][0]["id"] == "F@1"
-    assert all(":00" in item["date"] for item in r["timeline"])  # 按小时
+    # top_users：工号优先展示，EMP001 排第一
+    assert r["top_users"][0] == {"user": "EMP001", "count": 2}
+    assert r["top_users"][1] == {"user": "EMP002", "count": 1}
+    # timeline：近 30 天>48h → 按天粒度
+    assert all(item["granularity"] == "day" for item in r["timeline"])
+
+
+def test_aggregate_stats_hour_granularity_short_window(tmp_path, monkeypatch):
+    """时间窗 ≤2 天 → 按小时粒度。"""
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    _seed(db, [
+        {"ts": t1, "user": "sk", "caller": "skill", "endpoint": "/md", "level": "tool"},
+    ])
+    from app.telemetry.aggregator import aggregate_stats
+    r = aggregate_stats(days=1)  # 近 1 天 → ≤48h → hour
+    assert all(item["granularity"] == "hour" for item in r["timeline"])
+    assert all(":00" in item["date"] for item in r["timeline"])
 
 
 def test_aggregate_stats_days_filter(tmp_path, monkeypatch):
@@ -147,13 +177,15 @@ def test_aggregate_stats_days_filter(tmp_path, monkeypatch):
     old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
     new = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     _seed(db, [
-        {"ts": old, "user": "sk", "operator": "", "caller": "skill", "endpoint": "/md", "id": "OLD", "type": "Feature", "level": "object"},
-        {"ts": new, "user": "sk", "operator": "", "caller": "skill", "endpoint": "/md", "id": "NEW", "type": "Feature", "level": "object"},
+        {"ts": old, "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
+        {"ts": new, "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
     ])
     from app.telemetry.aggregator import aggregate_stats
     r = aggregate_stats(days=10)
     assert r["total"] == 1
-    assert r["top_ids"][0]["id"] == "NEW"
+    assert r["by_endpoint"]["/md"] == 1
 
 
 def test_aggregate_activity_scans_requests_only(tmp_path, monkeypatch):
@@ -260,6 +292,17 @@ def test_list_skill_usage_tie_ts_advances_without_dup(tmp_path, monkeypatch):
 
 def _win_seed(db):
     _seed(db, [
+        # 调用级行（stats 新口径）
+        {"ts": "2026-08-31T10:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "level": "tool", "params": '{"ids": ["AUG31"], "version": null}',
+         "result": '{"ok": 1, "error": 0}'},
+        {"ts": "2026-09-01T08:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
+        {"ts": "2026-09-01T20:00:00+00:00", "user": "sk", "operator": "", "caller": "mcp",
+         "endpoint": "mcp:get_md", "level": "tool"},
+        {"ts": "2026-09-02T09:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
+        # 对象级行（scope=object 用）
         {"ts": "2026-08-31T10:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
          "endpoint": "/md", "id": "AUG31", "type": "Feature", "level": "object"},
         {"ts": "2026-09-01T08:00:00+00:00", "user": "sk", "operator": "", "caller": "skill",
@@ -277,7 +320,7 @@ def test_stats_time_window(tmp_path, monkeypatch):
     from app.telemetry.aggregator import aggregate_stats
     # 纯日期窗口：2026-09-01 当天（含 mcp 行）= 2；days 被忽略（否则全 4 条也含 8/31）
     r = aggregate_stats(days=365, start="2026-09-01", end="2026-09-01")
-    assert {i["id"] for i in r["top_ids"]} == {"SEP1_AM", "SEP1_PM"}
+    assert r["by_endpoint"] == {"/md": 1, "mcp:get_md": 1}
     # 只给起点：09-01 起 3 条
     assert aggregate_stats(start="2026-09-01")["total"] == 3
     # 只给终点：09-01 前 1 条
