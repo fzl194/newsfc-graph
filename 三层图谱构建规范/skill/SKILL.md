@@ -69,20 +69,24 @@ Agent 根据用户的需求描述和现网配置脚本，经过**业务域→场
 
 ### 3.1 两个端点（curl 直调，全程不传 version）
 
-**Phase 0 入口**——取全部业务域 md（无 body，cmd / bash 通用）：
+两个 POST 的 JSON body 都必须传 `AGENT_USERNAME` 和 `AGENT_SESSION_ID`，值分别
+取自沙箱环境变量 `_AGENT_USERNAME`、`_AGENT_SESSION_ID`；字段名与 MCP 工具保持一致。
+两值不得为空，长度上限分别为 64 / 128 字符。
+
+**Phase 0 入口**——取全部业务域 md（body 必带与 MCP 同名的工号和会话字段）：
 
 ```
-curl -s -X POST http://127.0.0.1:8000/api/v1/domains -H "X-API-Key: $GRAPH_API_KEY" -H "X-User-Id: $_AGENT_USERNAME"
+curl -s -X POST http://127.0.0.1:8000/api/v1/domains -H "X-API-Key: $GRAPH_API_KEY" -H "Content-Type: application/json" -d "{\"AGENT_USERNAME\":\"${_AGENT_USERNAME}\",\"AGENT_SESSION_ID\":\"${_AGENT_SESSION_ID}\"}"
 ```
 
 **全程主力**——批量取对象 md（单个也走批量）：
 
 ```
 # Windows cmd.exe
-echo {"ids":["NetworkScenario@charging","ConfigurationSolution@charging-online"]} | curl -s -X POST http://127.0.0.1:8000/api/v1/md -H "X-API-Key: %GRAPH_API_KEY%" -H "X-User-Id: %_AGENT_USERNAME%" -H "Content-Type: application/json" --data-binary @-
+echo {"ids":["NetworkScenario@charging","ConfigurationSolution@charging-online"],"AGENT_USERNAME":"%_AGENT_USERNAME%","AGENT_SESSION_ID":"%_AGENT_SESSION_ID%"} | curl -s -X POST http://127.0.0.1:8000/api/v1/md -H "X-API-Key: %GRAPH_API_KEY%" -H "Content-Type: application/json" --data-binary @-
 
 # Git Bash / Linux
-curl -s -X POST http://127.0.0.1:8000/api/v1/md -H "X-API-Key: $GRAPH_API_KEY" -H "X-User-Id: $_AGENT_USERNAME" -H "Content-Type: application/json" -d '{"ids":["NetworkScenario@charging"]}'
+curl -s -X POST http://127.0.0.1:8000/api/v1/md -H "X-API-Key: $GRAPH_API_KEY" -H "Content-Type: application/json" -d "{\"ids\":[\"NetworkScenario@charging\"],\"AGENT_USERNAME\":\"${_AGENT_USERNAME}\",\"AGENT_SESSION_ID\":\"${_AGENT_SESSION_ID}\"}"
 ```
 
 ### 3.2 下钻四步循环 ★图谱调用核心纪律
@@ -194,7 +198,7 @@ Phase 7: 输出交付
 
 1. **取全部业务域 md**：
    ```
-   curl -s -X POST http://127.0.0.1:8000/api/v1/domains -H "X-API-Key: $GRAPH_API_KEY" -H "X-User-Id: $_AGENT_USERNAME"
+   curl -s -X POST http://127.0.0.1:8000/api/v1/domains -H "X-API-Key: $GRAPH_API_KEY" -H "Content-Type: application/json" -d "{\"AGENT_USERNAME\":\"${_AGENT_USERNAME}\",\"AGENT_SESSION_ID\":\"${_AGENT_SESSION_ID}\"}"
    ```
    一次拿到全部业务域 md（含正文 + `## 边`）。按用户需求关键词匹配业务域。多域命中按主诉求判断；不确定向用户确认；未命中 → 提示补充属于哪个业务域。锁定 `{业务域}`。
 
@@ -204,7 +208,7 @@ Phase 7: 输出交付
 3. **读场景 md → 决策点路由表 + 方案候选**：
    ```
    # Windows cmd.exe
-   echo {"ids":["<场景id>"]} | curl -s -X POST http://127.0.0.1:8000/api/v1/md -H "X-API-Key: %GRAPH_API_KEY%" -H "X-User-Id: %_AGENT_USERNAME%" -H "Content-Type: application/json" --data-binary @-
+   echo {"ids":["<场景id>"],"AGENT_USERNAME":"%_AGENT_USERNAME%","AGENT_SESSION_ID":"%_AGENT_SESSION_ID%"} | curl -s -X POST http://127.0.0.1:8000/api/v1/md -H "X-API-Key: %GRAPH_API_KEY%" -H "Content-Type: application/json" --data-binary @-
    ```
    场景 md 含"决策点"路由表（业务诉求 → 推荐方案）+ `[[ConfigurationSolution@*]]` 下游方案。
 

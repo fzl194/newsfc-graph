@@ -2,8 +2,8 @@
 
 设计要点（docs/需求分析与实施计划-MCP服务化-2026-08-24.md）：
 - 5 工具：get_domains / get_md / search_objects / search_md / get_object——
-  SKILL 旧两接口（POST /domains、POST /md，步骤③删除）的能力继承 +
-  search_md 正文召回新能力（FTS5）。
+  继承 REST 兼容接口（POST /domains、POST /md）的查询语义，并增加
+  search_md 正文召回等能力（FTS5）；两条通道并行提供。
 - 上下文参数 AGENT_USERNAME / AGENT_SESSION_ID：Agent 从沙箱环境变量
   ``_AGENT_USERNAME`` / ``_AGENT_SESSION_ID`` 读取后传入（打点归因，不影响结果；
   SDK 禁止下划线前缀参数名，故工具参数名去掉前导下划线）。
@@ -26,6 +26,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.server import Context
 from mcp.server.transport_security import TransportSecuritySettings
 
+from .attribution import AgentSessionId, AgentUsername, telemetry_attribution
 from .objects_search import list_objects_rows
 from .routers.objects import _dump, _dump_edge, _resolve
 from .service import get_service
@@ -138,7 +139,7 @@ def _record_tool(name: str, *, user: str, operator: str, session_id: str,
     载荷（md 全文本在 objects 表，append-only 打点表不存大字段）。
     """
     record(f"mcp:{name}", user=user, caller="mcp", level="tool",
-           operator=operator, session_id=session_id,
+           **telemetry_attribution(operator, session_id),
            params=_j(params or {}), result=_j(result or {}))
 
 
@@ -149,7 +150,7 @@ def _err_summary(e: Exception) -> dict:
 # ---------- 工具 ----------
 
 @mcp.tool()
-def get_domains(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[str, Field(description=_CTX_SID)], ctx: Context = None) -> dict:
+def get_domains(AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)], ctx: Context = None) -> dict:
     """获取三层图谱全部业务域（BusinessDomain）的完整 markdown。
 
     业务域是业务归属的顶层定位层，是任何查询的推荐第一步：先调本工具，按用户需求
@@ -175,8 +176,8 @@ def get_domains(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_S
                for id_, obj in latest.items()]
         for item in out:  # object 级：每域一行（取用统计口径）
             record("mcp:get_domains", item["id"], "BusinessDomain", user=user,
-                   caller="mcp", level="object", operator=AGENT_USERNAME,
-                   session_id=AGENT_SESSION_ID)
+                   caller="mcp", level="object",
+                   **telemetry_attribution(AGENT_USERNAME, AGENT_SESSION_ID))
         _record_tool("get_domains", user=user, operator=AGENT_USERNAME,
                      session_id=AGENT_SESSION_ID, params=params,
                      result={"domains": len(out), "ids": [d["id"] for d in out[:30]]})
@@ -189,7 +190,7 @@ def get_domains(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_S
 
 
 @mcp.tool()
-def get_md(ids: list[str], AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[str, Field(description=_CTX_SID)],
+def get_md(ids: list[str], AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
            version: Optional[str] = None, ctx: Context = None) -> dict:
     """按逻辑 ID 批量获取图谱对象的完整 markdown（含 frontmatter + 正文 + ## 边段）。
 
@@ -233,7 +234,7 @@ def get_md(ids: list[str], AGENT_USERNAME: Annotated[str, Field(description=_CTX
                     f"{len(out)} 个 id）——请分批调用，每批 ≤50 个 id")
             out[id_] = {"version": obj.version, "md": obj.raw_md}
             record("mcp:get_md", id_, obj.type, user=user, caller="mcp", level="object",
-                   operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID)
+                   **telemetry_attribution(AGENT_USERNAME, AGENT_SESSION_ID))
         _record_tool("get_md", user=user, operator=AGENT_USERNAME, session_id=AGENT_SESSION_ID,
                      params=params,
                      result={"ok": len(uniq) - len(failed_ids), "failed": len(failed_ids),
@@ -246,7 +247,7 @@ def get_md(ids: list[str], AGENT_USERNAME: Annotated[str, Field(description=_CTX
 
 
 @mcp.tool()
-def search_objects(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[str, Field(description=_CTX_SID)], q: Optional[str] = None,
+def search_objects(AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)], q: Optional[str] = None,
                    layer: Optional[str] = None, type: Optional[str] = None,
                    nf: Optional[str] = None, version: Optional[str] = None,
                    domain: Optional[str] = None, scenario: Optional[str] = None,
@@ -292,7 +293,7 @@ def search_objects(AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGEN
 
 
 @mcp.tool()
-def search_md(q: str, AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[str, Field(description=_CTX_SID)],
+def search_md(q: str, AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
               layer: Optional[str] = None, type: Optional[str] = None,
               nf: Optional[str] = None, version: Optional[str] = None,
               limit: int = 20, offset: int = 0, ctx: Context = None) -> dict:
@@ -332,7 +333,7 @@ def search_md(q: str, AGENT_USERNAME: Annotated[str, Field(description=_CTX)], A
 
 
 @mcp.tool()
-def get_object(id: str, AGENT_USERNAME: Annotated[str, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[str, Field(description=_CTX_SID)],
+def get_object(id: str, AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
                version: Optional[str] = None, ctx: Context = None) -> dict:
     """获取单个图谱对象的结构化详情：frontmatter 元数据、正文、出边列表。
 

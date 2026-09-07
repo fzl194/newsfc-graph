@@ -2,10 +2,13 @@
 
 - 2026-08-24 MCP 服务化时删除了 ``POST /api/v1/domains`` 与 ``POST /api/v1/md``
   （e4922b4）；为兼容存量 Agent/SKILL 配置，按**原契约**恢复（请求/响应/
-  版本解析语义逐行取自删除前代码，仅去掉已整体移除的 X-User-Id operator）。
+  版本解析语义逐行取自删除前代码）。
+- 归因参数与 MCP 同名且必填：``AGENT_USERNAME``（工号）与
+  ``AGENT_SESSION_ID``（会话 ID）随 POST JSON body 传入，分别写入
+  telemetry 的 ``operator`` / ``session_id`` 专列，不重复写入 params。
 - 权限与 MCP 一致：skill（``can_skill`` 或 ``can_frontend``，admin 全权）——
   见 middleware/auth.py ``_need_perm`` 的路径分支。
-- 打点与取用统计无缝：level=object、caller=skill、endpoint=/domains|/md，
+- 打点与取用统计无缝：level=tool/object、caller=skill、endpoint=/domains|/md，
   与 MCP 行（mcp:get_domains|mcp:get_md）在运维页"知识取用频次"合并计数。
 - 新接入仍推荐 MCP（/mcp 另有 search_objects/search_md/get_object 三工具）。
 """
@@ -14,24 +17,36 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from ..attribution import AgentSessionId, AgentUsername, telemetry_attribution
 from ..service import get_service
 from ..telemetry.recorder import record
 from ..version import is_newer
 
 router = APIRouter()
+_REST_CALLER = "skill"
 
 
-def _record_call(endpoint: str, request: Request, params: dict, result: dict) -> None:
+class AttributionRequest(BaseModel):
+    """与 MCP 工具同名的必填调用上下文，仅用于打点归因。"""
+
+    AGENT_USERNAME: AgentUsername
+    AGENT_SESSION_ID: AgentSessionId
+
+
+def _record_call(endpoint: str, request: Request, req: AttributionRequest,
+                 params: dict, result: dict) -> None:
     """调用级行（2026-09-04 用户决策：底表默认=每次调用一行）：一次 HTTP 请求
     记一条 level=tool 行（与 MCP 工具行同构），params/result 为 JSON 字符串。"""
     import json as _json
-    record(endpoint, user=request.state.user, caller=request.state.caller,
-           level="tool", params=_json.dumps(params, ensure_ascii=False),
+    record(endpoint, user=request.state.user, caller=_REST_CALLER,
+           level="tool", **telemetry_attribution(
+               req.AGENT_USERNAME, req.AGENT_SESSION_ID),
+           params=_json.dumps(params, ensure_ascii=False),
            result=_json.dumps(result, ensure_ascii=False))
 
 
 @router.post("/domains")
-def list_domains_with_md(request: Request):
+def list_domains_with_md(req: AttributionRequest, request: Request):
     """一次性返回全部业务域的完整 md（``[{id, name, md}, ...]``）。
 
     业务域是用户最优先的业务归属定位层——数量少（跨 NF 类，version 恒 null），
@@ -50,17 +65,18 @@ def list_domains_with_md(request: Request):
         for id_, obj in latest.items()
     ]
     # 调用级 1 行（底表默认口径）+ 对象级每域 1 行（运维页统计热榜用）
-    _record_call("/domains", request, params={}, result={"domains": len(out)})
+    attribution = telemetry_attribution(req.AGENT_USERNAME, req.AGENT_SESSION_ID)
+    _record_call("/domains", request, req, params={}, result={"domains": len(out)})
     for item in out:
         record("/domains", item["id"], "BusinessDomain",
-               user=request.state.user, caller=request.state.caller,
-               level="object")
+               user=request.state.user, caller=_REST_CALLER,
+               level="object", **attribution)
     return out
 
 
 # ---------- /md (batch) ----------
 
-class BatchMdRequest(BaseModel):
+class BatchMdRequest(AttributionRequest):
     """批量取 md 请求体（Agent 友好，供 SKILL 逐层批次调用）。
 
     - ``ids``：1~N 个对象 id（版本无关逻辑 ID，可含 ``@`` 与空格）。
@@ -82,6 +98,7 @@ def batch_md(req: BatchMdRequest, request: Request):
     """
     idx = get_service().index
     out: dict = {}
+    attribution = telemetry_attribution(req.AGENT_USERNAME, req.AGENT_SESSION_ID)
     # dict.fromkeys 去重并保序；同 id 重复请求只算一次。
     for id_ in dict.fromkeys(req.ids):
         available = idx.versions_of(id_)
@@ -98,10 +115,10 @@ def batch_md(req: BatchMdRequest, request: Request):
             continue
         out[id_] = {"version": obj.version, "md": obj.raw_md}
         record("/md", id_, obj.type, user=request.state.user,
-               caller=request.state.caller, level="object")
+               caller=_REST_CALLER, level="object", **attribution)
     # 调用级 1 行（底表默认口径；对象级行上方逐 id 已记）
     ok = sum(1 for v in out.values() if "md" in v)
-    _record_call("/md", request,
+    _record_call("/md", request, req,
                  params={"ids": list(dict.fromkeys(req.ids)), "version": req.version},
                  result={"ok": ok, "error": len(out) - ok})
     return out

@@ -1,15 +1,14 @@
-"""鉴权 + 审计中间件（v3）：KEY 反查用户 → 权限校验 → 请求级打点①。
+"""鉴权中间件：KEY 反查用户 → 路径权限校验。
 
 - /users/login 豁免（登录前无 user，空 users 也能调）。
 - 其他 /api/*：无 KEY/未知 KEY → 401；权限不符 → 403。
 - 空 users → 所有 /api/*（非 login）→ 401（取消旁路）。
-- 打点①：鉴权通过后记一行请求级（排除 /users/login、/telemetry/*）。
 - caller：can_frontend → web；否则 skill（从用户属性派生，不信请求头）。
 
 v3（MCP 服务化 2026-08-24）：Agent 访问迁移至 MCP（/mcp，独立纯 ASGI 鉴权，
-caller=mcp）；原 SKILL 两端点（POST /domains、POST /md）已删，本中间件不再有
-skill 专属 REST 分支；X-User-Id 工号机制整体移除（MCP 打点归因走工具参数
-AGENT_USERNAME / AGENT_SESSION_ID）。
+caller=mcp）。2026-09-03 又恢复 SKILL REST 双接口；其权限仍由本中间件校验，
+但通道 caller 与 AGENT_USERNAME / AGENT_SESSION_ID 归因由 skill_compat router
+按 REST/MCP 公共契约记录。
 
 v4（打点瘦身 2026-08-26）：请求级全量打点移除（见文件尾注释）——中间件回归
 纯鉴权职责。

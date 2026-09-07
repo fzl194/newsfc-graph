@@ -118,8 +118,8 @@ def test_skill_user_cannot_write_assets_nor_tests(tmp_path, monkeypatch, tmp_dat
         assert c.get("/api/v1/tests/cases", headers=h).status_code == 403
 
 
-# X-User-Id 机制已随旧两接口删除（MCP 服务化 2026-08-24）：
-# 工号归因迁移至 MCP 工具参数 AGENT_USERNAME（见 test_mcp.py 打点用例）。
+# REST /domains、/md 的工号/会话归因由 JSON body 同名字段提供；契约与打点测试见
+# test_skill_compat.py。鉴权中间件只负责 X-API-Key 与权限。
 
 
 def test_stats_view_endpoints_frontend_perm(tmp_path, monkeypatch, tmp_data_dir):

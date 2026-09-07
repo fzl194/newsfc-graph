@@ -235,17 +235,18 @@ def test_list_objects_filter_by_ui_layer(tmp_data_dir, monkeypatch):
         assert "alpha@ConfigObject@DEMO_OBJ" in ids
 
 
-# ---------------- 旧 SKILL 两接口已删（MCP 服务化 2026-08-24） ----------------
-# POST /domains 与 POST /md 的能力由 MCP 工具 get_domains / get_md 继承
-# （语义测试见 test_mcp.py；版本解析矩阵见 test_e2e_versions.py）。
+# ---------------- SKILL 兼容双接口（与 MCP 并行） ----------------
 
 def test_skill_compat_endpoints_restored(tmp_data_dir, monkeypatch):
     """SKILL 兼容双接口已恢复（2026-09-03，与 MCP 并行；权限=skill）。
     契约回归（版本解析/批量语义/权限矩阵）见 test_skill_compat.py。"""
     _setup(tmp_data_dir, monkeypatch, {"a.md": CMD_EDGES})
+    attribution = {"AGENT_USERNAME": "e2e", "AGENT_SESSION_ID": "session-e2e"}
     with TestClient(app) as c:
-        assert c.post("/api/v1/md", json={"ids": ["x"]}, headers=H).status_code == 200
-        assert c.post("/api/v1/domains", headers=H).status_code == 200
+        assert c.post("/api/v1/md", json={
+            **attribution, "ids": ["x"],
+        }, headers=H).status_code == 200
+        assert c.post("/api/v1/domains", json=attribution, headers=H).status_code == 200
 
 
 # ---------------- 业务层 scenario / type 过滤 ----------------

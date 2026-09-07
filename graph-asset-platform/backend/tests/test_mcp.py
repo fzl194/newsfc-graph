@@ -138,7 +138,12 @@ def test_tools_list_returns_5_tools(tmp_data_dir, monkeypatch):
         # 上下文参数必填（required）且 description 指向沙箱环境变量
         get_md = next(t for t in r.json()["result"]["tools"] if t["name"] == "get_md")
         assert "AGENT_USERNAME" in get_md["inputSchema"]["required"]
+        assert "AGENT_SESSION_ID" in get_md["inputSchema"]["required"]
         assert "_AGENT_USERNAME" in get_md["inputSchema"]["properties"]["AGENT_USERNAME"]["description"]
+        assert get_md["inputSchema"]["properties"]["AGENT_USERNAME"]["minLength"] == 1
+        assert get_md["inputSchema"]["properties"]["AGENT_USERNAME"]["maxLength"] == 64
+        assert get_md["inputSchema"]["properties"]["AGENT_SESSION_ID"]["minLength"] == 1
+        assert get_md["inputSchema"]["properties"]["AGENT_SESSION_ID"]["maxLength"] == 128
 
 
 # ---------------- 工具语义 ----------------

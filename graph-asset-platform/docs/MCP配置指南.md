@@ -126,6 +126,9 @@ claude mcp add --transport http graph http://<平台地址>:8000/mcp \
 | `AGENT_USERNAME` | `_AGENT_USERNAME` | 使用者工号 → 打点 `operator`（谁在用） |
 | `AGENT_SESSION_ID` | `_AGENT_SESSION_ID` | 会话ID → 打点 `session_id`（会话维度统计） |
 
+两个工具参数都会去除首尾空白并拒绝空值；工号最长 64 字符，会话 ID 最长
+128 字符。它们是调用方声明的统计归因元数据，不参与鉴权。
+
 ### 给 Agent 的系统提示词模板（直接粘贴到云 Agent 指令配置）
 
 ```text
