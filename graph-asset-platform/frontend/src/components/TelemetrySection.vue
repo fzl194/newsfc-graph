@@ -283,7 +283,9 @@ onMounted(load)
 }
 .type-row {
   display: grid;
-  grid-template-columns: minmax(80px, auto) 1fr auto;
+  /* label/计数列固定宽：条形左右端点跨行对齐（每行独立 grid，auto 列宽会随
+     各行 label 长度变化，导致按端点条形左端点参差） */
+  grid-template-columns: 148px 1fr 64px;
   align-items: center;
   gap: var(--space-2);
   font-size: 12.5px;

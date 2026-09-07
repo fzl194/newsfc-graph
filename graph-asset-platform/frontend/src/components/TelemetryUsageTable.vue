@@ -42,7 +42,7 @@
       <el-table-column label="对象 / 参数" min-width="240">
         <template #default="{ row }">
           <span v-if="row.level === 'object'" class="mono" :title="row.obj_type">{{ row.obj_id }}</span>
-          <span v-else class="mono tut-json" :title="jsonOf(row.params)">{{ jsonOf(row.params) || '—' }}</span>
+          <JsonPopover v-else :value="row.params" />
         </template>
       </el-table-column>
       <el-table-column prop="user" label="账号" width="100" />
@@ -58,7 +58,7 @@
       </el-table-column>
       <el-table-column label="结果" min-width="160">
         <template #default="{ row }">
-          <span class="mono tut-json" :title="jsonOf(row.result)">{{ jsonOf(row.result) || '—' }}</span>
+          <JsonPopover :value="row.result" />
         </template>
       </el-table-column>
     </el-table>
@@ -74,6 +74,7 @@ import {
 import {
   fetchTelemetryUsage, type TelemetryUsageRow,
 } from '../api'
+import JsonPopover from './JsonPopover.vue'
 
 const ENDPOINTS = [
   { value: '/md', label: 'POST /md' },
@@ -140,11 +141,6 @@ function callerLabel(c: string): string {
   return c === 'mcp' ? 'MCP' : 'REST'
 }
 
-function jsonOf(v: unknown): string {
-  if (v === undefined || v === null) return ''
-  return typeof v === 'string' ? v : JSON.stringify(v)
-}
-
 onMounted(load)
 </script>
 
@@ -160,5 +156,4 @@ onMounted(load)
 .tut-caller { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
 .c-mcp { background: rgba(139, 92, 246, 0.12); color: #8b5cf6; }
 .c-skill { background: rgba(14, 165, 233, 0.12); color: #0ea5e9; }
-.tut-json { font-size: 11px; color: var(--text-muted); display: inline-block; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
 </style>

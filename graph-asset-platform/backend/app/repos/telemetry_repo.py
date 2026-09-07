@@ -8,6 +8,11 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+# timeline 桶展示时区：内网部署统一北京时间（ts 存 UTC，分桶前转换——
+# 2026-09-07 修复：此前按 UTC 直接 strftime，桶标签比北京时间差 8h，
+# 与底表前端 new Date(ts) 本地化口径不一致）。
+_TZ_DISPLAY = timezone(timedelta(hours=8))
+
 # 取用统计口径：SKILL 旧两接口（历史行）+ MCP 对应工具（新行）——无缝衔接
 _STATS_ENDPOINTS = ("/md", "/domains", "mcp:get_md", "mcp:get_domains")
 _STATS_CALLERS = ("skill", "mcp")
@@ -114,7 +119,10 @@ def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
             sessions.add(sid)
         try:
             dt = datetime.fromisoformat((r["ts"] or "").replace("Z", "+00:00"))
-            bucket = dt.strftime("%m-%d") if by_day else dt.strftime("%m-%d %H:00")
+            if dt.tzinfo is None:  # 存量行可能无时区标记 → 视作 UTC
+                dt = dt.replace(tzinfo=timezone.utc)
+            local = dt.astimezone(_TZ_DISPLAY)
+            bucket = local.strftime("%m-%d") if by_day else local.strftime("%m-%d %H:00")
             by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
         except ValueError:
             continue

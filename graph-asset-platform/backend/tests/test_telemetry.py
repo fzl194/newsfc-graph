@@ -172,6 +172,29 @@ def test_aggregate_stats_hour_granularity_short_window(tmp_path, monkeypatch):
     assert all(":00" in item["date"] for item in r["timeline"])
 
 
+def test_aggregate_stats_timeline_in_utc8(tmp_path, monkeypatch):
+    """timeline 桶标签按 UTC+8 展示（ts 存 UTC；2026-09-07 修复：此前按 UTC
+    分桶比北京时间差 8h，与底表前端本地化口径不一致）。"""
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    _seed(db, [
+        # UTC 20:30 = 北京 09-02 04:30 → 小时桶 "09-02 04:00"（旧 UTC 桶错为 "09-01 20:00"）
+        {"ts": "2026-09-01T20:30:00+00:00", "user": "sk", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
+        # UTC 08-31 20:00 = 北京 09-01 04:00 → 天桶 "09-01"（旧 UTC 桶错为 "08-31"）
+        {"ts": "2026-08-31T20:00:00+00:00", "user": "sk", "caller": "skill",
+         "endpoint": "/md", "level": "tool"},
+    ])
+    from app.telemetry.aggregator import aggregate_stats
+    # 窗口 ≤2 天（08-31~09-01，纯日期归一为当天起止）→ 小时粒度
+    r = aggregate_stats(days=365, start="2026-08-31", end="2026-09-01")
+    assert r["timeline"] == [{"date": "09-01 04:00", "count": 1, "granularity": "hour"},
+                             {"date": "09-02 04:00", "count": 1, "granularity": "hour"}]
+    # 窗口 >2 天 → 天粒度
+    r2 = aggregate_stats(days=365, start="2026-08-01", end="2026-09-02")
+    assert [b["date"] for b in r2["timeline"]] == ["09-01", "09-02"]
+    assert all(b["granularity"] == "day" for b in r2["timeline"])
+
+
 def test_aggregate_stats_days_filter(tmp_path, monkeypatch):
     db = _use_tmp_telemetry(tmp_path, monkeypatch)
     old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
