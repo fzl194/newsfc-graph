@@ -81,6 +81,7 @@ const ENDPOINTS = [
   { value: '/domains', label: 'POST /domains' },
   { value: 'mcp:get_md', label: 'mcp:get_md' },
   { value: 'mcp:get_domains', label: 'mcp:get_domains' },
+  { value: 'mcp:search_graph', label: 'mcp:search_graph' },
   { value: 'mcp:search_objects', label: 'mcp:search_objects' },
   { value: 'mcp:search_md', label: 'mcp:search_md' },
   { value: 'mcp:get_object', label: 'mcp:get_object' },

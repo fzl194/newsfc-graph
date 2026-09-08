@@ -137,25 +137,33 @@ export const userActivity = (
 ): Promise<{ ts: string; endpoint: string; caller: string; operator: string }[]> =>
   _req(`${BASE}/users/${encodeURIComponent(name)}/activity?days=${days}`)
 
-// ---------- MCP 工具配置（admin）----------
+// ---------- MCP 工具配置（admin；v13 三态 + 补充说明）----------
 
 export interface McpToolRow {
   name: string
-  enabled: boolean
-  description: string // '' = 用默认描述
-  default_description: string
+  visibility: 'visible' | 'hidden' | 'disabled'
+  enabled: boolean // 兼容字段 = visibility !== 'disabled'
+  supplemental_description: string // '' = 无补充；只追加在 canonical 之后
+  description: string // supplemental_description 的兼容别名
+  default_description: string // canonical（代码 docstring，不可覆盖）
+  is_legacy: boolean
 }
 
 export interface McpToolsConfig {
   tools: McpToolRow[]
-  instructions: string // '' = 用默认说明
-  default_instructions: string
+  instructions: string // 补充说明（'' = 纯 canonical）
+  default_instructions: string // canonical 总体说明（不可覆盖）
+  instructions_legacy_backup: string
 }
 
 export const listMcpTools = (): Promise<McpToolsConfig> => _req(`${BASE}/mcp-tools`)
 
 export const updateMcpTools = (b: {
-  tools?: { name: string; enabled: boolean; description: string }[]
+  tools?: {
+    name: string
+    visibility: McpToolRow['visibility']
+    supplemental_description: string
+  }[]
   instructions?: string
 }): Promise<McpToolsConfig> =>
   _req(`${BASE}/mcp-tools`, {

@@ -1,7 +1,9 @@
 # MCP 配置指南
 
-> 图谱查询 MCP 服务（`/mcp`，5 工具）的完整接入配置：服务端启动 → 获取 API KEY →
+> 图谱查询 MCP 服务（`/mcp`，3 个公开工具）的完整接入配置：服务端启动 → 获取 API KEY →
 > 各类客户端配置 → 云 Agent 用户身份传递 → 验证排障。
+> 2026-09-08 三工具重构：公开工具收敛为 get_domains / search_graph / get_md；
+> 旧三工具（search_objects/search_md/get_object）hidden 兼容（deprecated）。
 > 工具参数与返回明细见 [../图谱平台接口文档.md](../图谱平台接口文档.md) §2。
 
 ## 0. 接入模型（一图看懂）
@@ -13,11 +15,10 @@ Agent（Claude Code / Cursor / 云 Agent）
   ▼
 http://<平台地址>:8000/mcp
   │
-  ├─ get_domains      全部业务域 md（推荐第一步）
-  ├─ get_md           批量取对象 md（沿 [[ID]] 逐层下钻）
-  ├─ search_objects   元数据搜索（id/名称/层/网元）
-  ├─ search_md        正文全文搜索（FTS5 相关度召回）
-  └─ get_object       单对象结构化 + 出边
+  ├─ get_domains      全部业务域 md（业务方案定位入口）
+  ├─ search_graph     统一搜索（元数据+正文；多关键词 terms + any/all）
+  └─ get_md           批量取对象 md（权威原文；沿 references/[[ID]] 下钻）
+  ── hidden 兼容：search_objects / search_md / get_object（deprecated）
         ▲
         └─ 每次工具调用必传：AGENT_USERNAME / AGENT_SESSION_ID（用户工号+会话ID，
            从沙箱环境变量读取后传入——打点归因用，不影响结果）
@@ -119,7 +120,7 @@ claude mcp add --transport http graph http://<平台地址>:8000/mcp \
 ## 4. 用户身份传递（云 Agent 场景，关键）
 
 云 Agent 的 MCP 连接是平台级共用的，但每个使用者的工号/会话ID不同——因此
-**身份不进 header，进工具参数**。全部 5 个工具都有两个必填参数：
+**身份不进 header，进工具参数**。全部 3 个公开工具都有两个必填参数：
 
 | 工具参数 | 取值来源（沙箱环境变量） | 用途 |
 |---|---|---|
@@ -133,16 +134,19 @@ claude mcp add --transport http graph http://<平台地址>:8000/mcp \
 
 ```text
 【图谱 MCP 工具调用规范】
-调用 graph 服务的任何工具（get_domains / get_md / search_objects / search_md /
-get_object）时，必须同时传入：
+调用 graph 服务的任何工具（get_domains / search_graph / get_md）时，必须同时传入：
 - AGENT_USERNAME：从环境变量 _AGENT_USERNAME 读取的当前用户工号
 - AGENT_SESSION_ID：从环境变量 _AGENT_SESSION_ID 读取的当前会话ID
 这两个参数仅用于平台取用统计与追溯，不影响查询结果，但不可省略。
 
 【图谱查询建议路径】
-1. 先 get_domains 看全部业务域，按用户需求锁定业务域；
-2. 不确定对象 ID 时用 search_md 按业务关键词召回，或 search_objects 按名称/层过滤；
-3. 用 get_md 取完整 md，提取正文中的 [[ID]] 引用继续逐层下钻（业务层→任务层→特性层→命令层）。
+1. 已知准确对象 ID：直接 get_md。
+2. 不知道 ID：search_graph 定位候选（多个关键词放 terms 数组：["计费欺诈","免费RG"]，
+   默认 match=any 任一命中即召回；"ADD URR" 这类带空格的算一个短语 term）；
+   选定候选后必须 get_md 取完整原文——搜索摘要不是权威依据。
+3. 业务方案定位：get_domains 看全部业务域，沿 references/[[ID]] 引用 get_md
+   逐层下钻（业务层→任务层→特性层→命令层）。
+4. 参数字段范围：定位 MMLCommand 后 get_md，以 CommandParameter 段为准。
 ```
 
 > 说明：Agent 的工具参数名不允许下划线开头，所以环境变量是 `_AGENT_USERNAME`
@@ -154,11 +158,11 @@ get_object）时，必须同时传入：
 
 | 工具 | 必填参数 | 选填参数 | 一句话用途 |
 |---|---|---|---|
-| `get_domains` | 工号 + 会话ID | — | 全部业务域 md（入口，量小可全读） |
-| `get_md` | `ids[]`(1~100) + 工号 + 会话ID | `version` | 批量取对象完整 md（全程主力；总量≤2MB） |
-| `search_objects` | 工号 + 会话ID | `q`/`layer`/`type`/`nf`/`version`/`domain`/`scenario`/`page`/`size` | 元数据搜索（id/名称，不搜正文） |
-| `search_md` | `q` + 工号 + 会话ID | `layer`/`type`/`nf`/`version`/`limit`/`offset` | 正文全文搜索，相关度+高亮片段 |
-| `get_object` | `id` + 工号 + 会话ID | `version` | 单对象结构化详情+出边 |
+| `get_domains` | 工号 + 会话ID | — | 全部业务域 md + references（入口，量小可全读） |
+| `search_graph` | `terms[]`(1~10) + 工号 + 会话ID | `match`/`layer`/`type`/`nf`/`version`/`domain`/`scenario`/`page`/`size` | 统一搜索（元数据+正文），定位候选 ID |
+| `get_md` | `ids[]`(1~100) + 工号 + 会话ID | `version` | 批量取对象完整 md（权威原文；总量≤2MB） |
+
+兼容工具（deprecated，默认不出现在 tools/list，旧客户端仍可直调）：`search_objects`（元数据搜索）/ `search_md`（正文短语搜索）/ `get_object`（单对象+出边）——新接入不要使用。
 
 ## 6. 验证与排障
 
@@ -174,7 +178,7 @@ curl -s http://<平台地址>:8000/mcp \
         "protocolVersion":"2025-03-26","capabilities":{},
         "clientInfo":{"name":"curl","version":"0.0.0"}}}'
 
-# tools/list —— 应返回 5 个工具
+# tools/list —— 应返回 3 个公开工具（get_domains/search_graph/get_md）
 curl -s http://<平台地址>:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -189,9 +193,11 @@ curl -s http://<平台地址>:8000/mcp \
 | HTTP 401 `missing or invalid api key` | 未带 / KEY 错误 | 检查 header 名大小写不敏感、KEY 是否被重置 |
 | HTTP 403 `permission denied` | 用户无 skill 权限 | admin 给该用户勾 can_skill（或 can_frontend） |
 | 客户端连接超时 | 端口未放通 / 未 `--host 0.0.0.0` | 先 `curl http://<IP>:8000/docs` 验证 Web 通 |
-| 工具报「全文索引重建中」 | 平台启动初 FTS 后台重建 | 稍等重试（重建中搜索明确报错，不返回残缺结果） |
+| 工具报「全文索引重建中」(INDEX_REBUILDING) | 平台启动初 FTS 后台重建 | 稍等重试（重建中搜索明确报错，不返回残缺结果） |
+| INVALID_FILTER / INVALID_FILTER_COMBINATION | search_graph 传了非法过滤值或组合 | 按 details.available_values 修正，不要原样重试 |
+| SEARCH_TOO_BROAD | 命中量超预算 | 增加 nf/type/layer 过滤或减少 terms |
 | get_md 报 ids/总量超限 | >100 id 或响应 >2MB | 按提示分批，每批 ≤50 个 id |
-| MCP 工具 isError=true | 参数校验失败/对象不存在 | 错误信息为中文描述，按提示修正 |
+| MCP 工具 isError=true | 参数校验/业务错误 | content[0].text 是 {"error":{code,message,...}} JSON，按错误码修正 |
 
 ### 6.3 打点核对（确认归因是否生效）
 
@@ -209,13 +215,14 @@ admin 登录平台 → 顶部「MCP 工具」页（仅 admin 可见），可配�
 
 | 配置项 | 说明 | 生效语义 |
 |---|---|---|
-| 工具启用开关 | 5 个工具逐个启用/禁用 | **禁用 = 隐藏 + 拦截**：tools/list 不再出现该工具（Agent 看不到），直连调用也返回明确中文错误「已被管理员禁用」兜底 |
-| 工具描述 | 每个 tools/list 里 Agent 看到的说明文字 | **完全替换**默认描述（代码内 docstring）；清空 = 恢复默认 |
-| 服务总体说明 | initialize 时 Agent 收到的 instructions | **完全替换**默认说明；清空 = 恢复默认 |
+| visibility 三态 | 每工具 visible / hidden / disabled | **visible**=展示+可调；**hidden**=不展示但仍可直调（兼容已缓存旧 schema 的客户端）；**disabled**=不展示+返回 TOOL_DISABLED |
+| 补充说明 | tools/list 里追加在 canonical 描述之后的文字 | **只追加不覆盖**（接口契约/schema/错误码由代码固定）；清空 = 仅 canonical |
+| 服务总体说明 | initialize 时 Agent 收到的 instructions | 同样**只追加**在 canonical 决策树之后；清空 = 仅 canonical |
 
 要点：
 
 - **全局生效**：一套配置对所有 API KEY / 所有用户生效（不做按用户差异化）
 - **保存即生效，无需重启**：启用状态与描述每请求实时读库；总体说明即时应用
 - **重启不丢**：配置持久化在 platform.db（`mcp_tools` 表 + `meta.mcp_instructions`），服务重启自动恢复
-- 配置 API（admin 的 KEY 调用）：`GET /api/v1/mcp-tools` 查看全量；`PATCH /api/v1/mcp-tools` 保存（body：`{"tools": [{"name", "enabled", "description"}], "instructions": "..."}`）
+- 配置 API（admin 的 KEY 调用）：`GET /api/v1/mcp-tools` 查看全量；`PATCH /api/v1/mcp-tools` 保存（body：`{"tools": [{"name", "visibility", "supplemental_description"}], "instructions": "..."}`）。旧字段 `enabled`/`description` 仍收（兼容映射：enabled=true→visible/hidden，false→disabled）
+- **旧说明备份**：2026-09-08 升级前如配置过总体说明（旧语义=全文覆盖），升级时自动备份停用（含已下线 search_md 引导，继续生效会误导）；管理页可查看备份内容，把仍适用部分重新加入补充说明

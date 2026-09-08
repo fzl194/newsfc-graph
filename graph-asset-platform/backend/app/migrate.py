@@ -71,9 +71,11 @@ def build_index_db(conn: sqlite3.Connection, store: Store, registry: Registry) -
         "INSERT OR REPLACE INTO meta(key, value) VALUES('dangling', ?)",
         (str(bool(dangling)),),
     )
-    # FTS 全量重建（objects 清空重写，md_fts 同步重灌——单事务原子替换）
-    from .repos import fts_repo
+    # FTS 全量重建（objects 清空重写，双 FTS + object_latest 同步重灌，v12）
+    from .repos import fts_repo, graph_search_repo, object_latest_repo
     fts_repo.rebuild_from_objects(conn)
+    graph_search_repo.rebuild_from_objects(conn)
+    object_latest_repo.rebuild(conn)
     conn.commit()
     print(f"[migrate] 完成：{n_obj} 对象 / {n_edge} 边 / {n_skip} 跳过", flush=True)
     return {"objects": n_obj, "edges": n_edge, "skipped": n_skip}

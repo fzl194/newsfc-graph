@@ -80,6 +80,42 @@ def test_frontend_user_cannot_users(tmp_path, monkeypatch, tmp_data_dir):
         assert c.get("/api/v1/users", headers={"X-API-Key": "gap_fe"}).status_code == 403
 
 
+# ---------------- REST 图谱双接口 401/403 envelope（2026-09-08 三工具重构 §5.2） ----------------
+
+def test_graph_routes_401_uses_error_envelope(tmp_path, monkeypatch, tmp_data_dir):
+    """未带 KEY → 401 + {"error": {GraphError}}（其余路径保持 {"detail"}）。"""
+    _seed(tmp_path, monkeypatch, [ADMIN])
+    from app.main import app
+    with TestClient(app) as c:
+        r = c.post("/api/v1/domains", json={})
+        assert r.status_code == 401
+        assert r.json()["error"]["code"] == "UNAUTHENTICATED"
+        r2 = c.post("/api/v1/md", json={})
+        assert r2.status_code == 401
+        assert r2.json()["error"]["code"] == "UNAUTHENTICATED"
+        # 非图谱路径不受影响（前端 api.ts 兼容）
+        r3 = c.get("/api/v1/names")
+        assert r3.status_code == 401
+        assert "detail" in r3.json()
+
+
+def test_graph_routes_403_uses_error_envelope(tmp_path, monkeypatch, tmp_data_dir):
+    """无 skill 权限 → 403 envelope；can_skill/can_frontend 放行到路由层。"""
+    _seed(tmp_path, monkeypatch, [
+        {"username": "am", "key": "gap_am", "can_assets": True},  # 无 skill/frontend
+        SK,
+    ])
+    from app.main import app
+    with TestClient(app) as c:
+        r = c.post("/api/v1/md", headers={"X-API-Key": "gap_am"}, json={})
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "PERMISSION_DENIED"
+        # can_skill → 放行到路由层（空 body → 业务 422 INVALID_ARGUMENT envelope）
+        r2 = c.post("/api/v1/md", headers={"X-API-Key": "gap_sk"}, json={})
+        assert r2.status_code == 422
+        assert r2.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
 # ---------------- assets / upload / test 权限 ----------------
 
 def test_frontend_without_assets_denied_fs(tmp_path, monkeypatch, tmp_data_dir):

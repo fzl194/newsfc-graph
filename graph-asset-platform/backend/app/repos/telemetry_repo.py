@@ -23,7 +23,10 @@ _STATS_CALLERS = ("skill", "mcp")
 #   level=object），供单独导出；运维页统计热榜同此数据源。
 # - all：两类全含。
 # caller 恒为 skill/mcp（web 不在暴露面）；网页端浏览不打点。
+# v12（2026-09-08 三工具重构）：新增 mcp:search_graph；legacy 三端点保留
+# （历史数据与兼容期直调继续进统计/底表，§13.2）。
 _CALL_ENDPOINTS = ("/md", "/domains", "mcp:get_md", "mcp:get_domains",
+                   "mcp:search_graph",
                    "mcp:search_objects", "mcp:search_md", "mcp:get_object")
 _SCOPE_LEVELS = {"call": ("tool",), "object": ("object",),
                  "all": ("object", "tool")}

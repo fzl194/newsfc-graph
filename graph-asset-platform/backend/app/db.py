@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "13"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -112,14 +112,20 @@ CREATE TABLE IF NOT EXISTS test_artifacts(
   path TEXT, kind TEXT, size INT
 );
 
--- MCP 工具配置（admin 前端可配，2026-08-25）：enabled=0 隐藏+拦截；description
--- ''=用代码默认（docstring）。服务总体说明存 meta 表 key='mcp_instructions'。
+-- MCP 工具配置（admin 前端可配，2026-08-25；v13 三态迁移 2026-09-08）：
+-- visibility 三态（visible 展示+可调 / hidden 不展示+可调 / disabled 不展示+
+-- TOOL_DISABLED）；description 物理列复用存 supplemental_description（API/UI
+-- 改名，仅追加不覆盖 canonical）；enabled 列仅供旧数据迁移读取，新代码以
+-- visibility 判定。服务总体说明存 meta 表 key='mcp_instructions'（v13 起语义=
+-- 追加补充，canonical 在代码）。
 CREATE TABLE IF NOT EXISTS mcp_tools(
   tool_name TEXT PRIMARY KEY,
   enabled INT NOT NULL DEFAULT 1,
   description TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT '',
-  updated_by TEXT NOT NULL DEFAULT ''
+  updated_by TEXT NOT NULL DEFAULT '',
+  visibility TEXT NOT NULL DEFAULT 'visible'
+    CHECK(visibility IN ('visible','hidden','disabled'))
 );
 -- 抽取产物清单（v9，抽取任务化 2026-08-26）：入图闸门 confirm 后写入，按任务回退
 -- （revert）的依据。op: add=本次新增（回退=软删进回收站）；modify=本次覆盖（回退=
@@ -283,6 +289,35 @@ CREATE TABLE IF NOT EXISTS "B_AI_NE_VERSION_MAPPING_T" (
   "DOMAIN_NAME_EN"   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vm_ne ON "B_AI_NE_VERSION_MAPPING_T"("PHYSICAL_NE_TYPE","LOCAL_VERSION");
+
+-- ============ 统一搜索（v12，三工具重构 2026-09-08）============
+-- 每 ID 最新版本物化（需求 §7.5：最新版过滤必须在 term 搜索前于 SQL 生效）。
+-- version 沿用 objects 的 DB 表示（无版本=空串""，禁写 NULL）；刷新一律走
+-- repos/object_latest_repo（Python latest_version 语义化比较，禁 SQL MAX）。
+CREATE TABLE IF NOT EXISTS object_latest(
+  id TEXT PRIMARY KEY,
+  version TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- 统一搜索 FTS（§7.3/§12.2）：metadata_text=规范化 id/name/name_zh 换行连接；
+-- body_text=规范化正文（原始 body_md 留在 objects 供 snippet）。旧 md_fts 在
+-- legacy 周期内保留给 search_md。trigram：中英统一子串语义 + LIKE 走索引。
+CREATE VIRTUAL TABLE IF NOT EXISTS graph_search_fts USING fts5(
+  obj_id UNINDEXED, version UNINDEXED,
+  metadata_text, body_text,
+  tokenize='trigram'
+);
+
+-- 伴生映射（同 md_fts_map v7 教训：按 UNINDEXED 列 DELETE 是全 FTS 扫，
+-- 批量 reindex 每文件一扫成 O(N²)）——按 rowid O(1) 删。
+CREATE TABLE IF NOT EXISTS graph_search_map(
+  obj_id TEXT NOT NULL, version TEXT NOT NULL, fts_rowid INTEGER NOT NULL,
+  PRIMARY KEY(obj_id, version)
+) WITHOUT ROWID;
+
+-- 搜索过滤索引（§12.2，EXPLAIN 驱动不过度堆索引）
+CREATE INDEX IF NOT EXISTS idx_objects_nf_type_version ON objects(nf, type, version);
+CREATE INDEX IF NOT EXISTS idx_objects_domain_scenario ON objects(domain, scenario);
 """
 
 
@@ -355,6 +390,55 @@ def init_schema(conn: sqlite3.Connection) -> None:
     ).fetchone():
         conn.execute("DELETE FROM telemetry WHERE level='request'")
         conn.execute("INSERT INTO meta(key, value) VALUES('telemetry_request_purged','1')")
+    # v12 迁移（三工具重构 2026-09-08）：① object_latest 一次性回填（Python
+    # 语义化取最新，禁 SQL MAX）② graph_search_fts 一次性灌入（规范化文本）。
+    # 用**完整性检查**（而非"表空才建"）判幂等：rebuild 分块提交中途崩溃留下的
+    # 半灌入态也会被识别重灌（代码审查 MEDIUM）；完整性检查本身只做计数/行集
+    # 对账，成本可忽略。此后由 service 写路径增量维护；启动对账兜底内容漂移。
+    from .repos import graph_search_repo, object_latest_repo
+    if conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]:
+        if not object_latest_repo.integrity_ok(conn):
+            object_latest_repo.rebuild(conn)
+        if not graph_search_repo.integrity_ok(conn):
+            graph_search_repo.rebuild_from_objects(conn)
+    # v13 迁移（三工具重构 M3，一次性——哨兵防重，幂等）：① mcp_tools 加
+    # visibility 三态列（存量 enabled=0→disabled，=1→visible）；② legacy 三工具
+    # 设 hidden（可直调不出现在 tools/list）；③ 插入 search_graph=visible；
+    # ④ meta.mcp_instructions 旧值（5 工具时代全文覆盖）备份到
+    # mcp_instructions_legacy_backup 并清空 active——旧说明含已下线的 search_md
+    # 引导，继续生效会误导；管理员可从备份把仍适用内容重新加入补充说明。
+    mcols = {r[1] for r in conn.execute("PRAGMA table_info(mcp_tools)")}
+    if mcols and "visibility" not in mcols:
+        conn.execute(
+            "ALTER TABLE mcp_tools ADD COLUMN visibility TEXT NOT NULL "
+            "DEFAULT 'visible' "
+            "CHECK(visibility IN ('visible','hidden','disabled'))")
+        conn.execute(
+            "UPDATE mcp_tools SET visibility="
+            "CASE WHEN enabled=0 THEN 'disabled' ELSE 'visible' END")
+    if not conn.execute(
+        "SELECT value FROM meta WHERE key='mcp_visibility_migrated'"
+    ).fetchone():
+        for tool in ("search_objects", "search_md", "get_object"):
+            conn.execute(
+                "INSERT INTO mcp_tools(tool_name, enabled, description, visibility) "
+                "VALUES(?, 1, '', 'hidden') "
+                "ON CONFLICT(tool_name) DO UPDATE SET visibility='hidden'",
+                (tool,))
+        conn.execute(
+            "INSERT INTO mcp_tools(tool_name, enabled, description, visibility) "
+            "VALUES('search_graph', 1, '', 'visible') "
+            "ON CONFLICT(tool_name) DO NOTHING")
+        old = conn.execute(
+            "SELECT value FROM meta WHERE key='mcp_instructions'").fetchone()
+        if old and old["value"]:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES('mcp_instructions_legacy_backup', ?)", (old["value"],))
+        conn.execute(
+            "UPDATE meta SET value='' WHERE key='mcp_instructions'")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('mcp_visibility_migrated','1')")
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (SCHEMA_VERSION,),

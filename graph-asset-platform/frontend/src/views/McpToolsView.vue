@@ -4,7 +4,8 @@
       <div>
         <h1 class="page-title">MCP 工具配置</h1>
         <p class="page-sub">
-          控制 /mcp 服务对 Agent 暴露的工具与说明——全局生效，保存即生效（无需重启）
+          控制 /mcp 服务对 Agent 暴露的工具与说明——全局生效，保存即生效（无需重启）。
+          工具的接口契约（schema / 错误码 / canonical 描述）由代码固定，此处只能补充说明。
         </p>
       </div>
       <el-button type="primary" :loading="saving" :disabled="!dirty" @click="save">
@@ -13,27 +14,76 @@
     </header>
 
     <div class="table-card stagger-in">
-      <el-table :data="tools" v-loading="loading" :show-header="true">
+      <div class="section-head">
+        <div class="card-title">公开工具（Agent 在 tools/list 看到）</div>
+        <div class="card-sub">状态：visible 展示且可调 / hidden 不展示但仍可直调（兼容旧客户端）/ disabled 拦截调用</div>
+      </div>
+      <el-table :data="publicTools" v-loading="loading" :show-header="true">
+        <el-table-column label="工具" width="150">
+          <template #default="{ row }">
+            <code class="tool-name">{{ row.name }}</code>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="150">
+          <template #default="{ row }">
+            <el-select v-model="row.visibility" size="small" @change="markDirty">
+              <el-option label="visible（展示）" value="visible" />
+              <el-option label="hidden（隐藏可调）" value="hidden" />
+              <el-option label="disabled（禁用）" value="disabled" />
+            </el-select>
+          </template>
+        </el-table-column>
+        <el-table-column label="补充说明（追加在 canonical 描述之后；清空=仅 canonical）" min-width="460">
+          <template #default="{ row }">
+            <el-input
+              v-model="row.supplemental_description"
+              type="textarea"
+              :autosize="{ minRows: 2, maxRows: 6 }"
+              placeholder="留空 = 仅使用代码默认描述"
+              @input="markDirty"
+            />
+            <details class="canonical-box">
+              <summary>canonical 描述（只读，不可覆盖）</summary>
+              <pre class="canonical-pre">{{ row.default_description }}</pre>
+            </details>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <div class="table-card stagger-in">
+      <div class="section-head">
+        <div class="card-title">兼容工具（已下线，默认 hidden）</div>
+        <div class="card-sub">
+          不出现在新 Agent 的 tools/list，但已缓存旧 schema 的客户端仍可直调（deprecated）。
+          观测一个发布周期调用量为 0 后再考虑 disabled。
+        </div>
+      </div>
+      <el-table :data="legacyTools" v-loading="loading" :show-header="true">
         <el-table-column label="工具" width="150">
           <template #default="{ row }">
             <div class="tool-cell">
               <code class="tool-name">{{ row.name }}</code>
-              <span v-if="!row.enabled" class="off-badge">已禁用</span>
+              <span class="off-badge">deprecated</span>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="启用" width="80">
+        <el-table-column label="状态" width="150">
           <template #default="{ row }">
-            <el-switch v-model="row.enabled" @change="markDirty" />
+            <el-select v-model="row.visibility" size="small" @change="markDirty">
+              <el-option label="hidden（隐藏可调）" value="hidden" />
+              <el-option label="disabled（禁用）" value="disabled" />
+              <el-option label="visible（回滚展示）" value="visible" />
+            </el-select>
           </template>
         </el-table-column>
-        <el-table-column label="描述（Agent 在 tools/list 看到的说明；清空恢复默认）" min-width="480">
+        <el-table-column label="补充说明" min-width="460">
           <template #default="{ row }">
             <el-input
-              v-model="row.description"
+              v-model="row.supplemental_description"
               type="textarea"
-              :autosize="{ minRows: 2, maxRows: 8 }"
-              placeholder="留空使用默认描述"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              placeholder="留空 = 仅使用代码默认描述"
               @input="markDirty"
             />
           </template>
@@ -46,30 +96,46 @@
         <div>
           <div class="card-title">服务总体说明（instructions）</div>
           <div class="card-sub">
-            Agent 建立连接时收到的服务说明（推荐查询路径等）。输入框已预填默认值，清空恢复默认。
+            Agent 建立连接时收到的服务说明。输入框内容作为<b>补充</b>追加在 canonical
+            决策树之后，清空 = 仅 canonical。canonical 不可覆盖。
           </div>
         </div>
-        <el-button link size="small" @click="resetInstructions">恢复默认说明</el-button>
+        <el-button link size="small" @click="resetInstructions">清空补充</el-button>
       </div>
+      <details class="canonical-box">
+        <summary>canonical 总体说明（只读）</summary>
+        <pre class="canonical-pre">{{ defaultInstructions }}</pre>
+      </details>
       <el-input
         v-model="instructions"
         type="textarea"
-        :autosize="{ minRows: 3, maxRows: 12 }"
-        placeholder="留空使用默认说明"
+        :autosize="{ minRows: 2, maxRows: 8 }"
+        placeholder="补充说明（追加在 canonical 之后），留空 = 仅 canonical"
         @input="markDirty"
       />
+      <div v-if="legacyBackup" class="backup-note">
+        检测到旧版全文覆盖说明（升级时已自动备份停用）：
+        <el-button link size="small" @click="showBackup = !showBackup">
+          {{ showBackup ? '收起' : '查看备份内容' }}
+        </el-button>
+        <pre v-if="showBackup" class="canonical-pre backup-pre">{{ legacyBackup }}</pre>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ElButton, ElInput, ElSwitch, ElTable, ElTableColumn, ElMessage } from 'element-plus'
+import {
+  ElButton, ElInput, ElOption, ElSelect, ElTable, ElTableColumn, ElMessage,
+} from 'element-plus'
 import { listMcpTools, updateMcpTools, type McpToolRow } from '../api'
 
 const tools = ref<McpToolRow[]>([])
 const instructions = ref('')
 const defaultInstructions = ref('')
+const legacyBackup = ref('')
+const showBackup = ref(false)
 const loading = ref(false)
 const saving = ref(false)
 const dirty = ref(false)
@@ -77,9 +143,16 @@ const dirty = ref(false)
 // 初始快照（脏检查基准）：保存/加载后刷新
 let baseline = ''
 
+const publicTools = computed(() => tools.value.filter((t) => !t.is_legacy))
+const legacyTools = computed(() => tools.value.filter((t) => t.is_legacy))
+
 const snapshot = computed(() =>
   JSON.stringify({
-    tools: tools.value.map((t) => ({ name: t.name, enabled: t.enabled, description: t.description })),
+    tools: tools.value.map((t) => ({
+      name: t.name,
+      visibility: t.visibility,
+      supplemental_description: t.supplemental_description,
+    })),
     instructions: instructions.value,
   }),
 )
@@ -88,15 +161,9 @@ function markDirty(): void {
   dirty.value = snapshot.value !== baseline
 }
 
-// 恢复默认说明也是一次变更（审查修正：漏 markDirty 会卡死保存按钮）
 function resetInstructions(): void {
-  instructions.value = defaultInstructions.value
+  instructions.value = ''
   markDirty()
-}
-
-// 展示值 ↔ 存储值：空存储预填默认进输入框；保存时与默认相同则存空（代码默认升级仍能透出）
-function displayDesc(t: McpToolRow): string {
-  return t.description || t.default_description
 }
 
 async function load(): Promise<void> {
@@ -104,11 +171,9 @@ async function load(): Promise<void> {
   try {
     const cfg = await listMcpTools()
     tools.value = cfg.tools
-    tools.value.forEach((t) => {
-      t.description = displayDesc(t)
-    })
-    instructions.value = cfg.instructions || cfg.default_instructions
+    instructions.value = cfg.instructions
     defaultInstructions.value = cfg.default_instructions
+    legacyBackup.value = cfg.instructions_legacy_backup || ''
     baseline = snapshot.value
     dirty.value = false
   } catch (e) {
@@ -124,17 +189,15 @@ async function save(): Promise<void> {
     const cfg = await updateMcpTools({
       tools: tools.value.map((t) => ({
         name: t.name,
-        enabled: t.enabled,
-        description: t.description === t.default_description ? '' : t.description,
+        visibility: t.visibility,
+        supplemental_description: t.supplemental_description,
       })),
-      instructions: instructions.value === defaultInstructions.value ? '' : instructions.value,
+      instructions: instructions.value,
     })
     tools.value = cfg.tools
-    tools.value.forEach((t) => {
-      t.description = displayDesc(t)
-    })
-    instructions.value = cfg.instructions || cfg.default_instructions
+    instructions.value = cfg.instructions
     defaultInstructions.value = cfg.default_instructions
+    legacyBackup.value = cfg.instructions_legacy_backup || ''
     baseline = snapshot.value
     dirty.value = false
     ElMessage.success('已保存，对 Agent 立即生效')
@@ -168,8 +231,7 @@ onMounted(load)
   gap: var(--space-4);
 }
 
-/* flex 子项禁止压缩（否则 overflow:hidden 卡片被压扁裁行、页面永不出滚动条——
-   放大/高分屏下"只见 4/3 个工具"根因，2026-08-25 用户反馈） */
+/* flex 子项禁止压缩（否则 overflow:hidden 卡片被压扁裁行） */
 .page-head,
 .table-card,
 .instructions-card {
@@ -196,8 +258,21 @@ onMounted(load)
   box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
+.section-head {
+  padding: var(--space-4) var(--space-5) var(--space-2);
+}
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.card-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
 
-/* 工具名 + 禁用徽标 */
+/* 工具名 + deprecated 徽标 */
 .tool-cell {
   display: inline-flex;
   align-items: center;
@@ -216,11 +291,36 @@ onMounted(load)
 .off-badge {
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--danger);
-  background: rgba(220, 38, 38, 0.08);
-  border: 1px solid rgba(220, 38, 38, 0.2);
+  color: var(--warn, #b45309);
+  background: rgba(180, 83, 9, 0.08);
+  border: 1px solid rgba(180, 83, 9, 0.2);
   border-radius: 999px;
   padding: 1px 7px;
+}
+
+/* canonical 描述折叠框 */
+.canonical-box {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.canonical-box summary {
+  cursor: pointer;
+  user-select: none;
+}
+.canonical-pre {
+  margin: 6px 0 0;
+  padding: var(--space-3);
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
 }
 
 /* 总体说明卡片 */
@@ -236,14 +336,11 @@ onMounted(load)
   justify-content: space-between;
   gap: var(--space-4);
 }
-.card-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-}
-.card-sub {
-  margin-top: 2px;
+.backup-note {
   font-size: 12px;
   color: var(--text-muted);
+}
+.backup-pre {
+  margin-top: 6px;
 }
 </style>

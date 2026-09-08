@@ -127,16 +127,19 @@ def test_mcp_403_without_skill_perm(tmp_data_dir, monkeypatch):
 
 # ---------------- 协议 ----------------
 
-def test_tools_list_returns_5_tools(tmp_data_dir, monkeypatch):
+def test_tools_list_returns_3_public_tools(tmp_data_dir, monkeypatch):
+    """v13 三态迁移后 tools/list 只展示 get_domains/search_graph/get_md（§15.4）。"""
     _setup(tmp_data_dir, monkeypatch)
     with _client() as c:
         r = c.post("/mcp", headers={"X-API-Key": "gap_admin", **ACC},
                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert r.status_code == 200
-        names = {t["name"] for t in r.json()["result"]["tools"]}
-        assert names == {"get_domains", "get_md", "search_objects", "search_md", "get_object"}
+        tools = r.json()["result"]["tools"]
+        names = {t["name"] for t in tools}
+        assert names == {"get_domains", "get_md", "search_graph"}
+        by = {t["name"]: t for t in tools}
         # 上下文参数必填（required）且 description 指向沙箱环境变量
-        get_md = next(t for t in r.json()["result"]["tools"] if t["name"] == "get_md")
+        get_md = by["get_md"]
         assert "AGENT_USERNAME" in get_md["inputSchema"]["required"]
         assert "AGENT_SESSION_ID" in get_md["inputSchema"]["required"]
         assert "_AGENT_USERNAME" in get_md["inputSchema"]["properties"]["AGENT_USERNAME"]["description"]
@@ -144,6 +147,96 @@ def test_tools_list_returns_5_tools(tmp_data_dir, monkeypatch):
         assert get_md["inputSchema"]["properties"]["AGENT_USERNAME"]["maxLength"] == 64
         assert get_md["inputSchema"]["properties"]["AGENT_SESSION_ID"]["minLength"] == 1
         assert get_md["inputSchema"]["properties"]["AGENT_SESSION_ID"]["maxLength"] == 128
+        # schema-first（§9.1/§15.2）：enum/min/max/description/additionalProperties
+        sg = by["search_graph"]
+        assert sg["inputSchema"]["properties"]["match"]["enum"] == ["any", "all"]
+        assert sg["inputSchema"]["properties"]["terms"]["minItems"] == 1
+        assert sg["inputSchema"]["properties"]["terms"]["maxItems"] == 10
+        assert sg["inputSchema"]["properties"]["size"]["maximum"] == 50
+        assert sg["inputSchema"]["properties"]["page"]["minimum"] == 1
+        layer_spec = sg["inputSchema"]["properties"]["layer"]
+        layer_enum = layer_spec.get("enum") or layer_spec["anyOf"][0]["enum"]
+        assert layer_enum == ["命令层", "特性层", "任务层", "业务层"]
+        for fname, spec in sg["inputSchema"]["properties"].items():
+            assert spec.get("description"), f"search_graph.{fname} 缺 description"
+        assert sg["inputSchema"]["additionalProperties"] is False
+        # 三工具 outputSchema 非空（§8.3：真实 tools/list 验证）
+        assert sg["outputSchema"], "search_graph outputSchema 必须非空"
+        assert by["get_domains"]["outputSchema"], "get_domains outputSchema 必须非空"
+        assert get_md["outputSchema"], "get_md outputSchema 必须非空"
+        # get_md outputSchema：动态 ID map + success/failure 联合（§8.3）
+        ap = get_md["outputSchema"].get("additionalProperties") or {}
+        assert "anyOf" in ap or "oneOf" in ap or "$ref" in ap
+        # ids 护栏进 schema
+        assert get_md["inputSchema"]["properties"]["ids"]["maxItems"] == 100
+
+
+def test_hidden_legacy_still_callable_with_old_shape(tmp_data_dir, monkeypatch):
+    """默认态旧工具不出现在 tools/list，但 hidden 可被旧客户端直调且形态冻结（§11.3）。"""
+    s = _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD,
+                                           "Feature/UDG/20.15.2/f.md": FEATURE})
+    with _client() as c:
+        # 直调 hidden 旧工具仍成功
+        out = _call(c, "search_objects", {**_CTX, "q": "urr", "type": "MMLCommand"})
+        assert out["total"] == 1
+        assert out["rows"][0]["id"] == "UDG@MMLCommand@ADD URR"
+        out2 = _call(c, "search_md", {**_CTX, "q": "计费"})
+        assert out2["total"] >= 1 and "snippet" in out2["hits"][0]
+        out3 = _call(c, "get_object", {**_CTX, "id": "UDG@MMLCommand@ADD URR"})
+        assert out3["type"] == "MMLCommand" and "out_edges" in out3
+        # legacy 打点：deprecated + replacement，且只写自己的旧 endpoint tool 行
+        from app.telemetry.recorder import flush as _tel_flush
+        assert _tel_flush()
+        rows = [dict(r) for r in s.db.execute(
+            "SELECT endpoint, result FROM telemetry WHERE level='tool' "
+            "ORDER BY rowid").fetchall()]
+        legacy = [r for r in rows if r["endpoint"].startswith("mcp:search")
+                  or r["endpoint"] == "mcp:get_object"]
+        assert len(legacy) == 3  # 每外部调用恰好 1 条旧 endpoint 行（§11.3）
+        for r in legacy:
+            res = json.loads(r["result"])
+            assert res["deprecated"] is True
+            assert res["replacement"] in ("search_graph", "get_md")
+        # 不产生新 endpoint 双重打点
+        assert not [r for r in rows if r["endpoint"] in ("mcp:search_graph", "mcp:get_md")]
+
+
+def test_disabled_legacy_returns_tool_disabled(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
+    from app.repos import mcp_tools_repo
+    from app.db import get_shared_db
+    from app.service import import_lock
+    with _client() as c:
+        conn = get_shared_db()
+        with import_lock:
+            mcp_tools_repo.upsert(conn, tool_name="search_md",
+                                  visibility="disabled", description="",
+                                  updated_by="admin")
+            conn.commit()
+        msg = _call_err(c, "search_md", {**_CTX, "q": "计费"})
+        body = json.loads(msg)
+        assert body["error"]["code"] == "TOOL_DISABLED"
+        assert "search_graph" in body["error"]["message"]
+
+
+def test_admin_rollback_makes_legacy_visible(tmp_data_dir, monkeypatch):
+    """管理员显式回滚态（visibility=visible）legacy 才重新出现在 tools/list（§11.3）。"""
+    _setup(tmp_data_dir, monkeypatch)
+    from app.repos import mcp_tools_repo
+    from app.db import get_shared_db
+    from app.service import import_lock
+    with _client() as c:
+        conn = get_shared_db()
+        with import_lock:
+            mcp_tools_repo.upsert(conn, tool_name="search_md",
+                                  visibility="visible", description="",
+                                  updated_by="admin")
+            conn.commit()
+        r = c.post("/mcp", headers={"X-API-Key": "gap_admin", **ACC},
+                   json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {t["name"] for t in r.json()["result"]["tools"]}
+        assert "search_md" in names
+        assert {"get_domains", "get_md", "search_graph"} <= names
 
 
 # ---------------- 工具语义 ----------------
@@ -190,12 +283,15 @@ def test_get_md_ids_cap(tmp_data_dir, monkeypatch):
 def test_get_md_byte_cap(tmp_data_dir, monkeypatch):
     s = _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD,
                                            "Feature/UDG/20.15.2/f.md": FEATURE})
-    import app.mcp_server as ms
-    monkeypatch.setattr(ms, "MAX_TOTAL_BYTES", 10)
+    # 护栏常量已移共享核心（graph_query.contracts，2026-09-08 三工具重构 M1）
+    import app.graph_query.contracts as gq
+    monkeypatch.setattr(gq, "MAX_TOTAL_BYTES", 10)
     with _client() as c:
         msg = _call_err(c, "get_md", {**_CTX,
                                       "ids": ["UDG@MMLCommand@ADD URR", "UDG@Feature@GWFD-020300"]})
     assert "分批" in msg
+    # 业务错误统一 envelope：{"error": {code, message, ...}}（§5.2）
+    assert json.loads(msg)["error"]["code"] == "RESULT_TOO_LARGE"
 
 
 def test_search_objects_over_http(tmp_data_dir, monkeypatch):
@@ -291,15 +387,21 @@ def test_tool_rows_record_params_and_result(tmp_data_dir, monkeypatch):
 
 
 def test_tool_row_records_error_result(tmp_data_dir, monkeypatch):
-    """护栏触发（ids 超限）→ tool 行 result 记 error 摘要。"""
+    """护栏触发（响应超限）→ tool 行 result 记结构化 error 摘要（失败也留痕）。
+
+    101 ids 现在在 schema 层被拒（maxItems 进 inputSchema，§9.1）——函数未执行
+    不落 tool 行，与 REST 解析失败不落行同口径；业务护栏失败仍留痕。"""
     s = _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
+    import app.graph_query.contracts as gq
+    monkeypatch.setattr(gq, "MAX_TOTAL_BYTES", 10)
     with _client() as c:
-        _call_err(c, "get_md", {**_CTX, "ids": [f"x@y@{i}" for i in range(101)]})
+        _call_err(c, "get_md", {**_CTX, "ids": ["UDG@MMLCommand@ADD URR"]})
     from app.telemetry.recorder import flush as _tel_flush
     assert _tel_flush()
     rows = [dict(r) for r in s.db.execute(
         "SELECT params, result FROM telemetry WHERE level='tool' AND endpoint='mcp:get_md'"
     ).fetchall()]
     assert rows
-    assert "error" in json.loads(rows[0]["result"])
-    assert len(json.loads(rows[0]["params"])["ids"]) == 101
+    result = json.loads(rows[0]["result"])
+    assert result["error"]["code"] == "RESULT_TOO_LARGE"
+    assert json.loads(rows[0]["params"])["ids"] == ["UDG@MMLCommand@ADD URR"]

@@ -1,0 +1,224 @@
+"""MCP / REST 双通道对账测试（M1，需求 §10/§15.3）。
+
+同一 fixture 同时走 MCP（/mcp JSON-RPC）与 REST（POST /api/v1/domains|/md）：
+业务数据、错误、护栏、遥测归因必须一致，仅允许 caller/endpoint 与外层包装差异。
+"""
+import json
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+from tests.test_api_objects import _setup, CMD_EDGES, CMD_V2, CFG
+
+BIZ = (
+    "---\n"
+    "id: alpha@BusinessDomain@demo\n"
+    "type: BusinessDomain\n"
+    "domain: demo\n"
+    "---\n"
+    "# 业务感知\n"
+    "引用 [[alpha@MMLCommand@ADD DEMO]]。\n"
+)
+
+ACC = {"Accept": "application/json, text/event-stream"}
+CTX = {"AGENT_USERNAME": "00234567", "AGENT_SESSION_ID": "sess-parity-1"}
+
+client = TestClient(app)
+
+
+def _seed(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch,
+           {"cmd.md": CMD_EDGES, "v2.md": CMD_V2, "cfg.md": CFG, "biz.md": BIZ})
+
+
+def _mcp(c, name, arguments, sid=1):
+    r = c.post("/mcp", headers={"X-API-Key": "gap_test_admin", **ACC},
+               json={"jsonrpc": "2.0", "id": sid, "method": "tools/call",
+                     "params": {"name": name, "arguments": arguments}})
+    assert r.status_code == 200, r.text
+    return r.json()["result"]
+
+
+def _mcp_ok(c, name, arguments, sid=1):
+    result = _mcp(c, name, arguments, sid)
+    assert result["isError"] is False, result
+    return json.loads(result["content"][0]["text"])
+
+
+def _mcp_err(c, name, arguments):
+    result = _mcp(c, name, arguments)
+    assert result["isError"] is True, result
+    return json.loads(result["content"][0]["text"])
+
+
+# ---------------- 业务数据一致 ----------------
+
+def test_domains_parity_mcp_envelope_equals_rest_array(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        mcp_out = _mcp_ok(c, "get_domains", dict(CTX))
+        rest = c.post("/api/v1/domains", json=dict(CTX))
+    assert rest.status_code == 200, rest.text
+    # 唯一允许的包装差异：mcp.domains == rest 裸数组
+    assert mcp_out["domains"] == rest.json()
+
+
+def test_get_md_parity_full_map(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    ids = ["alpha@MMLCommand@ADD DEMO", "alpha@ConfigObject@DEMO_OBJ", "nope@MMLCommand@X"]
+    with TestClient(app) as c:
+        mcp_out = _mcp_ok(c, "get_md", {**CTX, "ids": ids})
+        rest = c.post("/api/v1/md", json={**CTX, "ids": ids})
+    assert rest.status_code == 200, rest.text
+    assert mcp_out == rest.json()
+
+
+def test_get_md_parity_dedup_and_version_semantics(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    ids = [" alpha@ConfigObject@DEMO_OBJ ", "alpha@ConfigObject@DEMO_OBJ"]
+    with TestClient(app) as c:
+        mcp_out = _mcp_ok(c, "get_md", {**CTX, "ids": ids})
+        rest = c.post("/api/v1/md", json={**CTX, "ids": ids})
+        # 显式旧版本语义一致
+        mcp_old = _mcp_ok(c, "get_md",
+                          {**CTX, "ids": ["alpha@MMLCommand@ADD DEMO"], "version": "20.15.2"},
+                          sid=2)
+        rest_old = c.post("/api/v1/md", json={
+            **CTX, "ids": ["alpha@MMLCommand@ADD DEMO"], "version": "20.15.2"})
+        # 版本缺失单项结构一致
+        mcp_miss = _mcp_ok(c, "get_md",
+                           {**CTX, "ids": ["alpha@MMLCommand@ADD DEMO"], "version": "19.0.0"},
+                           sid=3)
+        rest_miss = c.post("/api/v1/md", json={
+            **CTX, "ids": ["alpha@MMLCommand@ADD DEMO"], "version": "19.0.0"})
+    assert mcp_out == rest.json()
+    assert list(mcp_out.keys()) == ["alpha@ConfigObject@DEMO_OBJ"]  # trim 去重
+    assert mcp_old == rest_old.json()
+    assert mcp_old["alpha@MMLCommand@ADD DEMO"]["version"] == "20.15.2"
+    assert mcp_miss == rest_miss.json()
+    miss = mcp_miss["alpha@MMLCommand@ADD DEMO"]
+    assert miss["error_code"] == "VERSION_NOT_FOUND"
+    assert set(miss["available_versions"]) == {"20.15.2", "20.16.0"}
+
+
+# ---------------- 护栏一致 ----------------
+
+def test_ids_cap_101_fails_both_channels(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    ids = [f"x@y@{i}" for i in range(101)]
+    with TestClient(app) as c:
+        mcp_err = _mcp_err(c, "get_md", {**CTX, "ids": ids})
+        rest = c.post("/api/v1/md", json={**CTX, "ids": ids})
+    assert mcp_err["error"]["code"] == "INVALID_ARGUMENT"
+    assert rest.status_code == 422
+    assert rest.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_byte_cap_2mb_fails_both_channels(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    from app.graph_query import contracts as gq
+    monkeypatch.setattr(gq, "MAX_TOTAL_BYTES", 10)
+    ids = ["alpha@MMLCommand@ADD DEMO", "alpha@ConfigObject@DEMO_OBJ"]
+    with TestClient(app) as c:
+        mcp_err = _mcp_err(c, "get_md", {**CTX, "ids": ids})
+        rest = c.post("/api/v1/md", json={**CTX, "ids": ids})
+    assert mcp_err["error"]["code"] == "RESULT_TOO_LARGE"
+    assert rest.status_code == 413
+    assert rest.json()["error"]["code"] == "RESULT_TOO_LARGE"
+
+
+# ---------------- REST 错误 wire 形态 ----------------
+
+def test_rest_validation_error_envelope(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        # 缺归因字段
+        r1 = c.post("/api/v1/domains", json={})
+        # 归因字段超长
+        r2 = c.post("/api/v1/md", json={
+            "AGENT_USERNAME": "x" * 65, "AGENT_SESSION_ID": "s", "ids": ["a@b@c"]})
+        # 未知字段（extra=forbid，防拼错静默忽略）
+        r3 = c.post("/api/v1/md", json={
+            **CTX, "ids": ["alpha@ConfigObject@DEMO_OBJ"], "id_list": ["x"]})
+        # 非 JSON body
+        r4 = c.post("/api/v1/domains", content=b"not-json",
+                    headers={"Content-Type": "application/json"})
+    for r in (r1, r2, r3, r4):
+        assert r.status_code == 422, r.text
+        err = r.json()["error"]
+        assert err["code"] == "INVALID_ARGUMENT"
+        assert err["message"]
+        assert isinstance(err["retryable"], bool)
+
+
+def test_internal_error_no_leak_both_channels(tmp_data_dir, monkeypatch):
+    """INTERNAL_ERROR 对外只有固定通用消息；traceback/SQL/路径不得进响应。"""
+    _seed(tmp_data_dir, monkeypatch)
+    secret = "RuntimeError: SELECT * FROM objects WHERE x='\\'; C:/secret/path/db.sqlite"
+
+    def _boom(ids, version=None):
+        raise RuntimeError(secret)
+
+    import app.graph_query.read as gq_read
+    monkeypatch.setattr(gq_read, "get_md_core", _boom)
+    with TestClient(app) as c:
+        mcp_err = _mcp_err(c, "get_md", {**CTX, "ids": ["alpha@ConfigObject@DEMO_OBJ"]})
+        rest = c.post("/api/v1/md", json={**CTX, "ids": ["alpha@ConfigObject@DEMO_OBJ"]})
+    assert mcp_err["error"]["code"] == "INTERNAL_ERROR"
+    assert secret not in json.dumps(mcp_err)
+    assert rest.status_code == 500
+    body = rest.json()
+    assert body["error"]["code"] == "INTERNAL_ERROR"
+    assert secret not in json.dumps(body)
+
+
+# ---------------- 遥测对账 ----------------
+
+def test_telemetry_parity_except_caller_endpoint(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    ids = ["alpha@MMLCommand@ADD DEMO", "nope@MMLCommand@X"]
+    with TestClient(app) as c:
+        _mcp_ok(c, "get_md", {**CTX, "ids": ids})
+        c.post("/api/v1/md", json={**CTX, "ids": ids})
+    from app.service import get_service
+    from app.telemetry.recorder import flush
+    assert flush()
+    db = get_service().db
+    rows = [dict(r) for r in db.execute(
+        "SELECT level, endpoint, caller, user, operator, session_id, params, result "
+        "FROM telemetry WHERE endpoint IN ('mcp:get_md', '/md') ORDER BY rowid"
+    ).fetchall()]
+    assert len(rows) == 4  # 每通道 1 tool + 1 object（失败 id 不写 object 行）
+    mcp_rows = sorted((r for r in rows if r["caller"] == "mcp"), key=lambda r: r["level"])
+    rest_rows = sorted((r for r in rows if r["caller"] == "skill"), key=lambda r: r["level"])
+    for m, s in zip(mcp_rows, rest_rows):
+        assert m["level"] == s["level"]
+        assert m["operator"] == s["operator"] == "00234567"
+        assert m["session_id"] == s["session_id"] == "sess-parity-1"
+        assert m["user"] == s["user"] == "admin"
+        if m["level"] == "tool":  # object 行 params/result 为空串（设计如此）
+            assert json.loads(m["params"]) == json.loads(s["params"])
+            assert json.loads(m["result"]) == json.loads(s["result"])
+    # 失败 id 不产生 object 行（每通道 object 行仅 1 条）
+    assert sum(1 for r in rows if r["level"] == "object") == 2
+
+
+def test_get_md_telemetry_only_after_guard_pass(tmp_data_dir, monkeypatch):
+    """整单通过护栏后才写 object 遥测——护栏失败不留『成功取用』对象点。"""
+    _seed(tmp_data_dir, monkeypatch)
+    from app.graph_query import contracts as gq
+    monkeypatch.setattr(gq, "MAX_TOTAL_BYTES", 10)
+    with TestClient(app) as c:
+        _mcp_err(c, "get_md", {**CTX, "ids": ["alpha@MMLCommand@ADD DEMO"]})
+        c.post("/api/v1/md", json={**CTX, "ids": ["alpha@MMLCommand@ADD DEMO"]})
+    from app.service import get_service
+    from app.telemetry.recorder import flush
+    assert flush()
+    db = get_service().db
+    n_object = db.execute(
+        "SELECT COUNT(*) FROM telemetry WHERE level='object'").fetchone()[0]
+    n_tool = db.execute(
+        "SELECT COUNT(*) FROM telemetry WHERE level='tool'").fetchone()[0]
+    assert n_object == 0  # 护栏失败：无对象行
+    assert n_tool == 2    # 两通道各 1 条 tool 行（失败也留痕）

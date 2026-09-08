@@ -18,6 +18,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..users.service import authenticate, check_perm
 
+# REST 图谱双接口（2026-09-08 三工具重构）：401/403 用 GraphError envelope
+# （需求 §5.2），其余路径保持 {"detail"} 形态（前端 api.ts 兼容）。
+_GRAPH_API_PATHS = ("/api/v1/domains", "/api/v1/md")
+
+
+def _auth_json(path: str, status: int, code: str, message: str) -> JSONResponse:
+    if path in _GRAPH_API_PATHS:
+        return JSONResponse(status_code=status, content={"error": {
+            "code": code, "message": message, "retryable": False, "details": {}}})
+    return JSONResponse(status_code=status, content={"detail": message})
+
 
 def _need_perm(path: str) -> str:
     """路径 → 所需权限。/users/login 在 dispatch 里先豁免，不走到这。"""
@@ -27,7 +38,7 @@ def _need_perm(path: str) -> str:
         return "assets"
     if path.startswith("/api/v1/docs"):  # 原始产品文档（资产页签内，D15 用户决策：页签级权限）
         return "assets"
-    if path in ("/api/v1/domains", "/api/v1/md"):
+    if path in _GRAPH_API_PATHS:
         # SKILL 兼容双接口（2026-09-03 恢复）：权限与 MCP 一致（can_skill ∨
         # can_frontend；admin 全权）——存量 Agent 配置免改，两套并行
         return "skill"
@@ -54,7 +65,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             key = request.query_params.get("key", "")
         user = authenticate(key)
         if user is None:
-            return JSONResponse(status_code=401, content={"detail": "missing or invalid api key"})
+            return _auth_json(path, 401, "UNAUTHENTICATED",
+                              "missing or invalid api key")
 
         # caller 从用户属性派生（不信任请求头，防伪装躲统计）
         caller = "web" if user.get("can_frontend") else "skill"
@@ -63,7 +75,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         request.state.user_obj = user  # 整 dict，供 router 内 check_perm 二次校验（如 fs 写操作要 upload）
 
         if not check_perm(user, _need_perm(path)):
-            return JSONResponse(status_code=403, content={"detail": "permission denied"})
+            return _auth_json(path, 403, "PERMISSION_DENIED", "permission denied")
 
         return await call_next(request)
 

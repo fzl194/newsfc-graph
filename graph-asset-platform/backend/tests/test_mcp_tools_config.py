@@ -1,8 +1,9 @@
-"""MCP 工具配置测试（admin GET/PATCH /mcp-tools + 动态生效，2026-08-25）。
+"""MCP 工具配置测试（admin GET/PATCH /mcp-tools + 动态生效）。
 
-覆盖：权限（401/403/admin）、禁用语义（tools/list 隐藏 + 直连调用中文报错——
-决策「隐藏+拦截」）、描述完全替换与恢复默认、总体说明（instructions）覆盖与
-恢复、重启后配置恢复（lifespan 启动应用）。
+v13（三工具重构 M3，2026-09-08）新语义：
+- visibility 三态（visible/hidden/disabled）；legacy 三工具默认 hidden；
+- supplemental_description 只追加不覆盖 canonical（§9.2）；
+- 总体说明=补充（canonical 在代码）；旧 PATCH enabled 映射兼容（§11.1）。
 """
 import io
 import zipfile
@@ -24,7 +25,9 @@ version: 20.15.2
 在线计费的使用量上报规则配置命令。
 """
 
-ALL_TOOLS = {"get_domains", "get_md", "search_objects", "search_md", "get_object"}
+PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph"}
+LEGACY_TOOLS = {"search_objects", "search_md", "get_object"}
+ALL_TOOLS = PUBLIC_TOOLS | LEGACY_TOOLS
 
 
 def _setup(tmp_data_dir, monkeypatch, files=None):
@@ -58,8 +61,7 @@ def _client():
 
 
 def _get_cfg(c, key="gap_admin"):
-    r = c.get("/api/v1/mcp-tools", headers={"X-API-Key": key})
-    return r
+    return c.get("/api/v1/mcp-tools", headers={"X-API-Key": key})
 
 
 def _patch_cfg(c, body, key="gap_admin"):
@@ -98,111 +100,163 @@ _CTX = {"AGENT_USERNAME": "00234567", "AGENT_SESSION_ID": "sess-1"}
 def test_get_config_permissions(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     with _client() as c:
-        # 无 KEY → 401（中间件）
         assert _get_cfg(c, key="").status_code == 401
-        # 无 frontend → 403（中间件）
         assert _get_cfg(c, key="gap_assets_only").status_code == 403
-        # frontend 非 admin → 403（端点二次校验）
         r = _get_cfg(c, key="gap_web")
         assert r.status_code == 403
         assert "admin" in r.json()["detail"]
-        # admin → 200：5 工具全启用 + 默认描述/说明齐全
+        # admin → 200：全量视图（公开 visible + legacy hidden + 兼容字段）
         r = _get_cfg(c)
         assert r.status_code == 200
         body = r.json()
-        assert {t["name"] for t in body["tools"]} == ALL_TOOLS
-        assert all(t["enabled"] for t in body["tools"])
-        assert all(t["description"] == "" for t in body["tools"])
+        by = {t["name"]: t for t in body["tools"]}
+        assert set(by) == ALL_TOOLS
+        assert all(by[n]["visibility"] == "visible" for n in PUBLIC_TOOLS)
+        assert all(by[n]["visibility"] == "hidden" for n in LEGACY_TOOLS)
+        # 兼容字段：enabled = visibility != 'disabled'
+        assert all(by[n]["enabled"] for n in ALL_TOOLS)
+        assert all(t["supplemental_description"] == "" for t in body["tools"])
         assert all(t["default_description"] for t in body["tools"])
         assert body["instructions"] == ""
         assert "三层电信图谱" in body["default_instructions"]
+        assert "决策树" in body["default_instructions"]
 
 
-# ---------------- 禁用：隐藏 + 拦截 ----------------
+# ---------------- 三态：hidden 不展示可直调 / disabled 拦截 ----------------
 
-def test_disable_hides_from_list_and_blocks_call(tmp_data_dir, monkeypatch):
+def test_visibility_three_states(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
     with _client() as c:
-        r = _patch_cfg(c, {"tools": [{"name": "search_md", "enabled": False}]})
+        # hidden：不展示 + 可直调（旧客户端兼容）
+        r = _patch_cfg(c, {"tools": [{"name": "search_md",
+                                      "visibility": "hidden"}]})
         assert r.status_code == 200
-        # 保存后返回全量：search_md disabled，其余不变
-        by = {t["name"]: t for t in r.json()["tools"]}
-        assert by["search_md"]["enabled"] is False
-        assert by["get_md"]["enabled"] is True
-        # tools/list 隐藏（Agent 看不到）
+        assert {t["name"] for t in _tools_list(c)} == PUBLIC_TOOLS
+        res = _call(c, "search_md", {**_CTX, "q": "计费"})
+        assert res["isError"] is False
+        # disabled：不展示 + TOOL_DISABLED envelope
+        _patch_cfg(c, {"tools": [{"name": "search_md",
+                                  "visibility": "disabled"}]})
+        assert {t["name"] for t in _tools_list(c)} == PUBLIC_TOOLS
+        res2 = _call(c, "search_md", {**_CTX, "q": "计费"})
+        assert res2["isError"] is True
+        body = __import__("json").loads(res2["content"][0]["text"])
+        assert body["error"]["code"] == "TOOL_DISABLED"
+        assert "已被管理员禁用" in body["error"]["message"]
+        # 公开工具也可 disabled
+        _patch_cfg(c, {"tools": [{"name": "get_md", "visibility": "disabled"}]})
         names = {t["name"] for t in _tools_list(c)}
-        assert names == ALL_TOOLS - {"search_md"}
-        # 直连调用 → isError + 中文禁用提示（兜底，防绕过）
+        assert names == PUBLIC_TOOLS - {"get_md"}
+        # 恢复
+        _patch_cfg(c, {"tools": [{"name": "get_md", "visibility": "visible"},
+                                 {"name": "search_md", "visibility": "hidden"}]})
+        assert {t["name"] for t in _tools_list(c)} == PUBLIC_TOOLS
+
+
+# ---------------- 旧 PATCH enabled 兼容（§11.1） ----------------
+
+def test_legacy_patch_enabled_mapping(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
+    with _client() as c:
+        # 旧 PATCH：公开工具 enabled=false → disabled
+        _patch_cfg(c, {"tools": [{"name": "get_md", "enabled": False}]})
+        assert "get_md" not in {t["name"] for t in _tools_list(c)}
+        # 旧 PATCH：legacy enabled=false → disabled；=true 只到 hidden
+        _patch_cfg(c, {"tools": [{"name": "search_md", "enabled": False}]})
         res = _call(c, "search_md", {**_CTX, "q": "计费"})
         assert res["isError"] is True
-        assert "已被管理员禁用" in res["content"][0]["text"]
-        # 其余工具照常
-        res2 = _call(c, "get_md", {**_CTX, "ids": ["UDG@MMLCommand@ADD URR"]})
-        assert res2["isError"] is False
-        assert "在线计费" in res2["content"][0]["text"]
-        # 重新启用 → 恢复
         _patch_cfg(c, {"tools": [{"name": "search_md", "enabled": True}]})
-        assert {t["name"] for t in _tools_list(c)} == ALL_TOOLS
+        assert "search_md" not in {t["name"] for t in _tools_list(c)}  # hidden，不回 visible
+        res2 = _call(c, "search_md", {**_CTX, "q": "计费"})
+        assert res2["isError"] is False
+        # GET 兼容 enabled 字段
+        by = {t["name"]: t for t in _get_cfg(c).json()["tools"]}
+        assert by["search_md"]["enabled"] is True
+        assert by["search_md"]["visibility"] == "hidden"
+        assert by["get_md"]["visibility"] == "disabled"
 
 
-# ---------------- 描述：完全替换 + 恢复默认 ----------------
+# ---------------- 补充说明：只追加不覆盖 canonical（§9.2） ----------------
 
-def test_description_override_and_reset(tmp_data_dir, monkeypatch):
-    _setup(tmp_data_dir, monkeypatch)
+def test_supplement_appends_to_canonical(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch, {"Command/UDG/20.15.2/a.md": CMD})
     with _client() as c:
-        _patch_cfg(c, {"tools": [{"name": "get_md", "enabled": True,
-                                  "description": "定制描述：专用于计费场景查询"}]})
+        _patch_cfg(c, {"tools": [{"name": "get_md",
+                                  "supplemental_description": "定制补充：专用于计费场景"}]})
         t = next(t for t in _tools_list(c) if t["name"] == "get_md")
-        assert t["description"] == "定制描述：专用于计费场景查询"
-        # 清空 → 恢复 docstring 默认
-        _patch_cfg(c, {"tools": [{"name": "get_md", "enabled": True, "description": ""}]})
+        assert "批量获取" in t["description"]  # canonical 保留
+        assert "定制补充：专用于计费场景" in t["description"]  # 补充在后面
+        assert "[管理员补充]" in t["description"]
+        # schema 不受管理员配置影响
+        assert t["inputSchema"]["properties"]["ids"]["maxItems"] == 100
+        # 清空 → 纯 canonical
+        _patch_cfg(c, {"tools": [{"name": "get_md",
+                                  "supplemental_description": ""}]})
         t2 = next(t for t in _tools_list(c) if t["name"] == "get_md")
-        body = _get_cfg(c).json()
-        default = next(t for t in body["tools"] if t["name"] == "get_md")["default_description"]
-        assert t2["description"] == default
+        assert "定制补充" not in t2["description"]
         assert "批量获取" in t2["description"]
 
 
-# ---------------- 总体说明：覆盖 + 恢复 ----------------
+# ---------------- 总体说明：补充语义（§9.3） ----------------
 
-def test_instructions_override_and_reset(tmp_data_dir, monkeypatch):
+def test_instructions_supplement_semantics(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     with _client() as c:
-        assert _init(c)["instructions"] != "定制总体说明ABC"
+        base = _init(c)["instructions"]
+        assert "决策树" in base  # canonical 短决策树
         _patch_cfg(c, {"instructions": "定制总体说明ABC"})
-        assert _init(c)["instructions"] == "定制总体说明ABC"
-        # 清空 → 恢复默认（保存即生效，无需重启）
+        eff = _init(c)["instructions"]
+        assert "定制总体说明ABC" in eff
+        assert "决策树" in eff  # canonical 不被覆盖
+        # 清空 → 纯 canonical
         _patch_cfg(c, {"instructions": ""})
-        assert _init(c)["instructions"] != "定制总体说明ABC"
+        assert "定制总体说明ABC" not in _init(c)["instructions"]
         assert "三层电信图谱" in _init(c)["instructions"]
 
 
 def test_instructions_survive_restart(tmp_data_dir, monkeypatch):
-    """重启语义：lifespan 启动时从 DB 恢复说明覆盖（enabled/description 每请求读
-    DB 天然恢复）。新 TestClient 上下文 = 完整 lifespan 启停。"""
     _setup(tmp_data_dir, monkeypatch)
     with _client() as c:
         _patch_cfg(c, {"instructions": "重启后仍生效的说明"})
-        _patch_cfg(c, {"tools": [{"name": "search_objects", "enabled": False}]})
+        _patch_cfg(c, {"tools": [{"name": "search_objects",
+                                  "visibility": "disabled"}]})
     with _client() as c:
-        assert _init(c)["instructions"] == "重启后仍生效的说明"
+        assert "重启后仍生效的说明" in _init(c)["instructions"]
         assert "search_objects" not in {t["name"] for t in _tools_list(c)}
+
+
+def test_legacy_instructions_backed_up(tmp_data_dir, monkeypatch):
+    """v13 迁移语义：active instructions 清空（旧全文覆盖不再生效）+ 哨兵已置
+    （重复 init_schema 不重放迁移，管理员后续补充不被覆盖）。"""
+    s = _setup(tmp_data_dir, monkeypatch)
+    from app.repos import mcp_tools_repo
+    assert mcp_tools_repo.get_instructions(s.db) == ""
+    assert s.db.execute(
+        "SELECT value FROM meta WHERE key='mcp_visibility_migrated'"
+    ).fetchone() is not None
+    # 管理员配置新补充后，重复 init_schema 不清掉
+    with __import__("app.service", fromlist=["import_lock"]).import_lock:
+        mcp_tools_repo.set_instructions(s.db, "管理员补充XYZ")
+        s.db.commit()
+    dbmod.init_schema(s.db)  # 幂等重放
+    assert mcp_tools_repo.get_instructions(s.db) == "管理员补充XYZ"
 
 
 # ---------------- 入参校验 ----------------
 
 def test_whitespace_only_values_reset_to_default(tmp_data_dir, monkeypatch):
-    """纯空白描述/说明去空白后视同清空 → 回默认（审查修正）。"""
+    """纯空白描述/说明去空白后视同清空 → 回默认。"""
     _setup(tmp_data_dir, monkeypatch)
     with _client() as c:
-        r = _patch_cfg(c, {"tools": [{"name": "get_md", "description": "   "}],
+        r = _patch_cfg(c, {"tools": [{"name": "get_md",
+                                      "supplemental_description": "   "}],
                            "instructions": "   "})
         assert r.status_code == 200
         by = {t["name"]: t for t in r.json()["tools"]}
-        assert by["get_md"]["description"] == ""   # 已按默认存回
+        assert by["get_md"]["supplemental_description"] == ""
         t = next(t for t in _tools_list(c) if t["name"] == "get_md")
-        assert "批量获取" in t["description"]       # 生效层面也是默认
-        assert "三层电信图谱" in _init(c)["instructions"]
+        assert "批量获取" in t["description"]
+        assert "决策树" in _init(c)["instructions"]
 
 
 def test_patch_unknown_tool_rejected(tmp_data_dir, monkeypatch):
@@ -211,15 +265,12 @@ def test_patch_unknown_tool_rejected(tmp_data_dir, monkeypatch):
         r = _patch_cfg(c, {"tools": [{"name": "no_such_tool", "enabled": True}]})
         assert r.status_code == 400
         assert "no_such_tool" in r.json()["detail"]
-        # 无效请求不落库
-        assert {t["name"] for t in _tools_list(c)} == ALL_TOOLS
+        assert {t["name"] for t in _tools_list(c)} == PUBLIC_TOOLS
 
 
 # ---------------- 批量任务持锁期间：限时失败而非无限等 ----------------
 
 def test_patch_timeout_409_when_lock_held(tmp_data_dir, monkeypatch):
-    """import_lock 被批量任务（挖掘/上传/对账）持有时，PATCH 限时失败 409——
-    不再无限转圈（复现实测：并发上传 12s 持锁，旧写法 PATCH 被堵满全程）。"""
     import time as _time
     import app.routers.mcp_tools as rt
     from app.service import import_lock
@@ -235,13 +286,11 @@ def test_patch_timeout_409_when_lock_held(tmp_data_dir, monkeypatch):
             dt = _time.time() - t0
             assert r.status_code == 409
             assert "批量任务" in r.json()["detail"]
-            assert dt < 5  # 限时返回（0.3s 等待 + 余量），不是分钟级干等
-        # 未落库
+            assert dt < 5
         from app.repos import mcp_tools_repo
         import app.db as dbmod
         assert mcp_tools_repo.get_instructions(dbmod.get_shared_db()) == ""
     finally:
         import_lock.release()
-    # 锁释放后保存恢复正常
     with _client() as c:
         assert _patch_cfg(c, {"instructions": "锁释放后OK"}).status_code == 200

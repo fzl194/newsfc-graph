@@ -1,124 +1,145 @@
-"""SKILL 兼容双接口（2026-09-03 恢复，用户决策：与 MCP 两套并行）。
+"""SKILL 兼容双接口（薄 adapter；业务实现走 graph_query 共享核心）。
 
-- 2026-08-24 MCP 服务化时删除了 ``POST /api/v1/domains`` 与 ``POST /api/v1/md``
-  （e4922b4）；为兼容存量 Agent/SKILL 配置，按**原契约**恢复（请求/响应/
-  版本解析语义逐行取自删除前代码）。
-- 归因参数与 MCP 同名且必填：``AGENT_USERNAME``（工号）与
-  ``AGENT_SESSION_ID``（会话 ID）随 POST JSON body 传入，分别写入
+- 2026-09-08 三工具重构（M1）：/domains、/md 与 MCP get_domains/get_md 调用
+  同一 ``get_domains_core`` / ``get_md_core``——业务数据、版本解析、护栏
+  （ids 1~100、响应 2MB）、错误不分叉（需求 §10）；本文件只做协议包装与打点。
+- 请求体手动解析（extra=forbid + 统一 INVALID_ARGUMENT envelope 422），
+  不走 FastAPI 默认 RequestValidationError 形态（需求 §5.2：REST 图谱路由
+  错误体固定为 ``{"error": {GraphError}}``）。
+- 归因参数与 MCP 同名且必填：``AGENT_USERNAME`` / ``AGENT_SESSION_ID`` 落
   telemetry 的 ``operator`` / ``session_id`` 专列，不重复写入 params。
-- 权限与 MCP 一致：skill（``can_skill`` 或 ``can_frontend``，admin 全权）——
-  见 middleware/auth.py ``_need_perm`` 的路径分支。
-- 打点与取用统计无缝：level=tool/object、caller=skill、endpoint=/domains|/md，
-  与 MCP 行（mcp:get_domains|mcp:get_md）在运维页"知识取用频次"合并计数。
-- 新接入仍推荐 MCP（/mcp 另有 search_objects/search_md/get_object 三工具）。
+- 权限与 MCP 一致：skill（``can_skill`` 或 ``can_frontend``，admin 全权）；
+  401/403 的 error envelope 由 AuthMiddleware 对两路径分支输出。
 """
-from typing import Optional
+import json
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
-from ..attribution import AgentSessionId, AgentUsername, telemetry_attribution
-from ..service import get_service
+from ..attribution import telemetry_attribution
+from ..graph_query import contracts as gq
+from ..graph_query import read as graph_read
 from ..telemetry.recorder import record
-from ..version import is_newer
 
 router = APIRouter()
 _REST_CALLER = "skill"
 
 
-class AttributionRequest(BaseModel):
-    """与 MCP 工具同名的必填调用上下文，仅用于打点归因。"""
+def _error_response(error: gq.GraphError) -> JSONResponse:
+    """REST 图谱路由错误体：{"error": {GraphError}} + HTTP_STATUS 映射（§5.2）。"""
+    return JSONResponse(status_code=gq.HTTP_STATUS.get(error.code, 500),
+                        content={"error": error.model_dump()})
 
-    AGENT_USERNAME: AgentUsername
-    AGENT_SESSION_ID: AgentSessionId
+
+async def _parse_body(request: Request, model_cls):
+    """JSON body → Pydantic 模型（extra=forbid）。失败统一 INVALID_ARGUMENT 422。"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise gq.err(gq.INVALID_ARGUMENT, "请求体须为 JSON 对象")
+    try:
+        return model_cls.model_validate(body)
+    except ValidationError as e:
+        details = [{"field": ".".join(str(x) for x in x["loc"]),
+                    "message": x["msg"]} for x in e.errors()]
+        raise gq.err(gq.INVALID_ARGUMENT, "请求参数校验失败", errors=details)
 
 
-def _record_call(endpoint: str, request: Request, req: AttributionRequest,
+def _record_call(endpoint: str, request: Request, operator: str, session_id: str,
                  params: dict, result: dict) -> None:
-    """调用级行（2026-09-04 用户决策：底表默认=每次调用一行）：一次 HTTP 请求
-    记一条 level=tool 行（与 MCP 工具行同构），params/result 为 JSON 字符串。"""
-    import json as _json
+    """调用级行（底表默认口径）：一次 HTTP 请求记一条 level=tool 行（与 MCP 工具
+    行同构——params/result 摘要与 MCP 对齐，仅 caller/endpoint 不同，§8.6）。"""
     record(endpoint, user=request.state.user, caller=_REST_CALLER,
-           level="tool", **telemetry_attribution(
-               req.AGENT_USERNAME, req.AGENT_SESSION_ID),
-           params=_json.dumps(params, ensure_ascii=False),
-           result=_json.dumps(result, ensure_ascii=False))
+           level="tool", **telemetry_attribution(operator, session_id),
+           params=json.dumps(params, ensure_ascii=False),
+           result=json.dumps(result, ensure_ascii=False))
 
 
 @router.post("/domains")
-def list_domains_with_md(req: AttributionRequest, request: Request):
-    """一次性返回全部业务域的完整 md（``[{id, name, md}, ...]``）。
+async def list_domains_with_md(request: Request):
+    """一次性返回全部业务域的完整 md（``[{id, type, name, version, md, references}]``）。
 
     业务域是用户最优先的业务归属定位层——数量少（跨 NF 类，version 恒 null），
     Agent 入口直接取全部域 md。其他层级仍按 ``POST /md`` 沿 ``[[ID]]`` 引用下钻。
     """
-    idx = get_service().index
-    latest: dict = {}
-    for (id_, _ver), obj in idx.nodes.items():
-        if obj.type != "BusinessDomain":
-            continue
-        cur = latest.get(id_)
-        if cur is None or is_newer(obj.version, cur.version):
-            latest[id_] = obj
-    out = [
-        {"id": id_, "name": obj.frontmatter.get("name"), "md": obj.raw_md}
-        for id_, obj in latest.items()
-    ]
-    # 调用级 1 行（底表默认口径）+ 对象级每域 1 行（运维页统计热榜用）
+    req = None
+    try:
+        req = await _parse_body(request, gq.RestDomainsRequest)
+        items = graph_read.get_domains_core()
+    except gq.GraphQueryError as e:
+        _record_error("/domains", request, req, e)
+        return _error_response(e.error)
+    except Exception as e:  # noqa: BLE001 详细异常只进服务端日志
+        print(f"[skill_compat] INTERNAL_ERROR /domains: {e!r}", flush=True)
+        _record_error("/domains", request, req, e)
+        return _error_response(gq.GraphError(
+            code=gq.INTERNAL_ERROR, message=gq.INTERNAL_ERROR_MESSAGE))
     attribution = telemetry_attribution(req.AGENT_USERNAME, req.AGENT_SESSION_ID)
-    _record_call("/domains", request, req, params={}, result={"domains": len(out)})
-    for item in out:
-        record("/domains", item["id"], "BusinessDomain",
+    # 调用级 1 行（底表默认口径）+ 对象级每域 1 行（运维页统计热榜用）
+    _record_call("/domains", request, req.AGENT_USERNAME, req.AGENT_SESSION_ID,
+                 params={}, result={"domains": len(items)})
+    for item in items:
+        record("/domains", item.id, "BusinessDomain",
                user=request.state.user, caller=_REST_CALLER,
                level="object", **attribution)
-    return out
+    return [item.model_dump() for item in items]
 
 
-# ---------- /md (batch) ----------
-
-class BatchMdRequest(AttributionRequest):
-    """批量取 md 请求体（Agent 友好，供 SKILL 逐层批次调用）。
-
-    - ``ids``：1~N 个对象 id（版本无关逻辑 ID，可含 ``@`` 与空格）。
-    - ``version``：可选全局版本；不传 → 每个 id 各自取**最新现存版本**。
-      某 id 不在该版本 → 该 id 计错并回带 ``available_versions``，不影响其余 id。
-    """
-    ids: list[str] = Field(..., min_length=1)
-    version: Optional[str] = None
+def _record_error(endpoint: str, request: Request, req, e: Exception) -> None:
+    """失败也留痕（与 MCP tool 行同构）：解析成功后的失败记 1 条 error tool 行。
+    body 解析失败（无归因可用）不记——与 MCP SDK 参数校验失败不落 tool 行一致。
+    message 只回业务错误文本——未知异常统一 "internal error"（str(e) 可能含
+    SQL/路径，不落 telemetry/运维页，安全审查 M1）。"""
+    if req is None:
+        return
+    if isinstance(e, gq.GraphQueryError):
+        message = e.error.message
+        code = e.error.code
+    else:
+        message = "internal error"
+        code = gq.INTERNAL_ERROR
+    result = {"error": {"code": code, "message": message[:200]}}
+    if endpoint == "/md" and isinstance(req, gq.RestMdRequest):
+        # 规范化 ids（trim 去重）——与 MCP get_md 失败路径同口径
+        norm_ids = [k for k in dict.fromkeys((i or "").strip() for i in req.ids) if k]
+        params = {"ids": norm_ids, "version": req.version}
+    else:
+        params = {}
+    _record_call(endpoint, request, req.AGENT_USERNAME, req.AGENT_SESSION_ID,
+                 params=params, result=result)
 
 
 @router.post("/md")
-def batch_md(req: BatchMdRequest, request: Request):
-    """批量取多个对象的原始 markdown。
+async def batch_md(request: Request):
+    """批量取多个对象的原始 markdown（与 MCP get_md 完全同构，§10）。
 
-    复用单对象版本解析（``Index.resolve_node``）：不传 version 落到该 id 最新
-    现存版本；版本不匹配不整体报错，而是该 id 计错并回带可用版本，其余 id 照常
-    返回。响应为 ``{id: {version, md} | {error, available_versions}}``——每个 id
-    恰好一个条目，便于 Agent 遍历。
+    响应 ``{id: MdSuccess | MdFailure}``（动态 ID map）：成功项含完整元数据 +
+    md + references；失败项含 error_code/requested_version/available_versions，
+    单项失败不影响其余 id。护栏与 MCP 相同：ids 1~100（去重后）、响应 ≤2MB，
+    超限整单失败（413 RESULT_TOO_LARGE）。
     """
-    idx = get_service().index
-    out: dict = {}
+    req = None
+    try:
+        req = await _parse_body(request, gq.RestMdRequest)
+        result_map, summary = graph_read.get_md_core(req.ids, req.version)
+    except gq.GraphQueryError as e:
+        _record_error("/md", request, req, e)
+        return _error_response(e.error)
+    except Exception as e:  # noqa: BLE001 详细异常只进服务端日志
+        print(f"[skill_compat] INTERNAL_ERROR /md: {e!r}", flush=True)
+        _record_error("/md", request, req, e)
+        return _error_response(gq.GraphError(
+            code=gq.INTERNAL_ERROR, message=gq.INTERNAL_ERROR_MESSAGE))
     attribution = telemetry_attribution(req.AGENT_USERNAME, req.AGENT_SESSION_ID)
-    # dict.fromkeys 去重并保序；同 id 重复请求只算一次。
-    for id_ in dict.fromkeys(req.ids):
-        available = idx.versions_of(id_)
-        if not available:
-            out[id_] = {"error": "对象不存在", "available_versions": []}
-            continue
-        obj = idx.resolve_node(id_, req.version)
-        if obj is None:
-            # id 存在但指定版本缺失 → 回带可用版本，供 Agent 改版本重试
-            out[id_] = {
-                "error": f"版本不存在: {id_}@{req.version}",
-                "available_versions": available,
-            }
-            continue
-        out[id_] = {"version": obj.version, "md": obj.raw_md}
-        record("/md", id_, obj.type, user=request.state.user,
-               caller=_REST_CALLER, level="object", **attribution)
-    # 调用级 1 行（底表默认口径；对象级行上方逐 id 已记）
-    ok = sum(1 for v in out.values() if "md" in v)
-    _record_call("/md", request, req,
-                 params={"ids": list(dict.fromkeys(req.ids)), "version": req.version},
-                 result={"ok": ok, "error": len(out) - ok})
-    return out
+    # 护栏已过 → 成功 id 逐个留取用点（失败 id 不写 object 行，§8.6）
+    for id_, item in result_map.items():
+        if item["ok"]:
+            record("/md", id_, item["type"], user=request.state.user,
+                   caller=_REST_CALLER, level="object", **attribution)
+    _record_call("/md", request, req.AGENT_USERNAME, req.AGENT_SESSION_ID,
+                 params={"ids": summary["ids"], "version": summary["version"]},
+                 result={"ok": summary["ok"], "failed": summary["failed"],
+                         "failed_ids": summary["failed_ids"],
+                         "bytes": summary["bytes"]})
+    return result_map

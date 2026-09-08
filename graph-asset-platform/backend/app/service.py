@@ -62,18 +62,25 @@ class Service:
             _t.Thread(target=self._sync_mtime_async, daemon=True).start()
 
     def _fts_reconcile_async(self) -> None:
-        """后台对账 md_fts：count + 总字节双校验，不一致 → 持写锁全量重建。"""
-        from .repos import fts_repo
+        """后台对账三张派生表：md_fts（legacy）+ graph_search_fts + object_latest。
+        任一不一致 → 持写锁全量重建（v12 起统一搜索索引同口径维护）。"""
+        from .repos import fts_repo, graph_search_repo, object_latest_repo
         try:
-            if fts_repo.integrity_ok(self.db):
+            if (fts_repo.integrity_ok(self.db)
+                    and graph_search_repo.integrity_ok(self.db)
+                    and object_latest_repo.integrity_ok(self.db)):
                 return
             self.fts_rebuilding = True
             try:
                 with import_lock:
                     # rebuild 分块提交（2026-08-26）：块间释放 WAL 写锁，避免
                     # telemetry/jobs 独立连接被全量重建饿死（database is locked）
-                    n = fts_repo.rebuild_from_objects(self.db)
-                print(f"[startup] md_fts 与 objects 不一致，已后台重建 {n} 行", flush=True)
+                    n1 = fts_repo.rebuild_from_objects(self.db)
+                    n2 = graph_search_repo.rebuild_from_objects(self.db)
+                    n3 = object_latest_repo.rebuild(self.db)
+                print(f"[startup] 派生索引与 objects 不一致，已后台重建 "
+                      f"md_fts={n1} / graph_search={n2} / object_latest={n3}",
+                      flush=True)
             finally:
                 self.fts_rebuilding = False
         except Exception:  # noqa: BLE001 后台线程绝不抛
@@ -131,38 +138,46 @@ class Service:
         self.index = Index.load_from_db(self.db, self.registry)
 
     def reindex_path(self, rel: str, *, commit: bool = True) -> None:
-        """单文件 parse → UPSERT DB（objects/edges/md_fts）。不重载内存（调用方 reload_index）。
+        """单文件 parse → UPSERT DB（objects/edges/双 FTS/object_latest）。
 
         id/type/version 变了的旧节点按 source_path 清除（``objects_repo.delete_by_source``）；
-        FTS 旧 (id,version) 行同源删除（不留幽灵命中，审查 C1）。
+        FTS 旧 (id,version) 行同源删除（不留幽灵命中，审查 C1）；object_latest
+        按 ``old_ids ∪ new_ids`` 刷新（v12 统一搜索，§12.1）——刷新在未提交事务
+        内执行，不产生额外 commit（reindex_paths 的分块节奏不受影响）。
         """
         from .edges import parse_edges
         from .logical_id import split_id
         from .md_parser import parse_md
-        from .repos import edges_repo, fts_repo, objects_repo
-        # 删旧节点 + 其边 + FTS 旧行（source_path 维度，稳）
+        from .repos import (edges_repo, fts_repo, graph_search_repo,
+                            object_latest_repo, objects_repo)
+        # 删旧节点 + 其边 + 双 FTS 旧行（source_path 维度，稳）
         old_pairs = list(objects_repo.delete_by_source(self.db, rel))
         old_keys = {(oid, "" if over is None else over) for oid, over in old_pairs}
         for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
         fts_repo.delete_many(self.db, old_pairs)
+        graph_search_repo.delete_many(self.db, old_pairs)
+        affected_ids = {oid for oid, _ in old_pairs}
         # 重新 parse + 入库
         try:
             text = self.store.read(rel)
             fm, body, edge_sec = parse_md(text)
         except Exception:
+            object_latest_repo.refresh(self.db, affected_ids)  # 改名/删除场景
             if commit:
                 _commit(self.db)
             return
         id_ = fm.get("id")
         typ = fm.get("type")
         if not id_ or not typ or not self.registry.known(typ):
+            object_latest_repo.refresh(self.db, affected_ids)
             if commit:
                 _commit(self.db)
             return
         try:
             nf, _t, _l = split_id(id_)
         except ValueError:
+            object_latest_repo.refresh(self.db, affected_ids)
             if commit:
                 _commit(self.db)
             return
@@ -191,17 +206,29 @@ class Service:
         # 另一个已存键，才单独清理该键，避免 FTS 重复。
         if (id_, normalized_version) not in old_keys and new_key_existed:
             fts_repo.delete(self.db, id_, version)
+            graph_search_repo.delete(self.db, id_, version)
         fts_repo.insert(self.db, obj_id=id_, version=version, body=body)
+        graph_search_repo.insert(
+            self.db, obj_id=id_, version=version, name=fm.get("name"),
+            name_zh=fm.get("name_zh"), body_md=body)
+        affected_ids.add(id_)
+        object_latest_repo.refresh(self.db, affected_ids)
         if commit:
             _commit(self.db)
 
     def unindex_path(self, rel: str, *, commit: bool = True) -> None:
-        """删该 source_path 的 DB 节点 + 边 + FTS 行（md 被删时）。"""
-        from .repos import edges_repo, fts_repo, objects_repo
+        """删该 source_path 的 DB 节点 + 边 + 双 FTS 行 + latest 降级（md 被删时）。
+
+        删除当前最新版 → latest 自动降级到次新；删除最后版本 → latest 行消失。
+        """
+        from .repos import (edges_repo, fts_repo, graph_search_repo,
+                            object_latest_repo, objects_repo)
         old_pairs = list(objects_repo.delete_by_source(self.db, rel))
         for oid, over in old_pairs:
             edges_repo.delete_for_node(self.db, oid, over)
         fts_repo.delete_many(self.db, old_pairs)
+        graph_search_repo.delete_many(self.db, old_pairs)
+        object_latest_repo.refresh(self.db, {oid for oid, _ in old_pairs})
         if commit:
             _commit(self.db)
 
