@@ -26,12 +26,17 @@ SEARCH_TOO_BROAD = "SEARCH_TOO_BROAD"
 TOOL_DISABLED = "TOOL_DISABLED"
 INTERNAL_ERROR = "INTERNAL_ERROR"
 
-# REST HTTP 状态映射（其余错误码仅出现在 MCP tool error 或 /md 单项错误里）
+# REST HTTP 状态映射（其余错误码仅出现在 MCP tool error 或 /md 单项错误里；
+# 2026-09-09 REST /search 上线后新增搜索类码的映射）
 HTTP_STATUS = {
     UNAUTHENTICATED: 401,
     PERMISSION_DENIED: 403,
     INVALID_ARGUMENT: 422,
+    INVALID_FILTER: 422,
+    INVALID_FILTER_COMBINATION: 422,
     RESULT_TOO_LARGE: 413,
+    SEARCH_TOO_BROAD: 413,
+    INDEX_REBUILDING: 503,
     INTERNAL_ERROR: 500,
 }
 
@@ -110,6 +115,25 @@ class RestMdRequest(RestDomainsRequest):
 
     ids: list[Annotated[str, Field(min_length=1, max_length=256)]]
     version: Optional[str] = None
+
+
+class RestSearchRequest(RestDomainsRequest):
+    """REST /search 请求体（2026-09-09 用户决策：搜索补 REST 通道，与 MCP
+    search_graph 同契约）。字段约束对齐 MCP 工具 schema：terms 原始项数 1~10、
+    每项 1~80；layer/match 用 Literal（非法值 → INVALID_ARGUMENT 422）；
+    type/nf/version/domain/scenario 留给 core 动态校验（INVALID_FILTER）。"""
+
+    terms: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
+        min_length=1, max_length=10)
+    match: Literal["any", "all"] = "any"
+    layer: Optional[Literal["命令层", "特性层", "任务层", "业务层"]] = None
+    type: Optional[str] = None
+    nf: Optional[str] = None
+    version: Optional[str] = None
+    domain: Optional[str] = None
+    scenario: Optional[str] = None
+    page: int = Field(default=1, ge=1)
+    size: int = Field(default=20, ge=1, le=50)
 
 
 class MdSuccess(BaseModel):

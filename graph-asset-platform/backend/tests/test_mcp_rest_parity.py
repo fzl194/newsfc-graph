@@ -222,3 +222,97 @@ def test_get_md_telemetry_only_after_guard_pass(tmp_data_dir, monkeypatch):
         "SELECT COUNT(*) FROM telemetry WHERE level='tool'").fetchone()[0]
     assert n_object == 0  # 护栏失败：无对象行
     assert n_tool == 2    # 两通道各 1 条 tool 行（失败也留痕）
+
+
+# ---------------- search：MCP search_graph 与 REST POST /search 对账 ----------------
+
+def test_search_parity_full_response(tmp_data_dir, monkeypatch):
+    """REST /search 与 MCP search_graph 返回完全相同（同 core，§10 同款要求）。"""
+    _seed(tmp_data_dir, monkeypatch)
+    args = {"terms": ["DEMO"], "match": "any", "type": "MMLCommand", "size": 5}
+    with TestClient(app) as c:
+        mcp_out = _mcp_ok(c, "search_graph", {**CTX, **args})
+        rest = c.post("/api/v1/search", json={**CTX, **args})
+    assert rest.status_code == 200, rest.text
+    assert mcp_out == rest.json()
+
+
+def test_search_parity_zero_result_and_filters(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        mcp_zero = _mcp_ok(c, "search_graph", {**CTX, "terms": ["不存在的词"]})
+        rest_zero = c.post("/api/v1/search", json={**CTX, "terms": ["不存在的词"]})
+        # 过滤生效口径一致（type 收窄；fixture nf 为小写 alpha，会被自动转
+        # 大写后判非法——那是生产行为，在错误用例里单独断言）
+        mcp_nf = _mcp_ok(c, "search_graph", {**CTX, "terms": ["DEMO"], "type": "ConfigObject"})
+        rest_nf = c.post("/api/v1/search", json={
+            **CTX, "terms": ["DEMO"], "type": "ConfigObject"})
+        # nf 自动大写 + 合法值回带（两通道一致）
+        mcp_bad_nf = _mcp_err(c, "search_graph", {**CTX, "terms": ["DEMO"], "nf": "alpha"})
+        rest_bad_nf = c.post("/api/v1/search", json={**CTX, "terms": ["DEMO"], "nf": "alpha"})
+    assert rest_zero.status_code == 200
+    assert mcp_zero == rest_zero.json()
+    assert mcp_zero["total"] == 0
+    assert "REMOVE_OR_REPHRASE_TERM" in mcp_zero["diagnostics"]["recovery_codes"]
+    assert mcp_nf == rest_nf.json()
+    assert mcp_nf["applied_filters"] == {"type": "ConfigObject"}
+    assert rest_bad_nf.status_code == 422
+    assert rest_bad_nf.json()["error"]["code"] == "INVALID_FILTER"
+    assert rest_bad_nf.json()["error"]["details"]["available_values"] == ["alpha"]
+    assert mcp_bad_nf["error"] == rest_bad_nf.json()["error"]
+
+
+def test_search_parity_invalid_filter_and_validation(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        mcp_err = _mcp_err(c, "search_graph", {**CTX, "terms": ["DEMO"], "nf": "NOPE"})
+        rest_bad_filter = c.post("/api/v1/search", json={
+            **CTX, "terms": ["DEMO"], "nf": "NOPE"})
+        # 模型层校验（非法 enum/越界）→ INVALID_ARGUMENT 422 envelope
+        rest_bad_enum = c.post("/api/v1/search", json={
+            **CTX, "terms": ["DEMO"], "match": "phrase"})
+        rest_bad_size = c.post("/api/v1/search", json={
+            **CTX, "terms": ["DEMO"], "size": 500})
+        rest_unknown_field = c.post("/api/v1/search", json={
+            **CTX, "terms": ["DEMO"], "q": "旧字段"})
+    assert rest_bad_filter.status_code == 422
+    assert rest_bad_filter.json()["error"]["code"] == "INVALID_FILTER"
+    assert rest_bad_filter.json()["error"]["details"]["field"] == "nf"
+    assert mcp_err["error"]["code"] == rest_bad_filter.json()["error"]["code"]
+    for r in (rest_bad_enum, rest_bad_size, rest_unknown_field):
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_search_telemetry_parity(tmp_data_dir, monkeypatch):
+    """两通道各 1 条 tool 行（search 无 object 行）；params/result 摘要一致，
+    仅 caller/endpoint 不同（§7.9 同款对账）。"""
+    _seed(tmp_data_dir, monkeypatch)
+    args = {"terms": ["DEMO"], "match": "any", "type": "MMLCommand"}
+    with TestClient(app) as c:
+        _mcp_ok(c, "search_graph", {**CTX, **args})
+        c.post("/api/v1/search", json={**CTX, **args})
+    from app.service import get_service
+    from app.telemetry.recorder import flush
+    assert flush()
+    db = get_service().db
+    rows = [dict(r) for r in db.execute(
+        "SELECT caller, endpoint, level, user, operator, session_id, params, result "
+        "FROM telemetry WHERE endpoint IN ('mcp:search_graph', '/search') "
+        "AND level='tool' ORDER BY rowid").fetchall()]
+    assert len(rows) == 2
+    assert {(r["caller"], r["endpoint"]) for r in rows} == {
+        ("mcp", "mcp:search_graph"), ("skill", "/search")}
+    m, s = rows[0], rows[1]
+    assert m["operator"] == s["operator"] == "00234567"
+    assert m["session_id"] == s["session_id"] == "sess-parity-1"
+    assert m["user"] == s["user"] == "admin"
+    assert json.loads(m["params"]) == json.loads(s["params"])
+    rm, rs = json.loads(m["result"]), json.loads(s["result"])
+    assert rm["total"] == rs["total"] and rm["returned"] == rs["returned"]
+    assert rm["top_ids"] == rs["top_ids"]
+    assert rm["recovery_codes"] == rs["recovery_codes"]
+    # search 不产生 object 行
+    n_object = db.execute(
+        "SELECT COUNT(*) FROM telemetry WHERE level='object'").fetchone()[0]
+    assert n_object == 0

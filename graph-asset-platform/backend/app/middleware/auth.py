@@ -18,9 +18,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..users.service import authenticate, check_perm
 
-# REST 图谱双接口（2026-09-08 三工具重构）：401/403 用 GraphError envelope
-# （需求 §5.2），其余路径保持 {"detail"} 形态（前端 api.ts 兼容）。
-_GRAPH_API_PATHS = ("/api/v1/domains", "/api/v1/md")
+# REST 图谱接口（2026-09-08 三工具重构；2026-09-09 增 /search）：401/403 用
+# GraphError envelope（需求 §5.2），其余路径保持 {"detail"} 形态（前端 api.ts 兼容）。
+_GRAPH_API_PATHS = ("/api/v1/domains", "/api/v1/md", "/api/v1/search")
 
 
 def _auth_json(path: str, status: int, code: str, message: str) -> JSONResponse:

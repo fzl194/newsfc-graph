@@ -79,6 +79,7 @@ import JsonPopover from './JsonPopover.vue'
 const ENDPOINTS = [
   { value: '/md', label: 'POST /md' },
   { value: '/domains', label: 'POST /domains' },
+  { value: '/search', label: 'POST /search' },
   { value: 'mcp:get_md', label: 'mcp:get_md' },
   { value: 'mcp:get_domains', label: 'mcp:get_domains' },
   { value: 'mcp:search_graph', label: 'mcp:search_graph' },

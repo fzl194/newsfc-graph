@@ -93,6 +93,9 @@ def test_graph_routes_401_uses_error_envelope(tmp_path, monkeypatch, tmp_data_di
         r2 = c.post("/api/v1/md", json={})
         assert r2.status_code == 401
         assert r2.json()["error"]["code"] == "UNAUTHENTICATED"
+        r_search = c.post("/api/v1/search", json={"terms": ["x"]})
+        assert r_search.status_code == 401
+        assert r_search.json()["error"]["code"] == "UNAUTHENTICATED"
         # 非图谱路径不受影响（前端 api.ts 兼容）
         r3 = c.get("/api/v1/names")
         assert r3.status_code == 401
@@ -114,6 +117,9 @@ def test_graph_routes_403_uses_error_envelope(tmp_path, monkeypatch, tmp_data_di
         r2 = c.post("/api/v1/md", headers={"X-API-Key": "gap_sk"}, json={})
         assert r2.status_code == 422
         assert r2.json()["error"]["code"] == "INVALID_ARGUMENT"
+        r_search = c.post("/api/v1/search", headers={"X-API-Key": "gap_sk"}, json={})
+        assert r_search.status_code == 422
+        assert r_search.json()["error"]["code"] == "INVALID_ARGUMENT"
 
 
 # ---------------- assets / upload / test 权限 ----------------

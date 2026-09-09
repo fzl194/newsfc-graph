@@ -51,7 +51,7 @@ graph-asset-platform/
 cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 ```
 
-> **鉴权（v2 用户体系）**：`platform-data/users.json` 存用户（明文 KEY，不入 git）。前端访问跳登录页（用户名+KEY，仅 `can_frontend` 用户可登录）；Agent 可走 MCP 服务（`/mcp`）或 REST 兼容接口（`POST /api/v1/domains`、`POST /api/v1/md`），均在 header 传 `X-API-Key: <用户KEY>`、每次调用传同名字段 `AGENT_USERNAME`/`AGENT_SESSION_ID`（MCP 工具参数或 REST JSON body），详见 `图谱平台接口文档.md`。**不再使用 `GAP_API_KEY` 环境变量**。
+> **鉴权（v2 用户体系）**：`platform-data/users.json` 存用户（明文 KEY，不入 git）。前端访问跳登录页（用户名+KEY，仅 `can_frontend` 用户可登录）；Agent 可走 MCP 服务（`/mcp`）或 REST 兼容接口（`POST /api/v1/domains`、`POST /api/v1/md`、`POST /api/v1/search`，与 MCP 三公开工具同契约），均在 header 传 `X-API-Key: <用户KEY>`、每次调用传同名字段 `AGENT_USERNAME`/`AGENT_SESSION_ID`（MCP 工具参数或 REST JSON body），详见 `图谱平台接口文档.md`。**不再使用 `GAP_API_KEY` 环境变量**。
 >
 > **初始化 admin**：`users.json` 不存在或为空时无法登录。生成初始 admin（打印 KEY）：
 > ```bash

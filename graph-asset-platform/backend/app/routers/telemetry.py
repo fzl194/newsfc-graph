@@ -38,7 +38,7 @@ def telemetry_usage_table(
     scope: str = Query(default="call", description="call|object|all，同 skill-usage"),
     start: str = Query(default="", description="时间窗起点（ISO8601 或纯日期）"),
     end: str = Query(default="", description="时间窗终点（ISO8601 或纯日期=含当天）"),
-    endpoint: str = Query(default="", description="端点多选（逗号分隔，取值：/md,/domains,mcp:get_md,mcp:get_domains,mcp:search_graph,mcp:search_objects,mcp:search_md,mcp:get_object）"),
+    endpoint: str = Query(default="", description="端点多选（逗号分隔，取值：/md,/domains,/search,mcp:get_md,mcp:get_domains,mcp:search_graph,mcp:search_objects,mcp:search_md,mcp:get_object）"),
     q: str = Query(default="", description="账号/工号子串过滤"),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=50, ge=1, le=200),
