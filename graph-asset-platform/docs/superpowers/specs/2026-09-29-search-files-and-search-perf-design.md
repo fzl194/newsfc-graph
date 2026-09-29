@@ -174,7 +174,7 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
      索引计划，3.45.3 实证；<3.45 为全库正文扫描——此时切 `metadata_only` 档保命）；
      元数据照常 LIKE。**前缀短语方案已实证否决**（`MATCH '"xx"*'` 在 3.45.3 返回空，
      FTS5 trigram MATCH 需 ≥3 字符）。
-   - 1 字符 term：只搜元数据，不搜正文（diagnostics 注明 `body_skipped_short_term`）。
+   - 1 字符 term：只搜元数据，不搜正文（diagnostics 注明 `body_skipped_short_terms`）。
    - perf 冒烟测试（合成 10 万对象语料，标记 slow）不达标 → 切 metadata_only 档发布。
 5. **catalog 校验缓存**：`_validate_filters` 每请求最多 5 次 DISTINCT 全表扫，改为模块级
    缓存 + rebuild/reload_index 时失效。
@@ -244,7 +244,7 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 
 | 风险 | 缓解 |
 |---|---|
-| trigram 前缀短语实测不达预期（D6） | 两档开关，默认可切 metadata_only；perf 冒烟测试把门 |
+| 两字词 LIKE 在低版本 SQLite 无索引计划（前缀短语方案已实证否决并按 D6 修订弃用） | meta 表开关切 metadata_only 档；perf 冒烟测试把门 |
 | 深翻页到池底即止（语义变化） | 接口文档明示"top-N 语义 + 截断标记"；全量场景由 search_files 游标承担 |
 | files 索引与磁盘漂移（外部直拷） | `_sync_mtime_async` 只治理 objects 不治理 files（§4.2），外部拷贝后漂移是常态；admin files-reindex 兜底 + 接口文档写明运维口径 |
 | 首启 bootstrap 在超大库上耗时 | 异步后台执行，不阻塞服务；进度打日志 |

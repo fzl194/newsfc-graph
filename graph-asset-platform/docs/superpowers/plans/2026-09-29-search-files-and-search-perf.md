@@ -4,7 +4,7 @@
 
 **Goal:** 新增文件维度 MCP 工具 `search_files`（文件名搜索 + 目录浏览，游标分页，扛百万级）+ REST `POST /api/v1/files`；同时治理 search_graph 在内网大数据量下的超时（有界候选池重构）。
 
-**Architecture:** Track A（Chunk 1-2）给 assets/ 建 SQLite "文件户口册"（v14 三表：files / files_fts / files_fts_map），所有平台写路径增量维护 + 首启异步 bootstrap + admin 兜底重建；查询核心 `file_query.search_files_core` 由 MCP 工具与 REST 端点共享（同构对账扩为四对）。Track B（Chunk 3）重构 `graph_query/search.py`：每 term 每来源只取 top-2000 进 Python 合并池、total 封顶、SEARCH_TOO_BROAD 退场、两字词走 trigram 前缀短语（meta 表开关可降级）。
+**Architecture:** Track A（Chunk 1-2）给 assets/ 建 SQLite "文件户口册"（v14 三表：files / files_fts / files_fts_map），所有平台写路径增量维护 + 首启异步 bootstrap + admin 兜底重建；查询核心 `file_query.search_files_core` 由 MCP 工具与 REST 端点共享（同构对账扩为四对）。Track B（Chunk 3）重构 `graph_query/search.py`：每 term 每来源只取 top-2000 进 Python 合并池、total 封顶、SEARCH_TOO_BROAD 退场、两字词走 trigram 加速 LIKE（meta 表开关可降级 metadata_only）。
 
 **Tech Stack:** Python 3 / FastAPI / SQLite（FTS5 trigram）/ FastMCP / pytest。
 
@@ -1777,7 +1777,7 @@ git commit -m "perf: 短词两档——2字词 trigram 加速 LIKE（meta 开关
 ```python
 def test_catalog_cached_until_invalidate(populated):
     from app.graph_query import catalog
-    conn = get_service().db
+    conn = populated.db
     v1 = catalog.versions(conn)
     conn.execute("INSERT INTO objects(id, version, type, layer, scope, "
                  "source_path, name, frontmatter_json, body_md, raw_md, mtime) "
@@ -1793,7 +1793,7 @@ def test_catalog_cached_until_invalidate(populated):
 ```python
 def test_reload_index_invalidates_catalog(populated):
     import app.graph_query.catalog as catalog
-    get_service().reload_index()
+    populated.reload_index()
     assert catalog._cache == {}  # reload（写路径末尾）即失效
 ```
 
@@ -1940,7 +1940,6 @@ def big(tmp_path_factory):
     s.registry = Registry.load_default()
     s.index = Index.load_from_db(s.db, s.registry)
     s.files_building = False
-    svc_mod._service = s
     rows = []
     for i in range(N):
         oid = f"UDG@MMLCommand@CMD {i:06d}"
