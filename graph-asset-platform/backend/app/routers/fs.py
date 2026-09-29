@@ -272,9 +272,10 @@ class PathIn(BaseModel):
 def mkdir(req: PathIn, request: Request):
     _require_assets(request)
     svc = get_service()
-    svc.store.makedirs(req.path)
-    files_repo.upsert_from_disk(svc.db, svc.store, req.path)
-    svc.db.commit()
+    with import_lock:
+        svc.store.makedirs(req.path)
+        files_repo.upsert_from_disk(svc.db, svc.store, req.path)
+        svc.db.commit()
     _record(request, "/fs/mkdir", req.path)
     return {"ok": True, "path": req.path}
 
@@ -319,8 +320,8 @@ def move(req: MoveIn, request: Request):
             return {"ok": True, "new_path": target, "moved": False}
         store.write(target, text)
         files_repo.upsert_from_disk(svc.db, svc.store, target)
-        files_repo.remove_path(svc.db, req.src)
         store.delete(req.src)
+        files_repo.remove_path(svc.db, req.src)  # 盘删成功后再删册行（镜像 rename：盘删失败不悬空册删）
         store.cleanup_empty_dirs(req.src)
         svc.reindex_path(target)
         svc.unindex_path(req.src)

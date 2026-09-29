@@ -395,6 +395,11 @@ def test_fs_rename_dry_run_and_apply(tmp_data_dir, monkeypatch):
     new_pa = "Command/alpha/20.15.2/alpha@MMLCommand@AAA2.md"
     assert s.store.exists(new_pa) and not s.store.exists(pa)
     assert parse_md(s.store.read(new_pa))[0]["id"] == "alpha@MMLCommand@AAA2"
+    # files 户口册：改名后新行在、旧行不在（rename 挂钩；rebuild 已灌两行）
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", (new_pa,)).fetchone() is not None
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", (pa,)).fetchone() is None
 
 
 # ---------- upload（target_dir 驱动）----------
@@ -412,6 +417,9 @@ def test_fs_upload_to_target_dir(tmp_data_dir, monkeypatch):
     # 落到 target_dir/id.md（target_dir 权威，不经 classify）
     p = "Command/alpha/20.99.99/alpha@MMLCommand@UPLOAD.md"
     assert s.store.exists(p)
+    # files 户口册：上传文件行在册（upload 挂钩）
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", (p,)).fetchone() is not None
 
 
 def test_fs_upload_overrides_fm(tmp_data_dir, monkeypatch):
