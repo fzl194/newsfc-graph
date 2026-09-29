@@ -1,7 +1,8 @@
 """统一搜索 search_graph 测试（M2，需求 §7/§15.1）。
 
 覆盖：terms/any/all、短语 term、短词（<3 字符）、元数据等级排序、RRF、
-filter/latest 前置、预算、facets、分页、recovery_codes、错误码区分。
+filter/latest 前置、池上限（POOL_CAP 触顶截断）、facets、分页、
+recovery_codes、错误码区分。
 """
 import io
 import zipfile
@@ -387,18 +388,18 @@ def test_hit_fields_required_shape(tmp_data_dir, monkeypatch):
     assert "免费RG" in hit["snippets"][0]["text"]
 
 
-# ---------------- 19 预算 ----------------
+# ---------------- 19 池上限（POOL_CAP 触顶截断，SEARCH_TOO_BROAD 退场） ----------------
 
-def test_search_too_broad_budget(tmp_data_dir, monkeypatch):
-    _setup(tmp_data_dir, monkeypatch)
+def test_pool_cap_truncation_returns_bounded(populated, monkeypatch):
+    """SEARCH_TOO_BROAD 退场：池触顶不再报错——正常返回 + total_is_bounded +
+    截断建议。monkeypatch POOL_CAP=2 强制触顶，语义不依赖语料规模。"""
     from app.graph_query import search as search_mod
-    m2 = pytest.MonkeyPatch()
-    m2.setattr(search_mod, "SEARCH_BUDGET", 0)
-    try:
-        e = _err_of(terms=["计费"])
-        assert e.code == gq.SEARCH_TOO_BROAD
-    finally:
-        m2.undo()
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+    out = search_graph_core(terms=["计费"])  # 种子里 ≥4 个对象元数据含"计费"
+    assert out["total"] >= 1
+    assert out["total_is_bounded"] is True
+    assert out["diagnostics"]["term_counts"]["计费"]["capped"] is True
+    assert any("截断" in s for s in out["suggestions"])
 
 
 # ---------------- 22/23 零结果诊断 ----------------
@@ -416,7 +417,8 @@ def test_zero_result_recovery_remove_term(tmp_data_dir, monkeypatch):
     out = search_graph_core(terms=["计费", "不存在的词xyz"], match="all")
     assert out["total"] == 0
     assert "REMOVE_OR_REPHRASE_TERM" in out["diagnostics"]["recovery_codes"]
-    assert out["diagnostics"]["term_counts"]["不存在的词xyz"] == 0
+    assert out["diagnostics"]["term_counts"]["不存在的词xyz"] == \
+        {"hit": False, "capped": False}
 
 
 def test_zero_result_recovery_relax_filters(tmp_data_dir, monkeypatch):
@@ -430,7 +432,7 @@ def test_zero_result_recovery_relax_filters(tmp_data_dir, monkeypatch):
 def test_term_counts_present_on_success(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     out = search_graph_core(terms=["计费", "免费RG"], match="any")
-    assert out["diagnostics"]["term_counts"]["免费RG"] >= 1
+    assert out["diagnostics"]["term_counts"]["免费RG"]["hit"] is True
 
 
 # ---------------- 输出契约 ----------------
@@ -438,8 +440,9 @@ def test_term_counts_present_on_success(tmp_data_dir, monkeypatch):
 def test_response_contract_fields(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     out = search_graph_core(terms=["URR"])
-    for f in ("terms", "match", "applied_filters", "total", "page", "size",
-              "has_more", "next_page", "hits", "facets", "diagnostics", "suggestions"):
+    for f in ("terms", "match", "applied_filters", "total", "total_is_bounded",
+              "page", "size", "has_more", "next_page", "hits", "facets",
+              "diagnostics", "suggestions"):
         assert f in out, f
     assert out["match"] == "any"
     assert out["applied_filters"] == {}
@@ -481,3 +484,34 @@ def test_catalog_nf_case_conflict_integrity_error(tmp_data_dir, monkeypatch):
     with pytest.raises(gq.GraphQueryError) as ei:
         catalog.nfs(s.db)
     assert ei.value.error.code == gq.INTERNAL_ERROR
+
+
+# ---------------- 有界候选池（2026-09-29 超时治理 Task 9） ----------------
+
+@pytest.fixture
+def populated(tmp_data_dir, monkeypatch):
+    """Task 10/11 共用：种子语料 + 全局 service 就绪。"""
+    _setup(tmp_data_dir, monkeypatch)  # 该文件既有的种子辅助（各测试体内同款调用）
+    from app.service import get_service
+    return get_service()
+
+
+def test_broad_term_returns_truncated_not_error(populated):
+    """宽泛词不再 SEARCH_TOO_BROAD 报错：正常返回 + total_is_bounded。"""
+    out = search_graph_core(terms=["配置"])  # 种子语料里的高频词（3 个对象正文含"配置"）
+    assert out["total"] >= 1
+    if out["total_is_bounded"]:
+        assert out["total"] <= 10_000
+        assert any("截断" in s for s in out["suggestions"])
+
+
+def test_term_counts_new_shape(populated):
+    out = search_graph_core(terms=["ADD URR", "不存在词xyz"])
+    tc = out["diagnostics"]["term_counts"]
+    assert tc["ADD URR"] == {"hit": True, "capped": False}
+    assert tc["不存在词xyz"] == {"hit": False, "capped": False}
+
+
+def test_total_is_bounded_field_present(populated):
+    out = search_graph_core(terms=["ADD URR"])
+    assert isinstance(out["total_is_bounded"], bool)

@@ -22,7 +22,7 @@ OBJECT_NOT_FOUND = "OBJECT_NOT_FOUND"
 VERSION_NOT_FOUND = "VERSION_NOT_FOUND"
 RESULT_TOO_LARGE = "RESULT_TOO_LARGE"
 INDEX_REBUILDING = "INDEX_REBUILDING"
-SEARCH_TOO_BROAD = "SEARCH_TOO_BROAD"
+SEARCH_TOO_BROAD = "SEARCH_TOO_BROAD"  # deprecated-unused（2026-09-29 超时治理退场，仅保留枚举兼容）
 TOOL_DISABLED = "TOOL_DISABLED"
 INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -222,10 +222,19 @@ class SearchFacets(BaseModel):
     versions: dict[str, int]
 
 
+class TermCountStat(BaseModel):
+    """term_counts 新形状（spec §5.3）：hit=EXISTS 探针语义；capped=池触顶。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hit: bool
+    capped: bool
+
+
 class SearchDiagnostics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    term_counts: dict[str, int]
+    term_counts: dict[str, TermCountStat]
     recovery_codes: list[str]
 
 
@@ -238,6 +247,7 @@ class SearchGraphResponse(BaseModel):
     match: str
     applied_filters: dict
     total: int
+    total_is_bounded: bool = False
     page: int
     size: int
     has_more: bool

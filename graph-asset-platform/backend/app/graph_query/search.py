@@ -10,7 +10,7 @@
 4. 每 term 元数据 LIKE + 正文（≥3 FTS5 trigram 短语 ORDER BY bm25 / <3 LIKE）；
 5. 合并 any/all（同一 term 多字段只计一次）；
 6. 排序（matched_terms_count ↓, metadata_level ↓, body_rrf ↓, type/id ↑）；
-7. 预算检查（累计中间命中 > SEARCH_BUDGET → SEARCH_TOO_BROAD，不返回部分结果）；
+7. 池上限（每 term 每来源 LIMIT POOL_CAP；触顶 → total_is_bounded，不报错）；
 8. 分页（外层单页 ≤50）。
 
 排序说明（§7.6）：跨 term 不比 raw BM25，用 RRF：body_rrf = Σ 1/(60+rank)；
@@ -25,7 +25,6 @@ from .contracts import (
     INVALID_ARGUMENT,
     INVALID_FILTER,
     INVALID_FILTER_COMBINATION,
-    SEARCH_TOO_BROAD,
     GraphError,
     GraphQueryError,
     SearchGraphResponse,
@@ -34,8 +33,12 @@ from ..repos.graph_search_repo import normalize_search_text
 from ..service import get_service
 from ..ui_layers import UI_LAYER_TYPES, ui_layer_of
 
-# 内部中间命中预算（§7.7）：超过即整次 SEARCH_TOO_BROAD——不返回近似/部分结果
-SEARCH_BUDGET = 2_000_000
+# 候选池上限（每 term 每来源）：排序合并只在小池内做——宽泛词不再把百万行拉回
+# Python（2026-09-29 超时治理，spec §5.2）。触顶 → total_is_bounded=true，
+# 不再报 SEARCH_TOO_BROAD（错误码保留在 contracts 标注 deprecated-unused）。
+POOL_CAP = 2_000
+# total 精确计数上限：超过报 10000 + total_is_bounded（与 search_files 同口径）
+TOTAL_CAP = 10_000
 
 # 输入护栏
 MAX_TERMS = 10
@@ -323,8 +326,8 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
                 "json_extract(o.frontmatter_json, '$.name_zh') AS name_zh")
 
     agg: dict = {}            # (id, version) → 累积命中
-    term_hits: dict = {}      # norm_term → set[(id, version)]
-    raw_rows = 0
+    term_stats: dict = {}     # norm_term → {"hit": bool, "capped": bool}
+    any_capped = False
 
     def _entry(key, row):
         if key not in agg:
@@ -339,16 +342,15 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
 
     for _disp, norm in norm_terms:
         seen_keys: set = set()
-        # 单条查询 LIMIT（预算+1）：预算内的总量语义不变；超预算无需把行全取回
-        # 即可判定（安全审查 M2——防高基数 term 拉爆内存）
-        row_cap = SEARCH_BUDGET + 1
-        # 元数据：规范化后字面包含（trigram 索引加速 LIKE）
+        capped = False
+        # 元数据：规范化后字面包含（trigram 索引加速 LIKE），池内限量
         rows = conn.execute(
             f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
             "AND graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
-            f"LIMIT {row_cap}",
+            f"LIMIT {POOL_CAP}",
             [*params, f"%{_like_escape(norm)}%"]).fetchall()
-        raw_rows += len(rows)
+        if len(rows) >= POOL_CAP:
+            capped = True
         for r in rows:
             key = (r["obj_id"], r["version"])
             level, fields = _meta_level(
@@ -360,14 +362,15 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
             e["fields"] |= fields
             e["meta_level"] = max(e["meta_level"], level)
             seen_keys.add(key)
-        # 正文：≥3 走 FTS5 trigram 短语（ORDER BY bm25，1-based rank → RRF）
+        # 正文：≥3 走 FTS5 trigram 短语（ORDER BY bm25，1-based rank → RRF），池内限量
         if len(norm) >= 3:
             rows = conn.execute(
                 f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
                 "AND graph_search_fts MATCH ? "
-                f"ORDER BY bm25(graph_search_fts) LIMIT {row_cap}",
+                f"ORDER BY bm25(graph_search_fts) LIMIT {POOL_CAP}",
                 [*params, f"body_text : {_fts_phrase(norm)}"]).fetchall()
-            raw_rows += len(rows)
+            if len(rows) >= POOL_CAP:
+                capped = True
             for rank, r in enumerate(rows, 1):
                 key = (r["obj_id"], r["version"])
                 e = _entry(key, r)
@@ -376,13 +379,14 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
                 e["body_terms"].add(norm)
                 e["rrf"] += 1.0 / (_RRF_K + rank)
                 seen_keys.add(key)
-        else:  # <3：LIKE 字面包含（先被 filters+latest 限定）
+        else:  # <3：LIKE 字面包含（Task 10 将按档分流：1字词跳正文/2字词保持此路径）
             rows = conn.execute(
                 f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
                 "AND graph_search_fts.body_text LIKE ? ESCAPE '\\' "
-                f"LIMIT {row_cap}",
+                f"LIMIT {POOL_CAP}",
                 [*params, f"%{_like_escape(norm)}%"]).fetchall()
-            raw_rows += len(rows)
+            if len(rows) >= POOL_CAP:
+                capped = True
             for r in rows:
                 key = (r["obj_id"], r["version"])
                 e = _entry(key, r)
@@ -390,13 +394,8 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
                 e["fields"].add("body")
                 e["body_terms"].add(norm)
                 seen_keys.add(key)
-        term_hits[norm] = seen_keys
-        if raw_rows > SEARCH_BUDGET:
-            raise GraphQueryError(GraphError(
-                code=SEARCH_TOO_BROAD,
-                message=("命中量过大（中间命中超预算）：请增加 nf/type/layer 等"
-                         "过滤或减少 terms 后重试——不返回近似或部分结果"),
-                details={"budget": SEARCH_BUDGET, "rows_so_far": raw_rows}))
+        term_stats[norm] = {"hit": bool(seen_keys), "capped": capped}
+        any_capped = any_capped or capped
 
     # ---------- any/all 合并 + 排序 ----------
     n_terms = len(norm_terms)
@@ -470,14 +469,14 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
         })
 
     # ---------- 诊断与建议 ----------
-    term_counts = {disp: len(term_hits.get(norm, ()))
-                   for disp, norm in norm_terms}
+    # term_counts（新形状 §5.3）：EXISTS 语义的 hit + 池触顶标记 capped
+    term_counts = {disp: term_stats[norm] for disp, norm in norm_terms}
     recovery_codes: list = []
     if total == 0:
-        if match == "all" and all(c > 0 for c in term_counts.values()) \
+        if match == "all" and all(st["hit"] for st in term_stats.values()) \
                 and len(term_counts) > 1:
             recovery_codes.append("USE_MATCH_ANY")
-        if any(c == 0 for c in term_counts.values()):
+        if any(not st["hit"] for st in term_stats.values()):
             recovery_codes.append("REMOVE_OR_REPHRASE_TERM")
         if any(v is not None for v in (layer, type_, nf, version, domain, scenario)) \
                 and any(_probe_without_filters(conn, norm) for _, norm in norm_terms):
@@ -490,13 +489,17 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
         ]
     else:
         suggestions = ["选择候选 ID 后调用 get_md 获取完整原文"]
+    if any_capped:
+        suggestions.append("命中量过大已按相关度截断：增加 nf/type/layer 等过滤"
+                           "或减少 terms 可提升排序质量")
 
     applied = {k: v for k, v in {
         "layer": layer, "type": type_, "nf": nf, "version": version,
         "domain": domain, "scenario": scenario}.items() if v is not None}
     resp = SearchGraphResponse(
         terms=[disp for disp, _ in norm_terms], match=match,
-        applied_filters=applied, total=total, page=page, size=size,
+        applied_filters=applied, total=total, total_is_bounded=any_capped,
+        page=page, size=size,
         has_more=has_more, next_page=(page + 1) if has_more else None,
         hits=hits,
         facets=facets,
