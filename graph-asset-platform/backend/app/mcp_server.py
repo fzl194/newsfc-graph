@@ -56,13 +56,15 @@ _CTX_SID = ("【必传】当前会话ID：每次调用从环境变量 _AGENT_SES
 # **追加**在 canonical 之后——不再全文覆盖（旧覆盖值已由 v13 迁移备份）。
 DEFAULT_INSTRUCTIONS = (
     "三层电信图谱（业务层→任务层→特性层→命令层）查询服务。使用决策树：\n"
-    "1. 已知准确对象 ID：直接 get_md。\n"
-    "2. 不知道 ID：search_graph 定位候选（多关键词放 terms 数组，任一命中用 "
+    "1. 按业务意图找方案：get_domains 读业务域 md 的全文 [[ID]] 引用后 get_md 下钻。\n"
+    "2. 按关键词找对象：search_graph 定位候选（多关键词放 terms 数组，任一命中用 "
     "match=any，全部命中用 match=all）；选定候选后必须 get_md 取完整原文——"
     "snippet 不是权威依据。\n"
-    "3. 业务方案定位：get_domains 读业务域 md 的全文 [[ID]] 引用后 get_md 下钻。\n"
+    "3. 按文件名找文件 / 列目录：search_files（md 命中回带 obj_id+version，"
+    "get_md 读该文件内容；非 md 文件只有元数据；全量获取用 after 游标循环翻页）。\n"
     "4. 参数字段范围：定位 MMLCommand 后 get_md，读取 CommandParameter 段。\n"
-    "5. get_md 单项失败不重试整批（失败项回带 available_versions，改版本或移除该 id）。"
+    "5. get_md 单项失败不重试整批（失败项回带 available_versions，改版本或移除该 id）。\n"
+    "所有搜索与读取默认作用于每个 ID 的最新现存版本（version 参数可锁定旧版）。"
 )
 
 # legacy 工具替换映射（§11.3：deprecated 打点 + 错误指引）
@@ -259,8 +261,9 @@ def _validation_details(e: ValidationError) -> dict:
 def get_domains(AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)], ctx: Context = None) -> DomainsResponse:
     """获取三层图谱全部业务域（BusinessDomain）的完整 markdown。
 
-    业务域是业务归属的顶层定位层，是任何查询的推荐第一步：先调本工具，按用户需求
-    关键词锁定业务域，再从域 md 的 [[NetworkScenario@*]] 引用下钻场景/方案。
+    业务域是业务归属的顶层定位层，按业务意图定位（找业务方案/场景归属）时的
+    第一步；按关键词找对象请用 search_graph，按文件名找文件请用 search_files。
+    先调本工具，按用户需求关键词锁定业务域，再从域 md 的 [[NetworkScenario@*]] 引用下钻场景/方案。
     返回量小（业务域数量少），可放心全量读取。返回
     {domains: [{id, type, name, version, md, references}]}（references=全文 [[ID]]
     引用去重保序）。已知准确对象 ID 时可跳过本工具直接 get_md。
@@ -311,6 +314,7 @@ def get_md(ids: Annotated[list[Annotated[str, Field(min_length=1, max_length=256
     available_versions}（对象不存在/版本不存在，单项失败不阻断整批）。
     读完 md 后应提取全文 [[ID]] 引用（references 已给出）继续下钻。
     单次最多 100 个 id 且响应总量 ≤2MB，超限报错请分批。
+    默认读取每个 id 最新现存版本（version 可全局锁定）。
 
     Args:
         ids: 对象逻辑 ID 列表（1~100 个）
@@ -380,7 +384,11 @@ def search_graph(
     ctx: Context = None) -> SearchGraphResponse:
     """统一搜索三层图谱（元数据 id/name/name_zh + md 正文），定位候选对象 ID。
 
-    不知道对象 ID 时的唯一入口（业务方案定位用 get_domains）。返回候选列表 +
+    不知道对象 ID 时的唯一入口（业务方案定位用 get_domains）。
+    默认作用于每个 ID 的最新现存版本（version 参数可锁定旧版）。命中量过大时
+    正常返回按相关度截断的候选（total_is_bounded=true，宽词 match=all 的交集
+    可能不含池外命中；全量获取场景请用 search_files 的 after 游标），加过滤词
+    可提升质量。返回候选列表 +
     matched_terms/matched_in/snippets/facets/diagnostics：
     - snippet 只是定位线索，**不是权威依据**——选定候选后必须调 get_md 取完整
       原文（MMLCommand 参数字段范围以 get_md 返回的 CommandParameter 段为准）；

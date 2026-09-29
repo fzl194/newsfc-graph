@@ -161,7 +161,7 @@ async def search_graph(request: Request):
     domain/scenario/page/size + AGENT_USERNAME/AGENT_SESSION_ID，extra=forbid）。
     响应与 MCP content JSON 完全相同（SearchGraphResponse）；错误 envelope：
     422 INVALID_ARGUMENT（枚举/越界/未知字段）、422 INVALID_FILTER(_COMBINATION)
-    （带 available_values）、413 SEARCH_TOO_BROAD、503 INDEX_REBUILDING（retryable）。
+    （带 available_values）、503 INDEX_REBUILDING（retryable）。
     打点：1 条 tool 行（caller=skill、endpoint=/search），无 object 行——与
     MCP §7.9 同口径。
     """
