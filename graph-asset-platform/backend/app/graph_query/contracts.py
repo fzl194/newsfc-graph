@@ -250,17 +250,25 @@ class SearchGraphResponse(BaseModel):
 
 # ---------- search_files 输入/输出（spec 2026-09-29 §4.3） ----------
 
+# search_files 输入长度护栏（REST Field 与 core 校验同值引用，两通道不分叉；
+# 规范化后 query 上限 80 只在 core 用，留 file_query 本地）
+MAX_FILES_QUERY_LEN = 200     # query 原始输入
+MAX_FILES_PATH_LEN = 1024     # path 目录限定
+MAX_FILES_EXT_LEN = 64        # ext 扩展名
+MAX_FILES_AFTER_LEN = 1024    # after 游标（与 path 同值，独立常量便于演进）
+
+
 class RestFilesRequest(RestDomainsRequest):
     """REST /files 请求体（与 MCP search_files 同契约）。query/path/ext 至少
     一个（core 校验）；limit 1~500；after=游标（上一页 next_cursor）。长度上限
-    query=200/path=1024/ext=64/after=1024（core 同值校验，两通道不分叉）。"""
+    引上方 MAX_FILES_* 常量（core 同值校验，两通道不分叉）。"""
 
-    query: Optional[Annotated[str, Field(max_length=200)]] = None
-    path: Optional[Annotated[str, Field(max_length=1024)]] = None
-    ext: Optional[Annotated[str, Field(max_length=64)]] = None
+    query: Optional[Annotated[str, Field(max_length=MAX_FILES_QUERY_LEN)]] = None
+    path: Optional[Annotated[str, Field(max_length=MAX_FILES_PATH_LEN)]] = None
+    ext: Optional[Annotated[str, Field(max_length=MAX_FILES_EXT_LEN)]] = None
     recursive: bool = False
     limit: int = Field(default=100, ge=1, le=500)
-    after: Optional[Annotated[str, Field(max_length=1024)]] = None
+    after: Optional[Annotated[str, Field(max_length=MAX_FILES_AFTER_LEN)]] = None
 
 
 class FileHit(BaseModel):

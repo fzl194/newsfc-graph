@@ -316,3 +316,28 @@ def test_search_telemetry_parity(tmp_data_dir, monkeypatch):
     n_object = db.execute(
         "SELECT COUNT(*) FROM telemetry WHERE level='object'").fetchone()[0]
     assert n_object == 0
+
+
+# ---------------- search_files 第四对（2026-09-29） ----------------
+
+def test_search_files_parity_query(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    args = {**CTX, "query": "ADD DEMO"}
+    with TestClient(app) as c:
+        mcp_out = _mcp_ok(c, "search_files", args)
+        rest = c.post("/api/v1/files", json=args)
+    assert rest.status_code == 200, rest.text
+    assert mcp_out == rest.json()
+
+
+def test_search_files_parity_ls_dir_rows_and_error(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        mcp_ls = _mcp_ok(c, "search_files", {**CTX, "path": "Command"})
+        rest_ls = c.post("/api/v1/files", json={**CTX, "path": "Command"})
+        mcp_err = _mcp_err(c, "search_files", {**CTX, "path": "NoSuch"})
+        rest_err = c.post("/api/v1/files", json={**CTX, "path": "NoSuch"})
+    assert rest_ls.status_code == 200, rest_ls.text
+    assert mcp_ls == rest_ls.json()   # 目录行 obj_id/version=None 两边同构
+    assert rest_err.status_code == 422
+    assert mcp_err == rest_err.json()  # 错误 envelope 同构

@@ -17,15 +17,16 @@ temp B-tree 排序），全量遍历场景请用 path 模式（索引干净）�
 from datetime import datetime, timezone
 from typing import Optional
 
-from .graph_query.contracts import INVALID_ARGUMENT, INVALID_FILTER, err
+from .graph_query.contracts import (INVALID_ARGUMENT, INVALID_FILTER,
+                                    MAX_FILES_AFTER_LEN, MAX_FILES_EXT_LEN,
+                                    MAX_FILES_PATH_LEN, MAX_FILES_QUERY_LEN,
+                                    err)
 from .repos.graph_search_repo import normalize_search_text
 from .service import get_service
 
 TOTAL_CAP = 10_000
-MAX_QUERY_LEN = 80            # 规范化后（NFKC→strip→casefold）
-MAX_QUERY_RAW_LEN = 200       # 原始输入（与 RestFilesRequest Field 同值）
-MAX_PATH_LEN = 1024           # path 与 after 游标共用
-MAX_EXT_LEN = 64
+MAX_QUERY_LEN = 80            # 规范化后（NFKC→strip→casefold）；原始输入上限
+                              # = contracts.MAX_FILES_QUERY_LEN（与 REST Field 同值）
 ECHO_CAP = 200                # INVALID_FILTER 回显截断（错误消息不放大输入）
 
 
@@ -56,8 +57,8 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
     norm_query = normalize_search_text(query) if query else ""
     if query is not None and not norm_query:
         raise err(INVALID_ARGUMENT, "query 不能为空白")
-    if len(query or "") > MAX_QUERY_RAW_LEN:
-        raise err(INVALID_ARGUMENT, f"query 原始长度最长 {MAX_QUERY_RAW_LEN} 字符")
+    if len(query or "") > MAX_FILES_QUERY_LEN:
+        raise err(INVALID_ARGUMENT, f"query 原始长度最长 {MAX_FILES_QUERY_LEN} 字符")
     if norm_query and len(norm_query) < 2:
         raise err(INVALID_ARGUMENT,
                   "文件名搜索词规范化后至少 2 个字符（1 字符无法走索引且无意义）")
@@ -65,12 +66,12 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
         raise err(INVALID_ARGUMENT, f"query 规范化后最长 {MAX_QUERY_LEN} 字符")
     ext_n = (ext or "").strip().lstrip(".").lower() or None
     path_n = (path or "").strip().strip("/") or None
-    if len(ext_n or "") > MAX_EXT_LEN:
-        raise err(INVALID_ARGUMENT, f"ext 最长 {MAX_EXT_LEN} 字符")
-    if len(path_n or "") > MAX_PATH_LEN:
-        raise err(INVALID_ARGUMENT, f"path 最长 {MAX_PATH_LEN} 字符")
-    if len(after or "") > MAX_PATH_LEN:
-        raise err(INVALID_ARGUMENT, f"after 游标最长 {MAX_PATH_LEN} 字符")
+    if len(ext_n or "") > MAX_FILES_EXT_LEN:
+        raise err(INVALID_ARGUMENT, f"ext 最长 {MAX_FILES_EXT_LEN} 字符")
+    if len(path_n or "") > MAX_FILES_PATH_LEN:
+        raise err(INVALID_ARGUMENT, f"path 最长 {MAX_FILES_PATH_LEN} 字符")
+    if len(after or "") > MAX_FILES_AFTER_LEN:
+        raise err(INVALID_ARGUMENT, f"after 游标最长 {MAX_FILES_AFTER_LEN} 字符")
     if not (norm_query or path_n or ext_n):
         raise err(INVALID_ARGUMENT,
                   "query / path / ext 至少给一个：query=按文件名搜；path=列目录；"
