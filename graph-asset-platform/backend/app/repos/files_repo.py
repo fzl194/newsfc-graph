@@ -108,8 +108,6 @@ def upsert_tree(conn: sqlite3.Connection, store, rel: str) -> None:
     base = win_long(store.root.resolve())  # 与枚举根同为 win_long 前缀
     for p in root.rglob("*"):
         rel_parts = p.relative_to(base).parts
-        if any(part.startswith(".") for part in rel_parts):
-            continue
         try:
             upsert_from_disk(conn, store, "/".join(rel_parts))
         except (OSError, ValueError):
