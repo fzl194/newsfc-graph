@@ -18,6 +18,12 @@ from .graph_search_repo import normalize_search_text
 _CHUNK = 5000
 
 
+def _norm(rel: str) -> str:
+    """入口路径规范化：反斜杠→正斜杠、去首尾斜杠。非规范路径会造出半开
+    前缀区间外的幽灵行（如带尾斜杠的 mkdir path、Windows 反斜杠 rel）。"""
+    return rel.replace("\\", "/").strip("/")
+
+
 def _stat_row(rel: str, st, is_dir: int) -> tuple:
     """stat → (name, ext, is_dir, size, mtime) 行值（upsert_from_disk 与
     rebuild_all 共用）。目录 ext 恒 ''、size 恒 0（schema 注释）：Path.suffix
@@ -55,6 +61,7 @@ def upsert_from_disk(conn: sqlite3.Connection, store, rel: str) -> None:
     """磁盘 stat 单路径 → UPSERT；磁盘不存在 → 删行（自愈语义，调用方 commit）。
     点文件/点目录不入册（与 rebuild_all/store.list_children 口径一致）——已在
     册的点文件（历史脏数据）同样被清。"""
+    rel = _norm(rel)
     if any(part.startswith(".") for part in rel.split("/")):
         remove_path(conn, rel)
         return
@@ -74,6 +81,7 @@ def upsert_from_disk(conn: sqlite3.Connection, store, rel: str) -> None:
 
 def remove_path(conn: sqlite3.Connection, rel: str) -> None:
     """删单行 + FTS（map 命中走 rowid；缺失回退 path 删，正确性网底）。"""
+    rel = _norm(rel)
     rid = conn.execute(
         "SELECT fts_rowid FROM files_fts_map WHERE path=?", (rel,)).fetchone()
     if rid is not None:
@@ -87,6 +95,7 @@ def remove_path(conn: sqlite3.Connection, rel: str) -> None:
 def remove_prefix(conn: sqlite3.Connection, prefix: str) -> int:
     """删 prefix 目录行自身 + 其下全部行。'/' 的下一码位是 '0'：半开区间覆盖
     prefix/ 下任意 Unicode 文件名（同 service.reindex_prefixes 的技巧）。"""
+    prefix = _norm(prefix)
     low, high = prefix + "/", prefix + "0"
     paths = [r[0] for r in conn.execute(
         "SELECT path FROM files WHERE path>=? AND path<?", (low, high))]
@@ -101,6 +110,7 @@ def upsert_tree(conn: sqlite3.Connection, store, rel: str) -> None:
 
     先 remove_prefix 清子树旧行再从磁盘重灌：rglob 只枚举磁盘存在项，
     行在册、盘上无对应文件的历史脏行（点文件/幽灵行）不经此清理会永久残留。"""
+    rel = _norm(rel)
     root = win_long(store.abspath(rel))
     if not root.exists():
         remove_prefix(conn, rel)

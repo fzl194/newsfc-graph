@@ -161,3 +161,17 @@ def test_upsert_tree_heals_dotfile_rows(conn_db, store):
     files_repo.upsert_tree(conn_db, store, "a")
     assert conn_db.execute(
         "SELECT COUNT(*) FROM files WHERE path='a/.dirty.md'").fetchone()[0] == 0
+    assert conn_db.execute(
+        "SELECT COUNT(*) FROM files WHERE path='a/b.md'").fetchone()[0] == 1
+
+
+def test_entries_normalize_backslash_and_trailing_slash(conn_db, store):
+    """入口路径规范化：反斜杠/尾斜杠不得造出前缀区间外的幽灵行（mkdir 尾斜杠同族）。"""
+    store.write("a/b.md", "b")
+    files_repo.rebuild_all(conn_db, store)  # a + a/b.md = 2 行
+    files_repo.upsert_from_disk(conn_db, store, "a/")  # 尾斜杠 → 刷新 a 行，非造 "a/" 幽灵
+    assert conn_db.execute(
+        "SELECT COUNT(*) FROM files WHERE path LIKE 'a%'").fetchone()[0] == 2
+    files_repo.remove_path(conn_db, "a\\b.md")  # 反斜杠 → 命中正斜杠行
+    assert conn_db.execute(
+        "SELECT COUNT(*) FROM files WHERE path='a/b.md'").fetchone()[0] == 0
