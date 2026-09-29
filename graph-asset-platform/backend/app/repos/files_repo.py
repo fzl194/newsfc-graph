@@ -76,7 +76,117 @@ def upsert_from_disk(conn: sqlite3.Connection, store, rel: str) -> None:
         upsert_entry(conn, path=rel, name=name, ext=ext,
                      is_dir=is_dir, size=size, mtime=mtime)
     except (OSError, ValueError):
+        # OSError 一律按不存在处理（Windows AV 短暂锁文件会误删活行，
+        # 下次写/兜底重建自愈——正确性优先的取舍）
         remove_path(conn, rel)  # stat 失败/路径非法 → 按不存在处理
+
+
+def _in_marks(paths: list) -> str:
+    """占位符列表 → "(?,?,…)" IN 子句形（调用方绑同序参数）。"""
+    return "(" + ",".join("?" * len(paths)) + ")"
+
+
+def upsert_many_from_disk(conn: sqlite3.Connection, store, rels,
+                          chunk: int = 250) -> dict:
+    """批量自愈同步（gate apply/cancel/revert 用）：分块提交 + map 预取 +
+    miss 集合单次 DELETE（N 次全扫变 1 次），沿用 reindex_paths 的分块纪律
+    （不长时间饿死 jobs/telemetry 独立连接）。返回 {"upserted": n, "removed": n}
+    （按分类计数，removed 含本就无行的 miss）。
+
+    语义与逐路径 ``upsert_from_disk`` 一致（存在→stat 入册，不存在/点文件→
+    删行）；块内自管提交（容错版 ``_commit``），异常 rollback 后原样抛。
+    to_remove 的 ``path IN`` 批删是本函数唯一按 path 扫 FTS 的点（单次/块）；
+    upsert 侧旧 FTS 行按预取 rowid 删（map 缺失的历史脏 fts 行不在册即视为
+    不存在，由 upsert_entry/rebuild_all 的兜底口径负责）。
+    """
+    from ..service import _commit
+
+    unique = list(dict.fromkeys(_norm(r) for r in rels))    # 去重保序
+    upserted = removed = 0
+    try:
+        for i in range(0, len(unique), chunk):
+            block = unique[i:i + chunk]
+            # map 预取：命中行按 rowid O(1) 删旧 FTS，miss 走 path 批删
+            rid_map = {r["path"]: r["fts_rowid"] for r in conn.execute(
+                "SELECT path, fts_rowid FROM files_fts_map WHERE path IN "
+                + _in_marks(block), block)}
+            to_upsert: list = []  # (rel, name, ext, is_dir, size, mtime)
+            to_remove: list = []
+            for rel in block:
+                if any(part.startswith(".") for part in rel.split("/")):
+                    to_remove.append(rel)
+                    continue
+                try:
+                    p = win_long(store.abspath(rel))
+                    if not p.exists():
+                        to_remove.append(rel)
+                        continue
+                    is_dir = 1 if p.is_dir() else 0
+                    name, ext, _d, size, mtime = _stat_row(rel, p.stat(), is_dir)
+                    to_upsert.append((rel, name, ext, is_dir, size, mtime))
+                except (OSError, ValueError):
+                    to_remove.append(rel)
+            # 删除侧：三表各一条 path IN 批删（本函数唯一 path 全扫点，单次）
+            if to_remove:
+                marks = _in_marks(to_remove)
+                conn.execute(f"DELETE FROM files_fts WHERE path IN {marks}",
+                             to_remove)
+                conn.execute(f"DELETE FROM files_fts_map WHERE path IN {marks}",
+                             to_remove)
+                conn.execute(f"DELETE FROM files WHERE path IN {marks}",
+                             to_remove)
+                removed += len(to_remove)
+            # 插入侧：先按预取 rowid 删旧 FTS（仅命中），再批量插 + map 回填
+            if to_upsert:
+                hit_rowids = [rid_map[u[0]] for u in to_upsert if u[0] in rid_map]
+                if hit_rowids:
+                    conn.execute(
+                        "DELETE FROM files_fts WHERE rowid IN "
+                        + _in_marks(hit_rowids), hit_rowids)
+                conn.executemany(
+                    "INSERT INTO files(path, name, ext, is_dir, size, mtime) "
+                    "VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+                    "name=excluded.name, ext=excluded.ext, "
+                    "is_dir=excluded.is_dir, size=excluded.size, "
+                    "mtime=excluded.mtime", to_upsert)
+                conn.executemany(
+                    "INSERT INTO files_fts(path, name) VALUES(?,?)",
+                    [(u[0], normalize_search_text(u[1])) for u in to_upsert])
+                paths = [u[0] for u in to_upsert]
+                conn.execute(
+                    "INSERT OR REPLACE INTO files_fts_map(path, fts_rowid) "
+                    "SELECT path, rowid FROM files_fts WHERE path IN "
+                    + _in_marks(paths), paths)
+                upserted += len(to_upsert)
+            _commit(conn)
+    except Exception:
+        conn.rollback()
+        raise
+    return {"upserted": upserted, "removed": removed}
+
+
+def upsert_parents_from_disk(conn: sqlite3.Connection, store, rels) -> int:
+    """从文件路径集合推导父目录集合（去重，排除根 ''），逐个 upsert_from_disk。
+
+    gate apply 新建目录（如 Feature 层特性目录）由此入册，否则 path 直接子项
+    浏览看不到新特性。目录数量少，逐个调用即可。返回去重后的父目录数
+    （含各级祖先目录；自管提交，异常 rollback 后原样抛）。
+    """
+    from ..service import _commit
+
+    parents: set = set()
+    for rel in rels:
+        parts = _norm(rel).split("/")
+        for i in range(1, len(parts)):
+            parents.add("/".join(parts[:i]))
+    try:
+        for d in sorted(parents):
+            upsert_from_disk(conn, store, d)
+        _commit(conn)
+    except Exception:
+        conn.rollback()
+        raise
+    return len(parents)
 
 
 def remove_path(conn: sqlite3.Connection, rel: str) -> None:

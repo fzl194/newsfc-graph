@@ -175,3 +175,65 @@ def test_entries_normalize_backslash_and_trailing_slash(conn_db, store):
     files_repo.remove_path(conn_db, "a\\b.md")  # 反斜杠 → 命中正斜杠行
     assert conn_db.execute(
         "SELECT COUNT(*) FROM files WHERE path='a/b.md'").fetchone()[0] == 0
+
+
+def test_upsert_many_from_disk_mixed_batch(conn_db, store):
+    """批量自愈同步：新文件/已存在(map命中)/磁盘缺失/点文件 四类一批各自落点。
+
+    map 命中重刷不得造重复 FTS 行；磁盘缺失/点文件（含历史脏行）删行；
+    去重保序；map rowid 指向真实 FTS 行；三表一致。
+    """
+    store.write("old.md", "old")
+    files_repo.upsert_from_disk(conn_db, store, "old.md")   # 已存在（map 命中）
+    files_repo.upsert_entry(conn_db, path="gone.md", name="gone.md", ext="md",
+                            is_dir=0, size=1, mtime=0.0)    # 磁盘缺失的册行
+    store.write("a/.secret.md", "s")
+    files_repo.upsert_entry(conn_db, path="a/.secret.md", name=".secret.md",
+                            ext="md", is_dir=0, size=1, mtime=0.0)  # 点文件脏行
+    store.write("new.md", "new")                            # 新文件
+
+    out = files_repo.upsert_many_from_disk(
+        conn_db, store,
+        ["new.md", "old.md", "gone.md", "a/.secret.md", "old.md"])  # old 重复
+
+    assert out == {"upserted": 2, "removed": 2}
+    paths = {r["path"] for r in conn_db.execute("SELECT path FROM files")}
+    assert paths == {"new.md", "old.md"}
+    assert _count(conn_db, "files_fts") == 2              # map 命中重刷无重复行
+    assert _count(conn_db, "files_fts_map") == 2
+    # map 一致：rowid 必须指向真实存在的 FTS 行（否则未来按 rowid 删失灵）
+    for m in conn_db.execute("SELECT fts_rowid FROM files_fts_map"):
+        assert conn_db.execute(
+            "SELECT COUNT(*) FROM files_fts WHERE rowid=?",
+            (m["fts_rowid"],)).fetchone()[0] == 1
+    assert files_repo.integrity_ok(conn_db)
+    row = conn_db.execute("SELECT size FROM files WHERE path='new.md'").fetchone()
+    assert row["size"] == 3
+
+
+def test_upsert_many_from_disk_empty_and_missing_only(conn_db, store):
+    """空集合零副作用；全部 miss（盘无文件）时册清空且不报错。"""
+    assert files_repo.upsert_many_from_disk(conn_db, store, []) == \
+        {"upserted": 0, "removed": 0}
+    files_repo.upsert_entry(conn_db, path="x.md", name="x.md", ext="md",
+                            is_dir=0, size=1, mtime=0.0)
+    out = files_repo.upsert_many_from_disk(conn_db, store, ["x.md"])
+    assert out == {"upserted": 0, "removed": 1}
+    assert _count(conn_db, "files") == 0
+    assert files_repo.integrity_ok(conn_db)
+
+
+def test_upsert_parents_from_disk_registers_ancestors(conn_db, store):
+    """文件路径集合推导父目录：全部祖先目录入册（a 与 a/b），根 '' 不入册，
+    文件自身不入册；去重后返回目录数。"""
+    store.write("a/b/c.md", "c")
+    store.write("top.md", "t")
+    n = files_repo.upsert_parents_from_disk(
+        conn_db, store, ["a/b/c.md", "top.md", "a/b/c.md"])
+    assert n == 2                                           # a + a/b（去重，根排除）
+    rows = {r["path"]: r for r in conn_db.execute("SELECT * FROM files")}
+    assert set(rows) == {"a", "a/b"}                        # c.md/top.md 非父目录
+    for d in ("a", "a/b"):
+        assert rows[d]["is_dir"] == 1 and rows[d]["ext"] == ""
+        assert rows[d]["size"] == 0
+    assert files_repo.integrity_ok(conn_db)
