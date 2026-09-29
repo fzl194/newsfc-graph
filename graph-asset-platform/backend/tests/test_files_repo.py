@@ -139,6 +139,9 @@ def test_rebuild_populates_files(tmp_data_dir):
     s.rebuild()  # 应连带重建 files 户口册
     assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
     assert s.index is not None  # Index.load_from_db 走通
+    # rebuild 统一走 rebuild_files：连带写完成标记（下次启动不重跑 bootstrap）
+    assert s.db.execute(
+        "SELECT value FROM meta WHERE key='files_bootstrapped'").fetchone() is not None
 
 
 def test_files_bootstrap_async(tmp_data_dir):
@@ -153,6 +156,45 @@ def test_files_bootstrap_async(tmp_data_dir):
     assert s.db.execute(
         "SELECT value FROM meta WHERE key='files_bootstrapped'"
     ).fetchone()[0] == "1"
+
+
+def test_bootstrap_reruns_when_table_nonempty_without_marker(tmp_data_dir):
+    """门控行为锁定：表非空但无完成标记（进程被杀留半截册）→ bootstrap 重跑。"""
+    s = _bare_service(tmp_data_dir)
+    s.store.write("a.md", "x")
+    from app.repos import files_repo
+    files_repo.rebuild_all(s.db, s.store)          # 表非空
+    s.db.execute("DELETE FROM meta WHERE key='files_bootstrapped'")
+    s.db.commit()
+    before = s.db.execute("SELECT mtime FROM files WHERE path='a.md'").fetchone()[0]
+    s.store.write("b.md", "y")                     # 磁盘多了文件
+    s._files_bootstrap_async()                     # 无标记 → 应重跑
+    assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2  # a.md+b.md（根无目录行）
+    assert s.db.execute(
+        "SELECT value FROM meta WHERE key='files_bootstrapped'").fetchone() is not None
+    assert before is not None
+
+
+def test_files_bootstrap_async_failure_clears_no_marker(tmp_data_dir, monkeypatch):
+    """失败路径：清残册三表 + 无标记 + flag 复位（下次启动自动重试/admin 兜底）。"""
+    s = _bare_service(tmp_data_dir)
+    s.store.write("a.md", "x")
+    from app.repos import files_repo
+    files_repo.rebuild_all(s.db, s.store)          # 半截册（表非空）
+    files_repo.upsert_entry(s.db, path="ghost.md", name="ghost.md", ext="md",
+                            is_dir=0, size=1, mtime=0.0)
+    s.db.commit()
+
+    def _boom(conn, store, chunk=None):
+        raise RuntimeError("disk gone")
+    monkeypatch.setattr(files_repo, "rebuild_all", _boom)
+    s.files_building = True
+    s._files_bootstrap_async()                     # 失败不抛（后台线程绝不抛）
+    assert s.files_building is False
+    for t in ("files", "files_fts", "files_fts_map"):
+        assert s.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0
+    assert s.db.execute(
+        "SELECT value FROM meta WHERE key='files_bootstrapped'").fetchone() is None
 
 
 def test_upsert_tree_heals_dotfile_rows(conn_db, store):

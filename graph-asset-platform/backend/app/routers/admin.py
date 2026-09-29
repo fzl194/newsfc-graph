@@ -7,7 +7,7 @@
 """
 from fastapi import APIRouter, HTTPException, Request
 
-from ..service import get_service, import_lock
+from ..service import get_service
 from ..users.service import check_perm
 
 router = APIRouter()
@@ -30,10 +30,9 @@ def reindex(request: Request):
 
 @router.post("/admin/files-reindex")
 def files_reindex(request: Request):
-    """全量重建 files 户口册（兜底：外部直拷磁盘后漂移；正常写路径已增量维护）。"""
+    """全量重建 files 户口册（兜底：外部直拷磁盘后漂移；正常写路径已增量维护）。
+
+    走 ``Service.rebuild_files``（自带 import_lock + files_building + 完成标记）。"""
     _require_admin(request)
     svc = get_service()
-    from ..repos import files_repo
-    with import_lock:
-        n = files_repo.rebuild_all(svc.db, svc.store)
-    return {"ok": True, "files": n}
+    return {"ok": True, "files": svc.rebuild_files()}

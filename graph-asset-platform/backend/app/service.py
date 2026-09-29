@@ -114,16 +114,11 @@ class Service:
 
     def _files_bootstrap_async(self) -> None:
         """后台一次性建 files 册（无完成标记时；百万级为分钟级，不阻塞启动）。
-        成功 → 同锁内写 files_bootstrapped 标记（__init__ 门控查标记）。失败不抛
-        （清残册并删标记 → 下次启动自动重试；admin 可经 /admin/files-reindex 兜底）。"""
-        from .repos import files_repo
+        成功走 ``rebuild_files``（锁内建册 + 写 files_bootstrapped 标记 + 期间置
+        files_building）。失败不抛（清残册并删标记 → 下次启动自动重试；admin 可
+        经 /admin/files-reindex 兜底）。"""
         try:
-            with import_lock:
-                n = files_repo.rebuild_all(self.db, self.store)
-                self.db.execute(
-                    "INSERT INTO meta(key, value) VALUES('files_bootstrapped','1') "
-                    "ON CONFLICT(key) DO UPDATE SET value='1'")
-            _commit(self.db)
+            n = self.rebuild_files()
             print(f"[startup] files 户口册首启建册 {n} 行", flush=True)
         except Exception as e:  # noqa: BLE001 后台线程绝不抛
             try:
@@ -347,17 +342,34 @@ class Service:
         return self.reindex_paths([*changed, *deleted])
 
     def rebuild(self) -> None:
-        """全量 reindex 兜底：扫 md 重建 DB + 内存 + files 户口册（手动触发，慢）。"""
+        """全量 reindex 兜底：扫 md 重建 DB + 内存 + files 户口册（手动触发，慢）。
+
+        files 部分走 ``rebuild_files``（自带锁 + 标记 + files_building），故与
+        build_index_db 分两段持锁——import_lock 非重入锁，rebuild_files 不得在
+        本方法已持锁时调用。"""
         from .migrate import build_index_db
-        from .repos import files_repo
         with import_lock:
             build_index_db(self.db, self.store, self.registry)
-            self.files_building = True
-            try:
-                files_repo.rebuild_all(self.db, self.store)
-            finally:
-                self.files_building = False
             self.index = Index.load_from_db(self.db, self.registry)
+        self.rebuild_files()
+
+    def rebuild_files(self) -> int:
+        """全量重建 files 册（admin 端点 / rebuild / bootstrap 三处统一）：
+        锁内 rebuild_all + 写 files_bootstrapped 标记，期间置 files_building。
+        返回入册行数（文件+目录）。自带 import_lock——调用方不得已持锁（非重入）。"""
+        from .repos import files_repo
+        n = 0
+        self.files_building = True
+        try:
+            with import_lock:
+                n = files_repo.rebuild_all(self.db, self.store)
+                self.db.execute(
+                    "INSERT INTO meta(key, value) VALUES('files_bootstrapped','1') "
+                    "ON CONFLICT(key) DO UPDATE SET value='1'")
+                _commit(self.db)
+            return n
+        finally:
+            self.files_building = False
 
     # ---------- 正文全文搜索（MCP search_md 的 service 层实现） ----------
 

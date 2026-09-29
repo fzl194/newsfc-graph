@@ -202,7 +202,7 @@ def _remove_raw(conn: sqlite3.Connection, path: str) -> int:
     else:
         conn.execute("DELETE FROM files_fts WHERE path=?", (path,))
     cur = conn.execute("DELETE FROM files WHERE path=?", (path,))
-    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return cur.rowcount or 0
 
 
 def remove_prefix(conn: sqlite3.Connection, prefix: str) -> int:
