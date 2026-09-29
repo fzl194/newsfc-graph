@@ -128,6 +128,8 @@ def _is_busy(exc: BaseException) -> bool:
 
 
 def _is_no_transaction(exc: BaseException) -> bool:
+    # 该错误仅可能来自 commit()（execute 自带提交检查），此时语句已被并发写者
+    # 连带提交落库；共享连接被回滚抢占的理论丢写场景由生产独立连接排除。
     return isinstance(exc, sqlite3.OperationalError) and (
         "no transaction" in str(exc).lower())
 
