@@ -25,7 +25,7 @@ version: 20.15.2
 在线计费的使用量上报规则配置命令。
 """
 
-PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph"}
+PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph", "search_files"}
 LEGACY_TOOLS = {"search_objects", "search_md", "get_object"}
 ALL_TOOLS = PUBLIC_TOOLS | LEGACY_TOOLS
 

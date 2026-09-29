@@ -27,6 +27,7 @@ from mcp.server.fastmcp.server import Context
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .attribution import AgentSessionId, AgentUsername, telemetry_attribution
+from .file_query import search_files_core
 from .graph_query import read as graph_read
 from .graph_query import search as graph_search
 from .graph_query.contracts import (
@@ -37,6 +38,7 @@ from .graph_query.contracts import (
     GraphError,
     GraphQueryError,
     MdResultMap,
+    SearchFilesResponse,
     SearchGraphResponse,
 )
 from .objects_search import list_objects_rows
@@ -90,10 +92,11 @@ def _load_config_safe() -> dict:
 _last_good_config: dict = {}
 
 
-# 公开工具（需求 §1：对外收敛为 get_domains/search_graph/get_md）。仅这些走
-# 严格错误契约（INTERNAL_ERROR 只给通用消息，禁止泄露 traceback/SQL/路径）；
-# legacy 工具（search_objects/search_md/get_object）冻结原错误文本透传（§11.3）。
-_PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph"}
+# 公开工具（需求 §1：对外收敛为 get_domains/search_graph/get_md；search_files
+# 2026-09-29 注册）。仅这些走严格错误契约（INTERNAL_ERROR 只给通用消息，禁止
+# 泄露 traceback/SQL/路径）；legacy 工具（search_objects/search_md/get_object）
+# 冻结原错误文本透传（§11.3）。
+_PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph", "search_files"}
 
 
 class _ConfigurableFastMCP(FastMCP):
@@ -406,6 +409,65 @@ def search_graph(
         return SearchGraphResponse(**out)
     except Exception as e:  # noqa: BLE001 失败也留痕后原样抛出
         _record_tool("search_graph", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params,
+                     result=_err_summary(e))
+        raise
+
+
+@mcp.tool()
+def search_files(
+    AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)],
+    AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
+    query: Annotated[Optional[str], Field(
+        description="文件名关键词（子串，不分大小写；规范化后至少 2 字符）。"
+                    "如 'ADD URR' 命中 UDG@MMLCommand@ADD URR.md；"
+                    "3 字符以上走索引，2 字符为语料扫描（大库下罕见词稍慢）")] = None,
+    path: Annotated[Optional[str], Field(
+        description="目录限定（相对 assets 根，如 'Command/UDG'）。默认列直接子项"
+                    "（ls 语义，含子目录行）；recursive=true 时递归取子树全部文件"
+                    "（find -type f 语义）。不传=全库")] = None,
+    ext: Annotated[Optional[str], Field(
+        description="扩展名精确过滤（小写，如 'md'/'png'）")] = None,
+    recursive: Annotated[bool, Field(
+        description="path 模式下递归子树（仅文件行）；默认 False=直接子项")] = False,
+    limit: Annotated[int, Field(
+        description="单页条数（1~500，默认 100）", ge=1, le=500)] = 100,
+    after: Annotated[Optional[str], Field(
+        description="游标：传上一页返回的 next_cursor 翻下一页；循环直到 "
+                    "has_more=false 即拿全量。注意 total 是从游标位置起的剩余"
+                    "条数（翻页递减），非全集绝对数")] = None,
+    ctx: Context = None) -> SearchFilesResponse:
+    """按文件名搜索 / 按目录浏览资产库文件（find/ls 语义，不搜内容）。
+
+    覆盖 assets 下所有文件（含图片等非 md）。三个用法：
+    - query='关键词'：全库按文件名搜（等价 find -name '*关键词*'）；
+    - path='Command/UDG'：列直接子项（等价 ls）；
+    - path + recursive=true：子树全量文件（等价 find <dir> -type f；全量获取用
+      after 游标循环翻页直到 has_more=false——全量遍历请用 path 模式，query
+      模式深翻页每页成本更高）。
+    按内容搜对象请用 search_graph（本工具不搜正文）。
+    md 文件命中回带 obj_id+version——用 get_md(ids=[obj_id], version=version)
+    读**该文件**的完整内容（不带 version 会取最新版，可能不是这个文件）；
+    非 md 文件（图片等）只有元数据。
+    query/path/ext 至少给一个；total 精确到 10000，超过时 total_is_bounded=true。
+    index_building=true 表示首启建册未完成，结果不全可稍后重试。
+    """
+    user = _identity(ctx)
+    params = {k: v for k, v in {"query": query, "path": path, "ext": ext,
+                                "recursive": recursive, "limit": limit,
+                                "after": after}.items() if v is not None}
+    try:
+        out = search_files_core(query=query, path=path, ext=ext,
+                                recursive=recursive, limit=limit, after=after)
+        _record_tool("search_files", user=user, operator=AGENT_USERNAME,
+                     session_id=AGENT_SESSION_ID, params=params,
+                     result={"total": out["total"],
+                             "returned": len(out["files"]),
+                             "top_paths": [f["path"] for f in out["files"][:10]],
+                             "has_more": out["has_more"]})
+        return SearchFilesResponse(**out)
+    except Exception as e:  # noqa: BLE001 失败也留痕后原样抛出
+        _record_tool("search_files", user=user, operator=AGENT_USERNAME,
                      session_id=AGENT_SESSION_ID, params=params,
                      result=_err_summary(e))
         raise
