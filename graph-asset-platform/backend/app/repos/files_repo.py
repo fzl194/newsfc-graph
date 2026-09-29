@@ -18,13 +18,27 @@ from .graph_search_repo import normalize_search_text
 _CHUNK = 5000
 
 
+def _stat_row(rel: str, st, is_dir: int) -> tuple:
+    """stat → (name, ext, is_dir, size, mtime) 行值（upsert_from_disk 与
+    rebuild_all 共用）。目录 ext 恒 ''、size 恒 0（schema 注释）：Path.suffix
+    对 "20.15.2" 这类含点目录名会给 '2'，会污染下游 ext 过滤。"""
+    if is_dir:
+        return (Path(rel).name, "", is_dir, 0, st.st_mtime)
+    suffix = Path(rel).suffix.lower()
+    return (Path(rel).name, suffix.lstrip(".") if suffix else "",
+            is_dir, st.st_size, st.st_mtime)
+
+
 def upsert_entry(conn: sqlite3.Connection, *, path: str, name: str, ext: str,
                  is_dir: int, size: int, mtime: float) -> None:
-    """UPSERT 单行（值由调用方给定）+ 同步 FTS（先按 map rowid 删旧行）。"""
+    """UPSERT 单行（值由调用方给定）+ 同步 FTS（先按 map rowid 删旧行；map
+    缺失回退 path 删——否则 upsert 造出重复 FTS 行，EXCEPT 对账查不出）。"""
     rid = conn.execute(
         "SELECT fts_rowid FROM files_fts_map WHERE path=?", (path,)).fetchone()
     if rid is not None:
         conn.execute("DELETE FROM files_fts WHERE rowid=?", (rid[0],))
+    else:
+        conn.execute("DELETE FROM files_fts WHERE path=?", (path,))
     conn.execute(
         "INSERT INTO files(path, name, ext, is_dir, size, mtime) VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(path) DO UPDATE SET name=excluded.name, ext=excluded.ext, "
@@ -38,7 +52,12 @@ def upsert_entry(conn: sqlite3.Connection, *, path: str, name: str, ext: str,
 
 
 def upsert_from_disk(conn: sqlite3.Connection, store, rel: str) -> None:
-    """磁盘 stat 单路径 → UPSERT；磁盘不存在 → 删行（自愈语义，调用方 commit）。"""
+    """磁盘 stat 单路径 → UPSERT；磁盘不存在 → 删行（自愈语义，调用方 commit）。
+    点文件/点目录不入册（与 rebuild_all/store.list_children 口径一致）——已在
+    册的点文件（历史脏数据）同样被清。"""
+    if any(part.startswith(".") for part in rel.split("/")):
+        remove_path(conn, rel)
+        return
     try:
         p = win_long(store.abspath(rel))
         if not p.exists():
@@ -46,11 +65,9 @@ def upsert_from_disk(conn: sqlite3.Connection, store, rel: str) -> None:
             return
         is_dir = 1 if p.is_dir() else 0
         st = p.stat()
-        suffix = Path(rel).suffix.lower()
-        upsert_entry(conn, path=rel, name=Path(rel).name,
-                     ext=suffix.lstrip(".") if suffix else "",
-                     is_dir=is_dir, size=0 if is_dir else st.st_size,
-                     mtime=st.st_mtime)
+        name, ext, _d, size, mtime = _stat_row(rel, st, is_dir)
+        upsert_entry(conn, path=rel, name=name, ext=ext,
+                     is_dir=is_dir, size=size, mtime=mtime)
     except (OSError, ValueError):
         remove_path(conn, rel)  # stat 失败/路径非法 → 按不存在处理
 
@@ -118,11 +135,10 @@ def rebuild_all(conn: sqlite3.Connection, store, chunk: int = _CHUNK) -> int:
             st = p.stat()
         except OSError:
             continue
-        suffix = p.suffix.lower()
-        batch.append(("/".join(rel_parts), p.name,
-                      suffix.lstrip(".") if suffix else "",
-                      is_dir, 0 if is_dir else st.st_size, st.st_mtime,
-                      normalize_search_text(p.name)))
+        rel = "/".join(rel_parts)
+        name, ext, _d, size, mtime = _stat_row(rel, st, is_dir)
+        batch.append((rel, name, ext, is_dir, size, mtime,
+                      normalize_search_text(name)))
         if len(batch) >= chunk:
             _insert_batch(conn, batch)
             total += len(batch)
@@ -148,7 +164,12 @@ def _insert_batch(conn: sqlite3.Connection, batch: list) -> None:
 
 
 def integrity_ok(conn: sqlite3.Connection) -> bool:
-    """对账：files 与 files_fts 行集合双向一致（缺行/多行都可查出）。"""
+    """对账：files 与 files_fts 行集合双向一致（缺行/多行/重复行都可查出——
+    EXCEPT 是集合语义查不出重复，COUNT 感知补位）。"""
+    if conn.execute(
+            "SELECT 1 FROM files_fts GROUP BY path HAVING COUNT(*)>1 LIMIT 1"
+    ).fetchone():
+        return False
     miss = conn.execute(
         "SELECT COUNT(*) FROM (SELECT path FROM files "
         "EXCEPT SELECT path FROM files_fts)").fetchone()[0]
