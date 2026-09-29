@@ -75,10 +75,10 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
 | 写入口 | 挂钩 |
 |---|---|
 | `/fs` 写端点（upload / put_file / move / rename / delete / trash_restore） | 端点内显式调 files_repo（move/rename=remove+upsert；delete=remove_path 或 remove_prefix） |
-| `service.rebuild()` | 末尾追加 `files_repo.rebuild_all()`（覆盖 import 路由等走 rebuild 的批量写） |
-| **`pipeline/gate.py` 应用/回退**（抽取任务：直接 `_copy` 到 assets + `svc.reindex_paths()`，**不走 rebuild**；且写入非 md 的 `_` 前缀 sidecar 文件——`reindex_paths` 只认 md，挂钩 rebuild/reindex_paths 都覆盖不到） | gate apply 后按其已知行集合（rows_map / extract_files 清单）显式 files_repo 增量同步（remove_path 旧 + upsert 新）；revert 同理 |
+| `service.rebuild()` | 末尾追加 `files_repo.rebuild_all()`（覆盖 tests 路由等走 rebuild 的批量写） |
+| **`pipeline/gate.py` 应用/回退**（抽取任务：直接 `_copy` 到 assets + `svc.reindex_paths()`，**不走 rebuild**；且写入非 md 的 `_` 前缀 sidecar 文件——`reindex_paths` 只认 md，挂钩 rebuild/reindex_paths 都覆盖不到） | gate apply 后按其已知行集合（rows_map / extract_files 清单）显式 files_repo 增量同步（remove_path 旧 + upsert 新）；revert 同理。**顺序要求**：files_repo 同步须在耐久完成点 `update_job(done)` **之前**——apply 中途崩溃时任务重试会重跑同步（沿用 gate.py 既有耐久完成点纪律） |
 | `POST /admin/reindex` | 走 svc.rebuild()，天然覆盖 |
-| 启动 | **一次性 bootstrap**：files 表为空且 assets 非空 → 后台线程全量扫描建册。落点在 `Service.__init__`（与 `_fts_reconcile_async` 同款后台模式；db.py 只建表不碰文件系统）。不阻塞启动；百万级为一次性分钟级，可接受。扫描期间 search_files 正常服务但结果不全，响应带 `index_building: true` 标记（模块级 bool） |
+| 启动 | **一次性 bootstrap**：files 表为空且 assets 非空 → 后台线程全量扫描建册。落点在 `Service.__init__`（与 `_fts_reconcile_async` 同款后台模式；db.py 只建表不碰文件系统）。不阻塞启动；百万级为一次性分钟级，可接受。扫描期间 search_files 正常服务但结果不全，响应带 `index_building: true` 标记（模块级 bool，**须在启动线程之前置位**，防 Service 构造与线程启动之间的请求窗口看到空表+false） |
 | 外部直拷磁盘（绕过平台） | 不自动对账（注意：`_sync_mtime_async` 启动时会自动把外部拷入的 md 治理进 objects，**但不会治理 files 表**——外部拷贝后 objects/files 漂移是常态而非边缘case）；admin 手动触发 `POST /admin/files-reindex`（新增，与 /admin/reindex 同款：admin 权限 + svc.rebuild 级别的兜底语义） |
 
 **点文件策略**：跳过 `.` 开头的文件/目录（与 `store.list_children` 一致）；pipeline 的
@@ -227,7 +227,9 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
    rebuild/reindex_paths 均覆盖不到该路径）
 10. `routers/admin.py`：POST /admin/files-reindex
 11. `graph_query/search.py`：有界化重构 + 短词两档（meta 表开关） + catalog 缓存
-12. 测试（§7）+ `图谱平台接口文档.md` / `docs/MCP配置指南.md` 更新
+12. 测试（§7）+ `图谱平台接口文档.md` / `docs/MCP配置指南.md` 更新（接口文档须分别写明
+    两处 `total_is_bounded` 的封顶口径：search_graph=候选池 2000/term/来源；search_files=
+    计数 10000）
 13. deploy 侧无镜像变更（纯代码包，走既有 sync.sh pack/apply + db 自动迁移）
 
 ## 9. 风险与回退
