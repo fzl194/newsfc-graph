@@ -172,6 +172,10 @@ class Service:
     def reload_index(self) -> None:
         """从 DB 重载内存 Index（写操作末尾调用）。"""
         self.index = Index.load_from_db(self.db, self.registry)
+        # catalog 目录值缓存失效（函数级 import 防环：catalog 顶层 import 了
+        # 本模块的 get_service）。写路径末尾统一走这里 → 目录值随之失效。
+        from .graph_query import catalog as _catalog
+        _catalog.invalidate()
 
     def reindex_path(self, rel: str, *, commit: bool = True) -> None:
         """单文件 parse → UPSERT DB（objects/edges/双 FTS/object_latest）。
@@ -351,6 +355,8 @@ class Service:
         with import_lock:
             build_index_db(self.db, self.store, self.registry)
             self.index = Index.load_from_db(self.db, self.registry)
+            from .graph_query import catalog as _catalog
+            _catalog.invalidate()  # 全量重建后目录值必变——锁内末尾失效
         self.rebuild_files()
 
     def rebuild_files(self) -> int:

@@ -550,3 +550,55 @@ def test_one_char_term_metadata_only(populated):
     """1 字符恒只搜元数据（与开关档位无关）。"""
     out = search_graph_core(terms=["配"])
     assert "配" in out["diagnostics"].get("body_skipped_short_terms", [])
+
+
+# ---------------- catalog 校验缓存（2026-09-29 超时治理 Task 11） ----------------
+
+def test_catalog_cached_until_invalidate(populated):
+    from app.graph_query import catalog
+    conn = populated.db
+    v1 = catalog.versions(conn)
+    conn.execute("INSERT INTO objects(id, version, type, layer, scope, "
+                 "source_path, name, frontmatter_json, body_md, raw_md, mtime) "
+                 "VALUES('zz@MMLCommand@NEW', '99.0.0', 'MMLCommand', 'Command',"
+                 "'nf', 'x.md', 'NEW', '{}', '', '', 0.0)")
+    conn.commit()
+    assert catalog.versions(conn) == v1            # 未失效 → 命中缓存
+    catalog.invalidate()
+    assert "99.0.0" in catalog.versions(conn)      # 失效 → 重查
+    catalog.invalidate()
+
+
+def test_reload_index_invalidates_catalog(populated):
+    import app.graph_query.catalog as catalog
+    catalog.versions(populated.db)  # 先填缓存——证明 reload 真失效（非仅属性存在）
+    assert catalog._cache
+    populated.reload_index()
+    assert catalog._cache == {}  # reload（写路径末尾）即失效
+
+
+def test_rebuild_invalidates_catalog(populated):
+    import app.graph_query.catalog as catalog
+    catalog.versions(populated.db)
+    populated.rebuild()
+    assert catalog._cache == {}  # rebuild 锁内末尾失效
+
+
+# ---------------- T10 评审 Minor（同笔提交） ----------------
+
+def test_pool_cap_exact_boundary_not_capped(populated, monkeypatch):
+    """恰好 POOL_CAP 条命中 → capped=False（LIMIT+1 探测消歧）。"""
+    import app.graph_query.search as s
+    monkeypatch.setattr(s, "POOL_CAP", 2)
+    out = search_graph_core(terms=["在线计费"])
+    # 正文恰 2 条命中（ADD URR 新版 + FEAT_BILLING），元数据另 1 条——均不触顶
+    assert out["total"] == 2
+    assert out["total_is_bounded"] is False
+    assert out["diagnostics"]["term_counts"]["在线计费"]["capped"] is False
+
+
+def test_zero_result_suggestion_mentions_skipped_short_terms(populated):
+    """零结果建议回显未搜正文的短词（T10 评审 Minor：短词跳正文可能是零结果主因）。"""
+    out = search_graph_core(terms=["配", "不存在的词xyz"])
+    assert out["total"] == 0
+    assert any("未搜正文" in s and "配" in s for s in out["suggestions"])

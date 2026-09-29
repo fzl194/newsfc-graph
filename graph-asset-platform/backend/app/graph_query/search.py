@@ -518,6 +518,10 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
             "减少 terms 或使用 match=any",
             "命令名、对象名和编号也由 search_graph 自动搜索",
         ]
+        if body_skipped:  # 短词未搜正文——可能是零结果主因（T10 评审 Minor）
+            suggestions.append(
+                "以下短词未搜正文（长度或档位限制）："
+                + "、".join(body_skipped))
     else:
         suggestions = ["选择候选 ID 后调用 get_md 获取完整原文"]
     if any_capped:
