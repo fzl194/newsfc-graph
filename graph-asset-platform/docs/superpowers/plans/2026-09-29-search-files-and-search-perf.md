@@ -1643,10 +1643,13 @@ git commit -m "perf: search_graph 有界候选池重构——池触顶/total封�
 
 ### Task 10: 短词两档（meta 表开关；2 字词=加速 LIKE，1 字词跳正文）
 
-> spec D6 修订（plan 评审实证否决前缀短语）：2 字词正文搜索走 **trigram 加速 LIKE**
-> ——SQLite ≥3.45 对 2 字符 LIKE 模式给出索引计划（3.45.3 EXPLAIN 实证 `INDEX 0:L0`），
-> 即 Task 9 已保留的 `<3` LIKE 分支本身；本 Task 只加「1 字符跳正文」与「慢版本降级
-> 开关」，**不引入任何 MATCH 前缀语法**（`MATCH '"xx"*'` 在 3.45.3 返回空）。
+> spec D6 修订（两次实证，T6 代码评审补证）：2 字词正文搜索走 **正文语料 LIKE + POOL_CAP**。
+> ⚠️ 两次推翻的方案：①前缀短语 `MATCH '"xx"*'` 在 3.45.3 返回空（trigram MATCH 需 ≥3 字符）；
+> ②「2 字符 LIKE 走 trigram 索引」不成立——ESCAPE 子句使优化失效且 <3 字符本就无索引，
+> 1M 行实测 250ms 语料级扫描（早期 EQP 文本「INDEX 0:L0」为误读，勿再引用）。因此
+> 本 Task 的 LIKE 路径语义正确但**大规模下罕见两字词仍慢**，`metadata_only` 档是主要
+> 缓解手段（内网验收超时即切档）；Task 9 已保留的 `<3` LIKE 分支即此路径，本 Task 只加
+> 「1 字符跳正文」与「降级开关」。
 
 **Files:**
 - Modify: `app/graph_query/search.py`（开关加载 + `<3` 分支按档分流 + 1 字词跳正文）
@@ -1908,7 +1911,8 @@ git commit -m "docs: 三工具边界描述修订 + 决策树补 search_files 支
 - [ ] **Step 13.1: 写测试与实现（合成语料本身就是实现的一部分）**
 
 ```python
-"""perf 冒烟（GAP_PERF=1 才跑）：合成 10 万对象，宽词 + 两字词断言 < 2s。
+"""perf 冒烟（GAP_PERF=1 才跑）：合成 10 万对象，宽词 + 两字词断言 < 2s；search_files
+罕见两字词 + path 游标遍历同测（T6 评审建议：断言基于计时而非 EQP 文本）。
 
 合成门防回归（CI 可跑）；内网真实量复测属上线 checklist（spec §7）。
 """
@@ -1977,6 +1981,27 @@ def test_two_char_term_under_2s(big):
     out, dt = _timed(lambda: search_graph_core(terms=["配额"]))
     assert dt < 2.0, f"两字词耗时 {dt:.2f}s"
     assert out["total"] > 0
+
+
+def test_search_files_rare_two_char_and_path_traversal(big):
+    """T6 评审建议：search_files 也进门控——罕见两字词（语料级扫描路径）+
+    path 游标遍历（应索引干净）。合成 files 册（big fixture 的对象表 source_path
+    就是文件清单来源——直接 INSERT files 三表或复用 files_repo 造册）。"""
+    from app.file_query import search_files_core
+    from app.repos import files_repo
+    files_repo.rebuild_all(big.db, big.store)
+    out, dt = _timed(lambda: search_files_core(query="额管"))
+    assert out["total"] > 0 and dt < 2.0, f"罕见两字词耗时 {dt:.2f}s"
+    def _walk():
+        after, seen = None, 0
+        while True:
+            o = search_files_core(ext="md", limit=500, after=after)
+            seen += len(o["files"])
+            if not o["has_more"]:
+                return seen
+            after = o["next_cursor"]
+    n, dt2 = _timed(_walk)
+    assert n == 100_000 and dt2 < 5.0, f"游标遍历 {n} 条 {dt2:.2f}s"
 ```
 
 - [ ] **Step 13.2: 跑一次验证（本机）**

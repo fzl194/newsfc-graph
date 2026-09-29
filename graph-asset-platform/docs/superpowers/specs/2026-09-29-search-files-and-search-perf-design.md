@@ -34,7 +34,7 @@ legacy hidden 工具，全部是**对象维度**（逻辑 ID）。需求：
 | D3 | "读文件"不新增工具，复用 get_md（search_files 回带 obj_id+version） |
 | D4 | 超时治理与 search_files 同项目两轨推进 |
 | D5 | 全量获取用**游标分页**（has_more + next_cursor 循环），单页上限 500 |
-| D6 | 两字关键词正文搜索走 **trigram 加速 LIKE**（SQLite ≥3.45 实证索引支持 2 字符 LIKE 模式；原"前缀短语"方案实证否决——3.45.3 上 `MATCH '"xx"*'` 返回空）。慢版本/性能不达标降级为"两字词只搜元数据"（meta 表开关 `body_like`/`metadata_only`，默认 body_like） |
+| D6 | 两字关键词正文搜索走 **正文语料 LIKE**（POOL_CAP 早停兜常见词；⚠️两次实证修订：①前缀短语 `MATCH '"xx"*'` 在 3.45.3 返回空——FTS5 trigram MATCH 需 ≥3 字符；②「2 字符 LIKE 走 trigram 索引」不成立——ESCAPE 子句使优化失效且 <3 字符本就无法用索引，1M 行实测 250ms 语料级扫描。罕见两字词在大正文库下仍慢 → `metadata_only` 是大规模下的**主要缓解手段**而非仅保命）。meta 表开关 `body_like`/`metadata_only`，默认 body_like |
 | D7 | REST 通道新增第四个 `POST /api/v1/files`，与 MCP search_files 同契约（沿用 MCP/REST 同构对账测试模式） |
 
 ## 4. Track A：search_files 新工具
@@ -94,7 +94,7 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
 
 | 参数 | 语义 |
 |---|---|
-| `query` | 文件名子串（规范化后 ≥2 字符；1 字符 → INVALID_ARGUMENT）。≥3 走 trigram 短语 MATCH；2 字符走 trigram 加速 LIKE（≥3.45 索引支持，低版本为 name 语料扫描——语义正确，速度尽力） |
+| `query` | 文件名子串（规范化后 ≥2 字符；1 字符 → INVALID_ARGUMENT）。≥3 走 trigram 短语 MATCH（索引）；2 字符走 name 语料 LIKE（trigram 对 <3 字符/ESCAPE 均不生效，实测语料级扫描，LIMIT 早停兜常见词——name 语料远小于正文，当前规模可接受） |
 | `path` | 目录过滤。`recursive=false`（默认）= 列**直接子项**（文件+目录行，ls 语义——Agent 可逐层探目录结构）；`recursive=true` = 递归子树**仅文件**（`find <dir> -type f` 语义，全量场景）。实现用 GLOB 前缀范围扫描（转义 `[ * ?`），走 path 主键索引；path 不存在 → INVALID_FILTER（结构化错误，不静默 0 结果） |
 | `recursive` | bool，默认 false；仅 path 模式有意义（query 模式恒全局搜索） |
 | `ext` | 扩展名精确过滤（小写，如 `md` / `png`；给了 ext 自然只余文件行） |
@@ -170,10 +170,12 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 4. **短词路径**（D6 两档，开关存 **meta 表 key=`search_short_term_mode`**（`body_like` /
    `metadata_only`，默认 `body_like`），每请求读取（同 mcp_tools 配置模式，改即生效、无 UI
    依赖，admin 经 SQL/后续运维页切换；读取失败回退上次成功值）：
-   - 2 字符 term：正文走 trigram **加速 LIKE**（SQLite ≥3.45 对 2 字符 LIKE 模式给出
-     索引计划，3.45.3 实证；<3.45 为全库正文扫描——此时切 `metadata_only` 档保命）；
-     元数据照常 LIKE。**前缀短语方案已实证否决**（`MATCH '"xx"*'` 在 3.45.3 返回空，
-     FTS5 trigram MATCH 需 ≥3 字符）。
+   - 2 字符 term：正文走 LIKE + POOL_CAP（**实测为正文语料级扫描**——trigram 索引对
+     <3 字符模式与 ESCAPE 子句均不生效，1M 行 250ms 实测；早期「3.45 给出索引计划」
+     为 EQP 文本误读）。常见词被 POOL_CAP 早停兜住；**罕见两字词在大正文库下仍慢，
+     `metadata_only` 档是大规模下的主要缓解手段**（内网验收两字词超时即切档）；
+     元数据 LIKE 照常（metadata_text 行短，扫描可承受）。**前缀短语方案已实证否决**
+     （`MATCH '"xx"*'` 在 3.45.3 返回空，FTS5 trigram MATCH 需 ≥3 字符）。
    - 1 字符 term：只搜元数据，不搜正文（diagnostics 注明 `body_skipped_short_terms`）。
    - perf 冒烟测试（合成 10 万对象语料，标记 slow）不达标 → 切 metadata_only 档发布。
 5. **catalog 校验缓存**：`_validate_filters` 每请求最多 5 次 DISTINCT 全表扫，改为模块级
