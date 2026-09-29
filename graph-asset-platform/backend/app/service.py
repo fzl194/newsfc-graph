@@ -117,7 +117,14 @@ class Service:
                 n = files_repo.rebuild_all(self.db, self.store)
             print(f"[startup] files 户口册首启建册 {n} 行", flush=True)
         except Exception as e:  # noqa: BLE001 后台线程绝不抛
-            print(f"[startup] files 建册失败（admin 可经 /admin/files-reindex 重试）: {e!r}",
+            try:
+                self.db.execute("DELETE FROM files")
+                self.db.execute("DELETE FROM files_fts")
+                self.db.execute("DELETE FROM files_fts_map")
+                self.db.commit()
+            except Exception:  # noqa: BLE001 清理失败仅留日志（下次 admin 兜底）
+                print("[startup] files 建册失败后清理残册也失败", flush=True)
+            print(f"[startup] files 建册失败（已清残册，下次启动自动重试；admin 可经 /admin/files-reindex 手动触发）: {e!r}",
                   flush=True)
         finally:
             self.files_building = False
@@ -333,7 +340,11 @@ class Service:
         from .repos import files_repo
         with import_lock:
             build_index_db(self.db, self.store, self.registry)
-            files_repo.rebuild_all(self.db, self.store)
+            self.files_building = True
+            try:
+                files_repo.rebuild_all(self.db, self.store)
+            finally:
+                self.files_building = False
             self.index = Index.load_from_db(self.db, self.registry)
 
     # ---------- 正文全文搜索（MCP search_md 的 service 层实现） ----------
