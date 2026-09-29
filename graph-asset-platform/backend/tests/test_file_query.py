@@ -58,7 +58,8 @@ def test_query_returns_obj_id_and_version(populated):
 
 
 def test_two_char_query_like_path(populated):
-    """2 字符走 trigram 加速 LIKE（spec D6 修订：前缀短语实证否决）。"""
+    """2 字符走 LIKE 路径（spec D6 修订：前缀短语实证否决；trigram 索引对
+    <3 字符与 ESCAPE 均不生效——语义正确，性能见 file_query 模块 docstring）。"""
     out = search_files_core(query="概述")
     assert [f["path"] for f in out["files"]] == ["Feature/UDG/F1/概述.md"]
 
@@ -111,11 +112,13 @@ def test_bad_path_structured_error(populated):
 
 
 def test_glob_metachar_dir(populated):
-    populated.store.makedirs("Command/weird[1]")
+    populated.store.write("Command/weird[1]/child.md", "c")
+    populated.store.write("Command/weird1/sibling.md", "s")
     from app.repos import files_repo
-    files_repo.upsert_from_disk(populated.db, populated.store, "Command/weird[1]")
-    out = search_files_core(path="Command/weird[1]")  # '[' 已转义，不炸不漏
-    assert out["files"] == [] and out["total"] == 0
+    files_repo.rebuild_all(populated.db, populated.store)
+    out = search_files_core(path="Command/weird[1]", recursive=True)
+    assert [f["path"] for f in out["files"]] == ["Command/weird[1]/child.md"]
+    # 未转义时 GLOB 'weird[1]/*' 会匹配 weird1/ → sibling 混入；转义后精确
 
 
 def test_index_building_flag(populated):
@@ -125,3 +128,31 @@ def test_index_building_flag(populated):
         assert out["index_building"] is True
     finally:
         populated.files_building = False
+
+
+def test_after_beyond_end_returns_empty(populated):
+    """after 越过结果集末端：空页、total=0（剩余口径）、无游标。"""
+    out = search_files_core(ext="md", after="zzzz")
+    assert out["files"] == [] and out["total"] == 0
+    assert out["has_more"] is False and out["next_cursor"] is None
+
+
+def test_total_is_bounded_when_over_cap(populated, monkeypatch):
+    """计数封顶：超 cap 时 total 钳在 cap、total_is_bounded=True（页不受影响）。"""
+    import app.file_query as fq
+    monkeypatch.setattr(fq, "TOTAL_CAP", 2)
+    out = search_files_core(ext="md")  # 3 个 md
+    assert out["total"] == 2 and out["total_is_bounded"] is True
+    assert len(out["files"]) == 3  # 页大小与计数封顶解耦
+
+
+def test_query_mode_cursor_full_traversal(populated):
+    """query 模式游标翻页：全量遍历无重复无遗漏（MATCH 与 path>after 叠加）。"""
+    seen, after = [], None
+    for _ in range(20):
+        out = search_files_core(query="ADD URR", limit=1, after=after)
+        seen.extend(f["path"] for f in out["files"])
+        if not out["has_more"]:
+            break
+        after = out["next_cursor"]
+    assert len(seen) == 2 and len(set(seen)) == 2

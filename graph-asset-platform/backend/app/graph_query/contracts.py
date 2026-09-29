@@ -252,14 +252,15 @@ class SearchGraphResponse(BaseModel):
 
 class RestFilesRequest(RestDomainsRequest):
     """REST /files 请求体（与 MCP search_files 同契约）。query/path/ext 至少
-    一个（core 校验）；limit 1~500；after=游标（上一页 next_cursor）。"""
+    一个（core 校验）；limit 1~500；after=游标（上一页 next_cursor）。长度上限
+    query=200/path=1024/ext=64/after=1024（core 同值校验，两通道不分叉）。"""
 
-    query: Optional[str] = None
-    path: Optional[str] = None
-    ext: Optional[str] = None
+    query: Optional[Annotated[str, Field(max_length=200)]] = None
+    path: Optional[Annotated[str, Field(max_length=1024)]] = None
+    ext: Optional[Annotated[str, Field(max_length=64)]] = None
     recursive: bool = False
     limit: int = Field(default=100, ge=1, le=500)
-    after: Optional[str] = None
+    after: Optional[Annotated[str, Field(max_length=1024)]] = None
 
 
 class FileHit(BaseModel):

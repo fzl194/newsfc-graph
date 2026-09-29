@@ -5,12 +5,15 @@
 
 游标=上一页最后一条 path（keyset，path ASC 确定性排序）：深翻页 O(1)、不受并发
 增删的页错位影响。total 精确到 ``TOTAL_CAP``（10000），超过置 ``total_is_bounded``。
+total = 从游标位置起的剩余条数（翻页递减），非全集绝对数——取剩余口径是性能
+考量（count 从游标 PK 范围起扫）。query 模式深翻页每页重扫匹配集（MATCH 驱动 +
+temp B-tree 排序），全量遍历场景请用 path 模式（索引干净）。
 
-2 字符 query 走 trigram **加速 LIKE**（SQLite >= 3.45 对 2 字符 LIKE 模式给出索引
-计划，3.45.3 实证；低版本为 name 语料扫描——语义正确、速度尽力）。⚠️ 前缀短语
-``MATCH '"xx"*'`` 已实证否决（FTS5 trigram MATCH 需 >=3 字符，spec D6 修订）。
+2 字符 query 走 ``files_fts.name LIKE``（trigram 索引对 <3 字符模式与 ESCAPE
+子句均不生效——3.45.3 实测为 name 语料级扫描，1M 行 ~250ms；常见词被 LIMIT
+早停兜住，罕见词扫全语料。语料=name 列远小于正文，当前规模可接受；千万级
+文件若变慢再评估（如加长度门槛）。⚠️ 前缀短语 ``MATCH '"xx"*'`` 已实证否决。
 """
-import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,7 +22,11 @@ from .repos.graph_search_repo import normalize_search_text
 from .service import get_service
 
 TOTAL_CAP = 10_000
-MAX_QUERY_LEN = 80
+MAX_QUERY_LEN = 80            # 规范化后（NFKC→strip→casefold）
+MAX_QUERY_RAW_LEN = 200       # 原始输入（与 RestFilesRequest Field 同值）
+MAX_PATH_LEN = 1024           # path 与 after 游标共用
+MAX_EXT_LEN = 64
+ECHO_CAP = 200                # INVALID_FILTER 回显截断（错误消息不放大输入）
 
 
 def _like_escape(s: str) -> str:
@@ -49,6 +56,8 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
     norm_query = normalize_search_text(query) if query else ""
     if query is not None and not norm_query:
         raise err(INVALID_ARGUMENT, "query 不能为空白")
+    if len(query or "") > MAX_QUERY_RAW_LEN:
+        raise err(INVALID_ARGUMENT, f"query 原始长度最长 {MAX_QUERY_RAW_LEN} 字符")
     if norm_query and len(norm_query) < 2:
         raise err(INVALID_ARGUMENT,
                   "文件名搜索词规范化后至少 2 个字符（1 字符无法走索引且无意义）")
@@ -56,6 +65,12 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
         raise err(INVALID_ARGUMENT, f"query 规范化后最长 {MAX_QUERY_LEN} 字符")
     ext_n = (ext or "").strip().lstrip(".").lower() or None
     path_n = (path or "").strip().strip("/") or None
+    if len(ext_n or "") > MAX_EXT_LEN:
+        raise err(INVALID_ARGUMENT, f"ext 最长 {MAX_EXT_LEN} 字符")
+    if len(path_n or "") > MAX_PATH_LEN:
+        raise err(INVALID_ARGUMENT, f"path 最长 {MAX_PATH_LEN} 字符")
+    if len(after or "") > MAX_PATH_LEN:
+        raise err(INVALID_ARGUMENT, f"after 游标最长 {MAX_PATH_LEN} 字符")
     if not (norm_query or path_n or ext_n):
         raise err(INVALID_ARGUMENT,
                   "query / path / ext 至少给一个：query=按文件名搜；path=列目录；"
@@ -65,9 +80,10 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
                           (path_n,)).fetchone()
         if ok is None:
             raise err(INVALID_FILTER,
-                      f"path 不存在或不是目录: {path_n}（首启建册期间可能未建全，"
-                      f"稍后重试或联系管理员执行 files-reindex）",
-                      field="path", value=path_n)
+                      f"path 不存在或不是目录: {path_n[:ECHO_CAP]}"
+                      f"（首启建册期间可能未建全，稍后重试或联系管理员执行 "
+                      f"files-reindex）",
+                      field="path", value=path_n[:ECHO_CAP])
     if not isinstance(limit, int) or not (1 <= limit <= 500):
         raise err(INVALID_ARGUMENT, "limit 须在 1~500")
 
@@ -79,7 +95,7 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
         if len(norm_query) >= 3:
             where.append("files_fts MATCH ?")
             params.append(f"name : {_fts_phrase(norm_query)}")
-        else:  # 2 字符 → trigram 加速 LIKE（>=3.45 索引支持；低版本 name 语料扫描）
+        else:  # 2 字符 → LIKE 扫 name 语料（trigram 索引不生效，见模块 docstring）
             where.append("files_fts.name LIKE ? ESCAPE '\\'")
             params.append(f"%{_like_escape(norm_query)}%")
     if path_n is not None:
@@ -124,13 +140,14 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
             "path": r["path"], "name": r["name"], "ext": r["ext"],
             "is_dir": is_dir, "size": r["size"],
             "mtime": (datetime.fromtimestamp(r["mtime"], tz=timezone.utc)
-                      .isoformat(timespec="seconds") if r["mtime"] else None),
+                      .isoformat(timespec="seconds").replace("+00:00", "Z")
+                      if r["mtime"] else None),
             # 键恒在（目录/非对象文件为 None）——MCP/REST wire 同构
             "obj_id": r["obj_id"] if has_obj else None,
             "version": (r["o_version"] or None) if has_obj else None,
         })
     applied = {k: v for k, v in {
-        "query": query, "path": path_n, "ext": ext_n,
+        "query": (query or "").strip() or None, "path": path_n, "ext": ext_n,
         "recursive": True if (recursive and path_n) else None}.items()
         if v is not None}
     return {
