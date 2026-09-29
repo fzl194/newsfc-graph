@@ -962,3 +962,29 @@ def test_multi_mml_dirs_single_invocation_into_sandbox(env, monkeypatch):
     assert str(cmd_call["storage"]).startswith(str(gate.gate_storage(j.job_id)))
     # 产物在沙箱的 AMF 槽位（目标≠包名解耦核心）
     assert (gate.gate_storage(j.job_id) / "Command/AMF/20.15.2/_build_manifest.json").exists()
+
+
+# ---------- files 户口册同步（spec §4.2，apply/cancel/revert 三流） ----------
+
+def test_gate_apply_and_revert_sync_files(env, monkeypatch):
+    fake = env.stub_cmd(extra_binary=True)
+    j = env.start(monkeypatch, fake)
+    assert j.status == "awaiting", j.error
+    r = client.post(f"/api/v1/import/extract/{j.job_id}/confirm",
+                    json={"action": "overwrite"})
+    assert r.status_code == 200, r.text
+    j2 = _get_job(j.job_id)
+    assert j2["status"] == "done"
+    from app import db as dbmod
+    db = dbmod.get_shared_db()
+    have = {row["path"] for row in db.execute("SELECT path FROM files").fetchall()}
+    # 清单内全部文件（含 _build_manifest sidecar 与 assets/pic.png 二进制）入册
+    for row in _rows(j.job_id):
+        assert row["path"] in have
+    # revert：add → 软删/物理删（行消失）；modify → 还原旧版（行保留）
+    from app.pipeline import gate as gate_mod
+    gate_mod.revert_job(j.job_id, deleted_by="tester")
+    have2 = {row["path"] for row in db.execute("SELECT path FROM files").fetchall()}
+    assert not any(p.endswith("ADD NEW.md") for p in have2)
+    assert not any("_build_manifest" in p for p in have2)
+    assert any(p.endswith("MOD ME.md") for p in have2)
