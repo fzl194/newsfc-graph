@@ -236,6 +236,8 @@ class SearchDiagnostics(BaseModel):
 
     term_counts: dict[str, TermCountStat]
     recovery_codes: list[str]
+    # 跳过正文搜索的短词展示值（Task 10 两档：1 字符恒跳 / 2 字符 metadata_only 档跳）
+    body_skipped_short_terms: list[str] = []
 
 
 class SearchGraphResponse(BaseModel):

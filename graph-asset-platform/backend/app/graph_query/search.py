@@ -7,7 +7,8 @@
 1. 规范化并验证 terms/filters（非法值 → INVALID_FILTER，不是普通 0）；
 2. 组合校验（值合法但组合无对象 → INVALID_FILTER_COMBINATION）；
 3. filters/latest（object_latest join）在 SQL 阶段前置——不存在先截断候选再过滤；
-4. 每 term 元数据 LIKE + 正文（≥3 FTS5 trigram 短语 ORDER BY bm25 / <3 LIKE）；
+4. 每 term 元数据 LIKE + 正文（≥3 FTS5 trigram 短语 ORDER BY bm25 / 2 字符按档
+   LIKE 或跳正文 / 1 字符恒只搜元数据，见 SHORT_TERM_META_KEY）；
 5. 合并 any/all（同一 term 多字段只计一次）；
 6. 排序（matched_terms_count ↓, metadata_level ↓, body_rrf ↓, type/id ↑）；
 7. 池上限（每 term 每来源 LIMIT POOL_CAP；触顶 → total_is_bounded，不报错）；
@@ -37,14 +38,35 @@ from ..ui_layers import UI_LAYER_TYPES, ui_layer_of
 # Python（2026-09-29 超时治理，spec §5.2）。触顶 → total_is_bounded=true，
 # 不再报 SEARCH_TOO_BROAD（错误码保留在 contracts 标注 deprecated-unused）。
 POOL_CAP = 2_000
-# total 精确计数上限：超过报 10000 + total_is_bounded（与 search_files 同口径）
-TOTAL_CAP = 10_000
 
 # 输入护栏
 MAX_TERMS = 10
 MAX_TERM_LEN = 80
 MAX_SHORT_TERMS = 3
 MAX_PAGE_SIZE = 50
+
+# 短词两档开关（spec §5.2.4/D6 修订版，meta 表，每请求读取，读失败回退上次
+# 成功值——同 mcp_server._load_config_safe 模式）：body_like=两字词正文走
+# LIKE（⚠️ 实测为正文语料级扫描：trigram 索引对 <3 字符模式与 ESCAPE 子句
+# 均不生效，1M 行 ~250ms；常见词被 POOL_CAP 早停兜住，罕见两字词在大正文
+# 库下仍慢——此时切 metadata_only 档）；metadata_only=两字词只搜元数据。
+# 1 字符恒只搜元数据。
+SHORT_TERM_META_KEY = "search_short_term_mode"
+_last_good_mode = "body_like"
+
+
+def _load_short_term_mode(conn) -> str:
+    global _last_good_mode
+    try:
+        r = conn.execute(
+            "SELECT value FROM meta WHERE key=?", (SHORT_TERM_META_KEY,)).fetchone()
+        v = ((r["value"] if r else "") or "body_like").strip()
+        if v not in ("body_like", "metadata_only"):
+            v = "body_like"
+        _last_good_mode = v
+        return v
+    except Exception:  # noqa: BLE001 配置面故障不放宽也不炸搜索
+        return _last_good_mode
 
 _RRF_K = 60
 _SNIPPET_PAD_BEFORE = 20
@@ -328,6 +350,8 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
     agg: dict = {}            # (id, version) → 累积命中
     term_stats: dict = {}     # norm_term → {"hit": bool, "capped": bool}
     any_capped = False
+    body_skipped: list = []   # 跳过正文搜索的短词展示值（诊断回显，Task 10）
+    short_mode = _load_short_term_mode(conn)
 
     def _entry(key, row):
         if key not in agg:
@@ -343,14 +367,16 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
     for _disp, norm in norm_terms:
         seen_keys: set = set()
         capped = False
-        # 元数据：规范化后字面包含（trigram 索引加速 LIKE），池内限量
+        # 元数据：规范化后字面包含（trigram 索引加速 LIKE），池内限量。
+        # LIMIT+1 探测触顶：正好 POOL_CAP 个命中不算 capped（fetch 后截回）
         rows = conn.execute(
             f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
             "AND graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
-            f"LIMIT {POOL_CAP}",
+            f"LIMIT {POOL_CAP + 1}",
             [*params, f"%{_like_escape(norm)}%"]).fetchall()
-        if len(rows) >= POOL_CAP:
+        if len(rows) > POOL_CAP:
             capped = True
+        rows = rows[:POOL_CAP]
         for r in rows:
             key = (r["obj_id"], r["version"])
             level, fields = _meta_level(
@@ -367,10 +393,11 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
             rows = conn.execute(
                 f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
                 "AND graph_search_fts MATCH ? "
-                f"ORDER BY bm25(graph_search_fts) LIMIT {POOL_CAP}",
+                f"ORDER BY bm25(graph_search_fts) LIMIT {POOL_CAP + 1}",
                 [*params, f"body_text : {_fts_phrase(norm)}"]).fetchall()
-            if len(rows) >= POOL_CAP:
+            if len(rows) > POOL_CAP:
                 capped = True
+            rows = rows[:POOL_CAP]  # 截回后再 enumerate：rank 恒为 1..POOL_CAP
             for rank, r in enumerate(rows, 1):
                 key = (r["obj_id"], r["version"])
                 e = _entry(key, r)
@@ -379,14 +406,18 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
                 e["body_terms"].add(norm)
                 e["rrf"] += 1.0 / (_RRF_K + rank)
                 seen_keys.add(key)
-        else:  # <3：LIKE 字面包含（Task 10 将按档分流：1字词跳正文/2字词保持此路径）
+        elif len(norm) == 1 or short_mode == "metadata_only":
+            # 1 字符（恒跳），或 2 字符 + metadata_only 降级档（大库两字词保命）
+            body_skipped.append(_disp)
+        else:  # 2 字符 + body_like 档：语料 LIKE（池内限量；成本见模块头注释）
             rows = conn.execute(
                 f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
                 "AND graph_search_fts.body_text LIKE ? ESCAPE '\\' "
-                f"LIMIT {POOL_CAP}",
+                f"LIMIT {POOL_CAP + 1}",
                 [*params, f"%{_like_escape(norm)}%"]).fetchall()
-            if len(rows) >= POOL_CAP:
+            if len(rows) > POOL_CAP:
                 capped = True
+            rows = rows[:POOL_CAP]
             for r in rows:
                 key = (r["obj_id"], r["version"])
                 e = _entry(key, r)
@@ -490,8 +521,9 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
     else:
         suggestions = ["选择候选 ID 后调用 get_md 获取完整原文"]
     if any_capped:
-        suggestions.append("命中量过大已按相关度截断：增加 nf/type/layer 等过滤"
-                           "或减少 terms 可提升排序质量")
+        suggestions.append(
+            "命中量过大已按相关度截断（宽词 match=all 的交集可能不含池外命中）："
+            "增加 nf/type/layer 等过滤或减少 terms 可提升排序质量")
 
     applied = {k: v for k, v in {
         "layer": layer, "type": type_, "nf": nf, "version": version,
@@ -504,7 +536,8 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
         hits=hits,
         facets=facets,
         diagnostics={"term_counts": term_counts,
-                     "recovery_codes": recovery_codes},
+                     "recovery_codes": recovery_codes,
+                     "body_skipped_short_terms": body_skipped},
         suggestions=suggestions,
     )
     return resp.model_dump()

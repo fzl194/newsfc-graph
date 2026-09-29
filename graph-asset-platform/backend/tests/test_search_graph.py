@@ -515,3 +515,38 @@ def test_term_counts_new_shape(populated):
 def test_total_is_bounded_field_present(populated):
     out = search_graph_core(terms=["ADD URR"])
     assert isinstance(out["total_is_bounded"], bool)
+
+
+# ---------------- 短词两档（2026-09-29 超时治理 Task 10） ----------------
+
+def test_two_char_term_body_like_mode(populated):
+    """默认 body_like 档：两字词走 LIKE，能命中正文（沿用既有行为，回归锚）。"""
+    out = search_graph_core(terms=["配额"])  # FEAT_BILLING 正文含「配额管理」
+    assert any(h["id"] == "UDG@Feature@GWFD-020300" for h in out["hits"])
+    assert "配额" not in out["diagnostics"].get("body_skipped_short_terms", [])
+
+
+def test_two_char_term_metadata_only_mode(populated):
+    """metadata_only 降级档：两字词只搜元数据（跳过正文）并写入诊断回显。"""
+    svc = populated
+    svc.db.execute(
+        "INSERT INTO meta(key, value) VALUES('search_short_term_mode',"
+        "'metadata_only') ON CONFLICT(key) DO UPDATE SET value='metadata_only'")
+    svc.db.commit()
+    import app.graph_query.search as s
+    s._last_good_mode = "body_like"  # 强制下轮重读（当前每请求直读，防御缓存化）
+    try:
+        # 种子元数据（id/name/name_zh）均不含「配额」——只有正文含
+        out = search_graph_core(terms=["配额"])
+        assert all(h["id"] != "UDG@Feature@GWFD-020300" for h in out["hits"])
+        assert "配额" in out["diagnostics"].get("body_skipped_short_terms", [])
+    finally:
+        svc.db.execute("DELETE FROM meta WHERE key='search_short_term_mode'")
+        svc.db.commit()
+        s._last_good_mode = "body_like"
+
+
+def test_one_char_term_metadata_only(populated):
+    """1 字符恒只搜元数据（与开关档位无关）。"""
+    out = search_graph_core(terms=["配"])
+    assert "配" in out["diagnostics"].get("body_skipped_short_terms", [])
