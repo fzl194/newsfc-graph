@@ -333,9 +333,9 @@ def _apply_gate_locked(job_id: str, action: str) -> dict:
     ix = svc.reindex_paths(rows_map.keys())
     # files 户口册同步（spec §4.2）：按清单行集合自愈式同步（存在→stat 入册，
     # 不存在→删行）。须在耐久完成点 update_job(done) 之前——中途崩溃时重试重跑。
-    for rel_full in rows_map:
-        files_repo.upsert_from_disk(svc.db, svc.store, rel_full)
-    svc.db.commit()
+    # 批量 API 内部分块容错提交（无长事务/悬挂事务），父目录行一并入册。
+    files_repo.upsert_many_from_disk(svc.db, svc.store, rows_map)
+    files_repo.upsert_parents_from_disk(svc.db, svc.store, rows_map)
     # 包元信息（最近抽取器；包可能已被替换/删除——尽力而为）
     try:
         bd = bundles.bundle_dir(res.get("bundle_nf", ""), res.get("bundle_version", ""))
@@ -389,9 +389,8 @@ def cancel_gate(job_id: str) -> None:
         # apply 可能已分块提交过索引。必须总是对完整 manifest 补偿，不能只用
         # 本轮改动列表：前一轮可能已还原文件、却在 reindex 中断。
         svc.reindex_paths(r["path"] for r in rows)
-        for r in rows:
-            files_repo.upsert_from_disk(svc.db, svc.store, r["path"])
-        svc.db.commit()
+        files_repo.upsert_many_from_disk(svc.db, svc.store, [r["path"] for r in rows])
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [r["path"] for r in rows])
     # 终态先落库，再删可恢复资料。
     jobs.update_job(job_id, status="cancelled")
     cleanup(job_id)
@@ -461,9 +460,8 @@ def revert_job(job_id: str, deleted_by: str = "") -> dict:
         # 同 cancel：索引补偿失败后的重试必须覆盖完整清单，即便本轮因 sha
         # 守卫未再次修改文件，也要让 objects/FTS 与当前 live 状态收敛。
         out["reindex"] = svc.reindex_paths(r["path"] for r in rows)
-        for r in rows:
-            files_repo.upsert_from_disk(svc.db, svc.store, r["path"])
-        svc.db.commit()
+        files_repo.upsert_many_from_disk(svc.db, svc.store, [r["path"] for r in rows])
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [r["path"] for r in rows])
 
     # 终态先于 originals/清单清理；落库失败时仍可幂等重试。
     jobs.update_job(job_id, status="done", result={
