@@ -117,3 +117,35 @@ def test_integrity_ok_detects_drift(conn_db, store):
     conn_db.execute("DELETE FROM files WHERE path='a.md'")  # 制造漂移
     conn_db.commit()
     assert not files_repo.integrity_ok(conn_db)
+
+
+def _bare_service(tmp_data_dir):
+    """__new__ 装配（同 test_fs._setup 形态），返回 service。"""
+    import app.service as svc_mod
+    from app.store import Store
+    import app.db as dbmod
+    from app.registry import Registry
+    s = svc_mod.Service.__new__(svc_mod.Service)
+    s.store = Store(tmp_data_dir)
+    s.db = dbmod.get_db(tmp_data_dir.parent / "t.db")
+    dbmod.init_schema(s.db)
+    s.registry = Registry.load_default()
+    return s
+
+
+def test_rebuild_populates_files(tmp_data_dir):
+    s = _bare_service(tmp_data_dir)
+    s.store.write("Command/a.md", "a")
+    s.rebuild()  # 应连带重建 files 户口册
+    assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
+    assert s.index is not None  # Index.load_from_db 走通
+
+
+def test_files_bootstrap_async(tmp_data_dir):
+    s = _bare_service(tmp_data_dir)
+    s.store.write("Feature/x/概述.md", "f")
+    s.files_building = True
+    s._files_bootstrap_async()  # 同步直调（后台线程跑的就是这个函数体）
+    assert s.files_building is False
+    # Feature + x + 概述.md = 3 行
+    assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 3

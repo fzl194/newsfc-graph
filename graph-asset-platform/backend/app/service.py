@@ -60,6 +60,14 @@ class Service:
             import threading as _t
             _t.Thread(target=self._fts_reconcile_async, daemon=True).start()
             _t.Thread(target=self._sync_mtime_async, daemon=True).start()
+        # files 户口册首启 bootstrap（v14）：表空 → 后台建册。flag 先置位再起
+        # 线程（spec：防构造与线程启动之间的请求窗口看到空表 + false）。
+        # assets 为空时建出 0 行册，等价于 spec 的「assets 非空」守卫（无害偏差）。
+        self.files_building = False
+        if self._table_empty("files"):
+            self.files_building = True
+            threading.Thread(target=self._files_bootstrap_async,
+                             daemon=True).start()
 
     def _fts_reconcile_async(self) -> None:
         """后台对账三张派生表：md_fts（legacy）+ graph_search_fts + object_latest。
@@ -99,6 +107,20 @@ class Service:
                     self.reload_index()
         except Exception:  # noqa: BLE001 后台线程绝不抛
             pass
+
+    def _files_bootstrap_async(self) -> None:
+        """后台一次性建 files 册（表空时；百万级为分钟级，不阻塞启动）。
+        失败不抛（admin 可经 /admin/files-reindex 兜底重试）。"""
+        from .repos import files_repo
+        try:
+            with import_lock:
+                n = files_repo.rebuild_all(self.db, self.store)
+            print(f"[startup] files 户口册首启建册 {n} 行", flush=True)
+        except Exception as e:  # noqa: BLE001 后台线程绝不抛
+            print(f"[startup] files 建册失败（admin 可经 /admin/files-reindex 重试）: {e!r}",
+                  flush=True)
+        finally:
+            self.files_building = False
 
     def _table_empty(self, name: str) -> bool:
         return self.db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] == 0
@@ -306,10 +328,12 @@ class Service:
         return self.reindex_paths([*changed, *deleted])
 
     def rebuild(self) -> None:
-        """全量 reindex 兜底：扫 md 重建 DB + 内存（手动触发，慢；用于数据不一致时）。"""
+        """全量 reindex 兜底：扫 md 重建 DB + 内存 + files 户口册（手动触发，慢）。"""
         from .migrate import build_index_db
+        from .repos import files_repo
         with import_lock:
             build_index_db(self.db, self.store, self.registry)
+            files_repo.rebuild_all(self.db, self.store)
             self.index = Index.load_from_db(self.db, self.registry)
 
     # ---------- 正文全文搜索（MCP search_md 的 service 层实现） ----------
