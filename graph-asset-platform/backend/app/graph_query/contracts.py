@@ -246,3 +246,45 @@ class SearchGraphResponse(BaseModel):
     facets: SearchFacets
     diagnostics: SearchDiagnostics
     suggestions: list[str]
+
+
+# ---------- search_files 输入/输出（spec 2026-09-29 §4.3） ----------
+
+class RestFilesRequest(RestDomainsRequest):
+    """REST /files 请求体（与 MCP search_files 同契约）。query/path/ext 至少
+    一个（core 校验）；limit 1~500；after=游标（上一页 next_cursor）。"""
+
+    query: Optional[str] = None
+    path: Optional[str] = None
+    ext: Optional[str] = None
+    recursive: bool = False
+    limit: int = Field(default=100, ge=1, le=500)
+    after: Optional[str] = None
+
+
+class FileHit(BaseModel):
+    """文件行：目录行 is_dir=true、obj_id/version 为 null（键恒在——MCP 走
+    pydantic 补 null、REST 直接返回 dict，两边 wire 必须逐字节同构）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    name: str
+    ext: str
+    is_dir: bool
+    size: int
+    mtime: Optional[str] = None
+    obj_id: Optional[str] = None
+    version: Optional[str] = None
+
+
+class SearchFilesResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    files: list[FileHit]
+    total: int
+    total_is_bounded: bool
+    has_more: bool
+    next_cursor: Optional[str]
+    index_building: bool
+    applied_filters: dict
