@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from ..frontmatter_rw import rewrite_frontmatter, validate_md
 from ..md_parser import parse_md  # noqa: F401  (保留供未来按需解析)
-from ..repos import trash_repo
+from ..repos import files_repo, trash_repo
 from ..service import get_service, import_lock
 from ..telemetry.recorder import record
 from ..users.service import check_perm
@@ -146,6 +146,7 @@ def put_file(path: str, req: FileContentIn, request: Request):
                            f"否则其他文件的 [[{old_id}]] 引用会断链。",
                 )
         store.write(path, req.content)
+        files_repo.upsert_from_disk(svc.db, svc.store, path)
         svc.reindex_path(path)
         svc.reload_index()
     _record(request, "/fs/file", path)
@@ -177,6 +178,7 @@ def delete_file(path: str, request: Request):
         md_rels = [rel for rel in store.list_md() if rel == path or rel.startswith(prefix)]
         for rel in md_rels:
             svc.unindex_path(rel)
+        files_repo.remove_prefix(svc.db, path)  # path 自身 + 子树（文件/目录通吃）
         trash_id = store.soft_delete(path)
         store.cleanup_empty_dirs(path)
         trash_repo.insert(
@@ -220,6 +222,7 @@ def trash_restore(req: TrashIdIn, request: Request):
             raise HTTPException(status_code=409, detail=str(ex))
         except (FileNotFoundError, ValueError) as ex:
             raise HTTPException(status_code=404, detail=str(ex))
+        files_repo.upsert_tree(svc.db, svc.store, rel)
         prefix = rel.rstrip("/") + "/"
         for r in store.list_md():
             if r == rel or r.startswith(prefix):
@@ -268,7 +271,10 @@ class PathIn(BaseModel):
 @router.post("/fs/mkdir")
 def mkdir(req: PathIn, request: Request):
     _require_assets(request)
-    get_service().store.makedirs(req.path)  # 空目录无需 rebuild
+    svc = get_service()
+    svc.store.makedirs(req.path)
+    files_repo.upsert_from_disk(svc.db, svc.store, req.path)
+    svc.db.commit()
     _record(request, "/fs/mkdir", req.path)
     return {"ok": True, "path": req.path}
 
@@ -312,6 +318,8 @@ def move(req: MoveIn, request: Request):
             svc.reload_index()
             return {"ok": True, "new_path": target, "moved": False}
         store.write(target, text)
+        files_repo.upsert_from_disk(svc.db, svc.store, target)
+        files_repo.remove_path(svc.db, req.src)
         store.delete(req.src)
         store.cleanup_empty_dirs(req.src)
         svc.reindex_path(target)
@@ -362,13 +370,16 @@ def rename(req: RenameIn, request: Request):
             nt = pattern.sub(lambda _m: f"[[{new_id}]]", t)
             if nt != t:
                 store.write(rel, nt)
+                files_repo.upsert_from_disk(svc.db, svc.store, rel)
                 svc.reindex_path(rel)
         text2 = store.read(req.path)  # 重读（可能刚被上面改过 wikilink）
         new_text = rewrite_frontmatter(text2, {"id": new_id})
         store.write(target, new_text)
+        files_repo.upsert_from_disk(svc.db, svc.store, target)
         svc.reindex_path(target)
         if target != req.path:
             store.delete(req.path)
+            files_repo.remove_path(svc.db, req.path)
             store.cleanup_empty_dirs(req.path)
             svc.unindex_path(req.path)
         svc.reload_index()
@@ -459,6 +470,7 @@ async def upload(
             else:
                 added += 1
             store.write(target, text)
+            files_repo.upsert_from_disk(svc.db, svc.store, target)
             svc.reindex_path(target)
         svc.reload_index()
     _record(request, "/fs/upload", target_dir)

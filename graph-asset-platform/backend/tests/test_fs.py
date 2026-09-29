@@ -520,3 +520,48 @@ def test_e2e_user_journey(tmp_data_dir, monkeypatch):
         pb = "Command/alpha/20.15.2/alpha@MMLCommand@BBB.md"
         assert c.delete("/api/v1/fs/file", params={"path": pb}).status_code == 200
         assert not s.store.exists(pb)
+
+
+# ---------- 写端点同步 files 户口册 ----------
+
+def test_fs_write_endpoints_sync_files(tmp_data_dir, monkeypatch):
+    """/fs 七个写端点各自同步 files 户口册（mkdir/put/move/delete/restore；upload/rename 由专项覆盖）。"""
+    s = _setup(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        # mkdir → 目录行
+        r = c.post("/api/v1/fs/mkdir", json={"path": "Command/alpha/20.9.9"})
+        assert r.status_code == 200, r.text
+        row = s.db.execute(
+            "SELECT is_dir FROM files WHERE path='Command/alpha/20.9.9'").fetchone()
+        assert row is not None and row["is_dir"] == 1
+        # put_file → 文件行
+        r = c.put("/api/v1/fs/file",
+                  params={"path": "Command/alpha/20.9.9/t.md"},
+                  json={"content": CMD})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT name FROM files WHERE path='Command/alpha/20.9.9/t.md'"
+        ).fetchone()["name"] == "t.md"
+        # move → 旧行消失、新行出现（move 后文件名 = id）
+        r = c.post("/api/v1/fs/move",
+                   json={"src": "Command/alpha/20.9.9/t.md",
+                         "target_dir": "Command/alpha/20.9.9/sub"})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT 1 FROM files WHERE path='Command/alpha/20.9.9/t.md'"
+        ).fetchone() is None
+        assert s.db.execute(
+            "SELECT 1 FROM files WHERE path='Command/alpha/20.9.9/sub/"
+            "alpha@MMLCommand@ADD DEMO.md'").fetchone() is not None
+        # delete 目录 → 前缀行全清
+        r = c.delete("/api/v1/fs/file", params={"path": "Command/alpha/20.9.9"})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE 'Command/alpha/20.9.9%'"
+        ).fetchone()[0] == 0
+        # 回收站还原 → 行回来
+        r = c.post("/api/v1/fs/trash/restore", json={"id": r.json()["trash_id"]})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE 'Command/alpha/20.9.9%'"
+        ).fetchone()[0] > 0
