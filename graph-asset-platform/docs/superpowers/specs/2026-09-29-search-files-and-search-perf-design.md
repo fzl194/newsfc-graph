@@ -42,13 +42,14 @@ legacy hidden 工具，全部是**对象维度**（逻辑 ID）。需求：
 ### 4.1 数据模型（db schema v14）
 
 ```sql
--- 文件户口册：assets 下所有文件（不含目录行；目录浏览是前端 /fs/children 的职责）
+-- 文件户口册：assets 下所有文件 + 目录行（目录行支撑 path 模式的 ls 式浏览）
 CREATE TABLE IF NOT EXISTS files(
   path TEXT PRIMARY KEY,          -- 相对 assets 根，正斜杠归一化，磁盘真实大小写
   name TEXT NOT NULL,             -- basename 原样
-  ext  TEXT NOT NULL DEFAULT '',  -- 小写、无点（无扩展名=''）
-  size INTEGER NOT NULL DEFAULT 0,
-  mtime REAL NOT NULL DEFAULT 0
+  ext  TEXT NOT NULL DEFAULT '',  -- 小写、无点（无扩展名=''；目录恒 ''）
+  is_dir INTEGER NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,   -- 目录恒 0
+  mtime REAL NOT NULL DEFAULT 0      -- 目录不随子项变更刷新（仅展示用途，避免噪音）
 ) WITHOUT ROWID;
 
 -- 文件名全文索引（trigram：与 md_fts/graph_search_fts 同选型，中英统一子串语义）
@@ -94,8 +95,9 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
 | 参数 | 语义 |
 |---|---|
 | `query` | 文件名子串（规范化后 ≥2 字符；1 字符 → INVALID_ARGUMENT）。≥3 走 trigram 短语；2 字符走 trigram 前缀短语 |
-| `path` | 目录前缀过滤（子树递归语义：`Command/UDG` 匹配其下所有层级文件）。实现用 GLOB 前缀范围扫描（转义 `[ * ?`），走 path 主键索引；path 不存在 → INVALID_FILTER（结构化错误，不静默 0 结果） |
-| `ext` | 扩展名精确过滤（小写，如 `md` / `png`） |
+| `path` | 目录过滤。`recursive=false`（默认）= 列**直接子项**（文件+目录行，ls 语义——Agent 可逐层探目录结构）；`recursive=true` = 递归子树**仅文件**（`find <dir> -type f` 语义，全量场景）。实现用 GLOB 前缀范围扫描（转义 `[ * ?`），走 path 主键索引；path 不存在 → INVALID_FILTER（结构化错误，不静默 0 结果） |
+| `recursive` | bool，默认 false；仅 path 模式有意义（query 模式恒全局搜索） |
+| `ext` | 扩展名精确过滤（小写，如 `md` / `png`；给了 ext 自然只余文件行） |
 | `limit` | 1~500，默认 100（文件行小，500 行 ≈ 百 KB 级） |
 | `after` | 游标：上一页的 `next_cursor`（即上一页最后一条 path） |
 | `AGENT_USERNAME` / `AGENT_SESSION_ID` | 打点归因（同现有工具） |
@@ -108,8 +110,8 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
 {
   "files": [
     {"path": "Command/UDG/20.15.2/UDG@MMLCommand@ADD URR.md",
-     "name": "UDG@MMLCommand@ADD URR.md", "ext": "md", "size": 3200,
-     "mtime": "2026-08-01T10:00:00Z",
+     "name": "UDG@MMLCommand@ADD URR.md", "ext": "md", "is_dir": false,
+     "size": 3200, "mtime": "2026-08-01T10:00:00Z",
      "obj_id": "UDG@MMLCommand@ADD URR", "version": "20.15.2"}
   ],
   "total": 123, "total_is_bounded": false,
@@ -120,6 +122,9 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
 ```
 
 - 排序：`path` 字典序 ASC（确定性排序 = 游标稳定性基础）。
+- 目录行：query 模式与 path 直接子项模式都会返回目录行（`is_dir: true`，无 obj_id）；
+  `recursive=true` 的子树全量只返回文件行（find -type f 语义）。目录行 FTS 同样入册
+  （按目录名搜索可用）。
 - `obj_id`/`version`：`LEFT JOIN objects ON objects.source_path = files.path`（source_path
   与文件一一对应，无 latest 歧义）。**必须回带 version**：文件可能是旧版本目录下的 md，
   get_md 不带 version 会取到最新版内容而非该文件内容。非图谱文件（图片/未入索引 md）无
@@ -198,7 +203,8 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 ## 7. 测试策略
 
 - **files_repo 单元**：upsert/remove/prefix/rebuild/integrity；win_long 路径。
-- **search_files 核心**：query/path/ext 组合交集；游标循环遍历总数==total（合成 5k 文件
+- **search_files 核心**：query/path/ext 组合交集；path 直接子项模式（ls：含目录行）与
+  recursive=true 子树模式（仅文件）各自的行为；游标循环遍历总数==total（合成 5k 文件
   全量走完）；obj_id+version 关联（含旧版本目录文件）；1 字符拒绝；path 越界/不存在
   INVALID_FILTER；GLOB 特殊字符转义（目录名含 `[`）；点文件跳过；bootstrap 期间
   `index_building` 标记。
