@@ -149,3 +149,15 @@ def test_files_bootstrap_async(tmp_data_dir):
     assert s.files_building is False
     # Feature + x + 概述.md = 3 行
     assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 3
+
+
+def test_upsert_tree_heals_dotfile_rows(conn_db, store):
+    """trash_restore 走 upsert_tree：还原子树时清掉历史脏点文件行（行在册、盘无此文件）。"""
+    store.write("a/b.md", "b")
+    files_repo.rebuild_all(conn_db, store)
+    files_repo.upsert_entry(conn_db, path="a/.dirty.md", name=".dirty.md",
+                            ext="md", is_dir=0, size=1, mtime=0.0)  # 历史脏行
+    conn_db.commit()
+    files_repo.upsert_tree(conn_db, store, "a")
+    assert conn_db.execute(
+        "SELECT COUNT(*) FROM files WHERE path='a/.dirty.md'").fetchone()[0] == 0

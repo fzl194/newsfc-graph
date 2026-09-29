@@ -97,11 +97,15 @@ def remove_prefix(conn: sqlite3.Connection, prefix: str) -> int:
 
 
 def upsert_tree(conn: sqlite3.Connection, store, rel: str) -> None:
-    """rel 自身（文件或目录行）+ 子树全量 UPSERT（回收站还原后重建册用）。"""
+    """rel 自身（文件或目录行）+ 子树全量 UPSERT（回收站还原后重建册用）。
+
+    先 remove_prefix 清子树旧行再从磁盘重灌：rglob 只枚举磁盘存在项，
+    行在册、盘上无对应文件的历史脏行（点文件/幽灵行）不经此清理会永久残留。"""
     root = win_long(store.abspath(rel))
     if not root.exists():
-        remove_path(conn, rel)
+        remove_prefix(conn, rel)
         return
+    remove_prefix(conn, rel)
     upsert_from_disk(conn, store, rel)
     if not root.is_dir():
         return
