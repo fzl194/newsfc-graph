@@ -60,11 +60,15 @@ class Service:
             import threading as _t
             _t.Thread(target=self._fts_reconcile_async, daemon=True).start()
             _t.Thread(target=self._sync_mtime_async, daemon=True).start()
-        # files 户口册首启 bootstrap（v14）：表空 → 后台建册。flag 先置位再起
-        # 线程（spec：防构造与线程启动之间的请求窗口看到空表 + false）。
-        # assets 为空时建出 0 行册，等价于 spec 的「assets 非空」守卫（无害偏差）。
+        # files 户口册首启 bootstrap（v14）：无 files_bootstrapped 完成标记 → 后台
+        # 建册。标记只在 rebuild 成功后同锁写入：表空、或进程被杀留半截册（表非空
+        # 但无标记）都会重跑。flag 先置位再起线程（spec：防构造与线程启动之间的
+        # 请求窗口看到空表 + false）。assets 为空时建出 0 行册并写标记，等价于
+        # spec 的「assets 非空」守卫（无害偏差）。
         self.files_building = False
-        if self._table_empty("files"):
+        if not self.db.execute(
+            "SELECT value FROM meta WHERE key='files_bootstrapped'"
+        ).fetchone():
             self.files_building = True
             threading.Thread(target=self._files_bootstrap_async,
                              daemon=True).start()
@@ -109,19 +113,27 @@ class Service:
             pass
 
     def _files_bootstrap_async(self) -> None:
-        """后台一次性建 files 册（表空时；百万级为分钟级，不阻塞启动）。
-        失败不抛（admin 可经 /admin/files-reindex 兜底重试）。"""
+        """后台一次性建 files 册（无完成标记时；百万级为分钟级，不阻塞启动）。
+        成功 → 同锁内写 files_bootstrapped 标记（__init__ 门控查标记）。失败不抛
+        （清残册并删标记 → 下次启动自动重试；admin 可经 /admin/files-reindex 兜底）。"""
         from .repos import files_repo
         try:
             with import_lock:
                 n = files_repo.rebuild_all(self.db, self.store)
+                self.db.execute(
+                    "INSERT INTO meta(key, value) VALUES('files_bootstrapped','1') "
+                    "ON CONFLICT(key) DO UPDATE SET value='1'")
+            _commit(self.db)
             print(f"[startup] files 户口册首启建册 {n} 行", flush=True)
         except Exception as e:  # noqa: BLE001 后台线程绝不抛
             try:
-                self.db.execute("DELETE FROM files")
-                self.db.execute("DELETE FROM files_fts")
-                self.db.execute("DELETE FROM files_fts_map")
-                self.db.commit()
+                with import_lock:
+                    self.db.execute("DELETE FROM files")
+                    self.db.execute("DELETE FROM files_fts")
+                    self.db.execute("DELETE FROM files_fts_map")
+                    self.db.execute(
+                        "DELETE FROM meta WHERE key='files_bootstrapped'")
+                _commit(self.db)
             except Exception:  # noqa: BLE001 清理失败仅留日志（下次 admin 兜底）
                 print("[startup] files 建册失败后清理残册也失败", flush=True)
             print(f"[startup] files 建册失败（已清残册，下次启动自动重试；admin 可经 /admin/files-reindex 手动触发）: {e!r}",

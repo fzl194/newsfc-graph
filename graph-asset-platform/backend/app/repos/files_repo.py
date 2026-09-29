@@ -166,53 +166,59 @@ def upsert_many_from_disk(conn: sqlite3.Connection, store, rels,
 
 
 def upsert_parents_from_disk(conn: sqlite3.Connection, store, rels) -> int:
-    """从文件路径集合推导父目录集合（去重，排除根 ''），逐个 upsert_from_disk。
+    """从文件路径集合推导父目录集合（去重，排除根 ''），委托
+    ``upsert_many_from_disk`` 批量入册（分块提交 + map 预取 + miss 集合单次批删，
+    消除逐目录单行 map-miss 回退扫）。
 
     gate apply 新建目录（如 Feature 层特性目录）由此入册，否则 path 直接子项
-    浏览看不到新特性。目录数量少，逐个调用即可。返回去重后的父目录数
-    （含各级祖先目录；自管提交，异常 rollback 后原样抛）。
+    浏览看不到新特性。返回去重后的父目录数（含各级祖先目录；提交/回滚语义
+    继承批量函数：分块自管提交，异常 rollback 后原样抛）。
     """
-    from ..service import _commit
-
     parents: set = set()
     for rel in rels:
         parts = _norm(rel).split("/")
         for i in range(1, len(parts)):
             parents.add("/".join(parts[:i]))
-    try:
-        for d in sorted(parents):
-            upsert_from_disk(conn, store, d)
-        _commit(conn)
-    except Exception:
-        conn.rollback()
-        raise
+    if parents:
+        upsert_many_from_disk(conn, store, sorted(parents))
     return len(parents)
 
 
 def remove_path(conn: sqlite3.Connection, rel: str) -> None:
     """删单行 + FTS（map 命中走 rowid；缺失回退 path 删，正确性网底）。"""
-    rel = _norm(rel)
+    _remove_raw(conn, _norm(rel))
+
+
+def _remove_raw(conn: sqlite3.Connection, path: str) -> int:
+    """按**存储原始键**删行 + FTS（不过 _norm）。返回 files 实删行数。
+
+    remove_prefix 的区间查询拿到的是存储原键——委托 remove_path 会先规范化，
+    尾斜杠等非规范脏行会被转走键而漏删（永久残留）。"""
     rid = conn.execute(
-        "SELECT fts_rowid FROM files_fts_map WHERE path=?", (rel,)).fetchone()
+        "SELECT fts_rowid FROM files_fts_map WHERE path=?", (path,)).fetchone()
     if rid is not None:
         conn.execute("DELETE FROM files_fts WHERE rowid=?", (rid[0],))
-        conn.execute("DELETE FROM files_fts_map WHERE path=?", (rel,))
+        conn.execute("DELETE FROM files_fts_map WHERE path=?", (path,))
     else:
-        conn.execute("DELETE FROM files_fts WHERE path=?", (rel,))
-    conn.execute("DELETE FROM files WHERE path=?", (rel,))
+        conn.execute("DELETE FROM files_fts WHERE path=?", (path,))
+    cur = conn.execute("DELETE FROM files WHERE path=?", (path,))
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
 def remove_prefix(conn: sqlite3.Connection, prefix: str) -> int:
-    """删 prefix 目录行自身 + 其下全部行。'/' 的下一码位是 '0'：半开区间覆盖
-    prefix/ 下任意 Unicode 文件名（同 service.reindex_prefixes 的技巧）。"""
+    """删 prefix 目录行自身 + 其下全部行（返回 files 实删行数）。'/' 的下一码位
+    是 '0'：半开区间覆盖 prefix/ 下任意 Unicode 文件名（同 service
+    .reindex_prefixes 的技巧）。区间命中的行按存储原始键删（非规范脏行同清）；
+    prefix 自身走 _norm 后的规范键。"""
     prefix = _norm(prefix)
     low, high = prefix + "/", prefix + "0"
     paths = [r[0] for r in conn.execute(
         "SELECT path FROM files WHERE path>=? AND path<?", (low, high))]
     paths.append(prefix)
+    n = 0
     for p in paths:
-        remove_path(conn, p)
-    return len(paths)
+        n += _remove_raw(conn, p)
+    return n
 
 
 def upsert_tree(conn: sqlite3.Connection, store, rel: str) -> None:

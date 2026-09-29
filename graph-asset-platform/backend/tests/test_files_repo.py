@@ -149,6 +149,10 @@ def test_files_bootstrap_async(tmp_data_dir):
     assert s.files_building is False
     # Feature + x + 概述.md = 3 行
     assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 3
+    # 成功 → 同锁内写完成标记（__init__ 门控据此跳过；被杀留半截册无标记会重跑）
+    assert s.db.execute(
+        "SELECT value FROM meta WHERE key='files_bootstrapped'"
+    ).fetchone()[0] == "1"
 
 
 def test_upsert_tree_heals_dotfile_rows(conn_db, store):
@@ -237,3 +241,25 @@ def test_upsert_parents_from_disk_registers_ancestors(conn_db, store):
         assert rows[d]["is_dir"] == 1 and rows[d]["ext"] == ""
         assert rows[d]["size"] == 0
     assert files_repo.integrity_ok(conn_db)
+
+
+def test_remove_prefix_deletes_raw_noncanonical_keys(conn_db, store):
+    files_repo.upsert_entry(conn_db, path="a/", name="a", ext="", is_dir=1,
+                            size=0, mtime=0.0)  # 非规范脏行（尾斜杠）
+    store.write("a/b.md", "b")
+    files_repo.upsert_from_disk(conn_db, store, "a/b.md")
+    n = files_repo.remove_prefix(conn_db, "a")
+    assert n == 2
+    assert conn_db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+
+
+def test_parents_routed_through_batch_no_ghost(conn_db, store):
+    store.makedirs("x/yyy")
+    store.write("x/yyy/f.md", "f")
+    files_repo.rebuild_all(conn_db, store)
+    files_repo.upsert_parents_from_disk(conn_db, store, ["x/yyy/new.md"])
+    # 新目录 x/yyy 已在册（祖先），无重复 FTS 行（批量路径不走单行回退）。
+    # 目录名须 ≥3 字符：files_fts 是 trigram 分词，1-2 字符名无 trigram 不可 MATCH。
+    assert conn_db.execute(
+        "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'name : \"yyy\"'"
+    ).fetchone()[0] == 1

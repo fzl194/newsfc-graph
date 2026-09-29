@@ -1002,6 +1002,7 @@ def test_gate_apply_and_revert_sync_files(env, monkeypatch, tmp_data_dir):
     dir_row = db.execute(
         "SELECT is_dir FROM files WHERE path='Command/UDG/20.15.2'").fetchone()
     assert dir_row is not None and dir_row["is_dir"] == 1
+    assert "Command/UDG/20.15.2/assets" in have  # apply 新建的目录（extra_binary）
     # revert：add → 软删/物理删（行消失）；modify → 还原旧版（行保留）
     from app.pipeline import gate as gate_mod
     gate_mod.revert_job(j.job_id, deleted_by="tester")
