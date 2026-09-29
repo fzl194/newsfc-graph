@@ -75,10 +75,14 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
 | 写入口 | 挂钩 |
 |---|---|
 | `/fs` 写端点（upload / put_file / move / rename / delete / trash_restore） | 端点内显式调 files_repo（move/rename=remove+upsert；delete=remove_path 或 remove_prefix） |
-| `service.rebuild()`（import / 产品文档导入 / pipeline 收尾都会走） | 末尾追加 `files_repo.rebuild_all()`——平台中介的批量写全覆盖 |
+| `service.rebuild()` | 末尾追加 `files_repo.rebuild_all()`（覆盖 import 路由等走 rebuild 的批量写） |
+| **`pipeline/gate.py` 应用/回退**（抽取任务：直接 `_copy` 到 assets + `svc.reindex_paths()`，**不走 rebuild**；且写入非 md 的 `_` 前缀 sidecar 文件——`reindex_paths` 只认 md，挂钩 rebuild/reindex_paths 都覆盖不到） | gate apply 后按其已知行集合（rows_map / extract_files 清单）显式 files_repo 增量同步（remove_path 旧 + upsert 新）；revert 同理 |
 | `POST /admin/reindex` | 走 svc.rebuild()，天然覆盖 |
-| 启动 | **一次性 bootstrap**：files 表为空且 assets 非空 → 异步全量扫描建册（复用 `_fts_reconcile_async` 的后台模式；不阻塞启动。百万级为一次性分钟级，可接受） |
-| 外部直拷磁盘（绕过平台） | 不自动对账；admin 手动触发 `POST /admin/files-reindex`（新增，与 /admin/reindex 同款：admin 权限 + svc.rebuild 级别的兜底语义） |
+| 启动 | **一次性 bootstrap**：files 表为空且 assets 非空 → 后台线程全量扫描建册。落点在 `Service.__init__`（与 `_fts_reconcile_async` 同款后台模式；db.py 只建表不碰文件系统）。不阻塞启动；百万级为一次性分钟级，可接受。扫描期间 search_files 正常服务但结果不全，响应带 `index_building: true` 标记（模块级 bool） |
+| 外部直拷磁盘（绕过平台） | 不自动对账（注意：`_sync_mtime_async` 启动时会自动把外部拷入的 md 治理进 objects，**但不会治理 files 表**——外部拷贝后 objects/files 漂移是常态而非边缘case）；admin 手动触发 `POST /admin/files-reindex`（新增，与 /admin/reindex 同款：admin 权限 + svc.rebuild 级别的兜底语义） |
+
+**点文件策略**：跳过 `.` 开头的文件/目录（与 `store.list_children` 一致）；pipeline 的
+`_` 前缀 sidecar **不是**点文件，正常入册。
 
 不做的：启动时周期性 mtime 全量对账（10M 级全走一遍是分钟级，YAGNI；bootstrap + 写路径
 增量 + admin 兜底已闭环）。
@@ -108,8 +112,9 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
      "mtime": "2026-08-01T10:00:00Z",
      "obj_id": "UDG@MMLCommand@ADD URR", "version": "20.15.2"}
   ],
-  "total_capped": 123, "total_is_bounded": false,
+  "total": 123, "total_is_bounded": false,
   "has_more": true, "next_cursor": "Command/UDG/20.15.2/UDG@MMLCommand@ADD XYZ.md",
+  "index_building": false,
   "applied_filters": {"path": "Command/UDG/20.15.2"}
 }
 ```
@@ -119,8 +124,10 @@ integrity_ok`（对账：files 与磁盘行集合一致性；path 集合对账�
   与文件一一对应，无 latest 歧义）。**必须回带 version**：文件可能是旧版本目录下的 md，
   get_md 不带 version 会取到最新版内容而非该文件内容。非图谱文件（图片/未入索引 md）无
   obj_id 字段。
-- `total_capped`：精确计数到 10000，超过为 10000 + `total_is_bounded: true`（计数 SQL 用
-  `SELECT COUNT(*) FROM (… LIMIT 10001)` 有界化）。
+- `total`：与 search_graph 对齐的同名语义——精确计数到 10000，超过为 10000 +
+  `total_is_bounded: true`（计数 SQL 用 `SELECT COUNT(*) FROM (… LIMIT 10001)` 有界化）。
+  不另造 `total_capped` 之名，兄弟工具间同语义同字段名。
+- `index_building`：首启 bootstrap 扫描进行中为 true（此时结果不全，Agent 可等待后重试）。
 - 全量获取循环：**拿 → 看 has_more → 带 next_cursor 再拿**，直到 has_more=false。游标是
   path 键序（keyset），深翻页 O(1)、不受并发增删导致的页错位影响。
 
@@ -155,8 +162,9 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
    `total_is_bounded=true`。语义="至少 total 条，已按相关度截断"。
 3. **SEARCH_TOO_BROAD 退场**：不再抛错（错误码保留在枚举中标注 deprecated-unused，不再
    触发）。宽泛搜索正常返回 top 结果 + 截断标记 + "建议加过滤"提示（diagnostics）。
-4. **短词路径**（D6 两档，配置开关 `search_short_term_mode = prefix | metadata_only`，
-   默认 prefix）：
+4. **短词路径**（D6 两档，开关存 **meta 表 key=`search_short_term_mode`**（`prefix` /
+   `metadata_only`，默认 `prefix`），每请求读取（同 mcp_tools 配置模式，改即生效、无 UI
+   依赖，admin 经 SQL/后续运维页切换；读取失败回退上次成功值）：
    - 2 字符 term：正文走 trigram **前缀短语**（`"计费*"`，索引支持；边界情形=词后紧跟
      空白/文档结尾的命中可能漏，可接受并在文档标注）；元数据照常 LIKE（trigram 加速）。
    - 1 字符 term：只搜元数据，不搜正文（diagnostics 注明 `body_skipped_short_term`）。
@@ -172,7 +180,7 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 |---|---|---|
 | `total` | 全局精确 | 合并池精确值；触顶时配合 `total_is_bounded=true` |
 | `total_is_bounded` | 无 | 新增 bool |
-| `diagnostics.term_counts` | 每 term 精确命中数 | `{hit: bool, capped: bool}`（EXISTS 探针 + 池触顶标记） |
+| `diagnostics.term_counts` | 每 term 精确命中数 | `{hit: bool, capped: bool}`（EXISTS 探针 + 池触顶标记）。**连带改造**：mcp_server.py get 打点摘要（`matched_terms_count` 计算）与 skill_compat.py 同款摘要按新形状适配，否则 dict 与 `>0` 比较直接 TypeError |
 | SEARCH_TOO_BROAD 错误 | 命中超 200 万抛出 | 不再触发 |
 | 其余（terms/match/filters/page/size/hits/facets 结构） | — | **不变**；facets 基于合并池计算（截断时为池内构成，语义在接口文档标注） |
 
@@ -192,26 +200,35 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 - **files_repo 单元**：upsert/remove/prefix/rebuild/integrity；win_long 路径。
 - **search_files 核心**：query/path/ext 组合交集；游标循环遍历总数==total（合成 5k 文件
   全量走完）；obj_id+version 关联（含旧版本目录文件）；1 字符拒绝；path 越界/不存在
-  INVALID_FILTER；GLOB 特殊字符转义（目录名含 `[`）。
+  INVALID_FILTER；GLOB 特殊字符转义（目录名含 `[`）；点文件跳过；bootstrap 期间
+  `index_building` 标记。
 - **同构对账**：MCP search_files vs REST POST /api/v1/files 同请求同结果（沿用三对模式
   扩为四对）。
 - **search_graph 行为**：既有测试随契约更新（total_is_bounded/term_counts 新形状）；
   新增截断路径测试（合成高基数 term）；短词两档开关各测一遍。
-- **perf 冒烟（slow 标记）**：合成 10 万对象，宽词 + 2 字词断言 < 2s。
+- **perf 冒烟（slow 标记）**：合成 10 万对象，宽词 + 2 字词断言 < 2s（CI 可跑的回归门）；
+  另在**内网验收 checklist** 里用真实数据量复测同口径（合成门防回归，真实门防外推失真）。
 - 全量 pytest 保持绿。
 
 ## 8. 交付物清单
 
-1. `db.py`：v14 迁移（三表 + 首启异步 bootstrap）
-2. `repos/files_repo.py`（新）
-3. `app/file_query.py`（新）：search_files_core
-4. `mcp_server.py`：search_files 注册 + 三工具描述词修订 + DEFAULT_INSTRUCTIONS 决策树
-5. `routers/skill_compat.py`：POST /api/v1/files
-6. `routers/fs.py` / `service.py`：files_repo 挂钩 + rebuild 追加 rebuild_all
-7. `routers/admin.py`：POST /admin/files-reindex
-8. `graph_query/search.py`：有界化重构 + 短词两档 + catalog 缓存
-9. 测试（§7）+ `图谱平台接口文档.md` / `docs/MCP配置指南.md` 更新
-10. deploy 侧无镜像变更（纯代码包，走既有 sync.sh pack/apply + db 自动迁移）
+1. `db.py`：v14 迁移（仅三表建表，幂等）
+2. `service.py`：`Service.__init__` 追加首启异步 bootstrap（files 表空且 assets 非空时
+   后台全量建册 + `index_building` 标记）；`rebuild()` 末尾追加 `files_repo.rebuild_all()`
+3. `repos/files_repo.py`（新）
+4. `app/file_query.py`（新）：search_files_core
+5. `mcp_server.py`：search_files 注册 + 三工具描述词修订 + DEFAULT_INSTRUCTIONS 决策树
+   + get 打点摘要按 term_counts 新形状适配
+6. `routers/skill_compat.py`：POST /api/v1/files + 打点摘要同款适配
+7. **`middleware/auth.py`**：`_GRAPH_API_PATHS` 增加 `/api/v1/files`（否则 skill-only 用户
+   403、错误响应丢 GraphError envelope——REST 同构要求）
+8. `routers/fs.py`：写端点挂 files_repo
+9. **`pipeline/gate.py`**：抽取任务 apply/revert 显式同步 files 表（含非 md sidecar；
+   rebuild/reindex_paths 均覆盖不到该路径）
+10. `routers/admin.py`：POST /admin/files-reindex
+11. `graph_query/search.py`：有界化重构 + 短词两档（meta 表开关） + catalog 缓存
+12. 测试（§7）+ `图谱平台接口文档.md` / `docs/MCP配置指南.md` 更新
+13. deploy 侧无镜像变更（纯代码包，走既有 sync.sh pack/apply + db 自动迁移）
 
 ## 9. 风险与回退
 
@@ -219,6 +236,6 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 |---|---|
 | trigram 前缀短语实测不达预期（D6） | 两档开关，默认可切 metadata_only；perf 冒烟测试把门 |
 | 深翻页到池底即止（语义变化） | 接口文档明示"top-N 语义 + 截断标记"；全量场景由 search_files 游标承担 |
-| files 索引与磁盘漂移（外部直拷） | admin 兜底端点；接口文档写明运维口径 |
+| files 索引与磁盘漂移（外部直拷） | `_sync_mtime_async` 只治理 objects 不治理 files（§4.2），外部拷贝后漂移是常态；admin files-reindex 兜底 + 接口文档写明运维口径 |
 | 首启 bootstrap 在超大库上耗时 | 异步后台执行，不阻塞服务；进度打日志 |
 | 内网升级（v13→v14） | IF NOT EXISTS + 空表判定的幂等迁移，与既有迁移同模式 |
