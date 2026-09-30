@@ -333,6 +333,9 @@ CREATE TABLE IF NOT EXISTS files(
   mtime REAL NOT NULL DEFAULT 0      -- 目录不随子项变更刷新（仅展示，避免噪音）
 ) WITHOUT ROWID;
 
+-- ext-only / ext+after 游标检索：等值列在前、path 范围与排序在后。
+CREATE INDEX IF NOT EXISTS idx_files_ext_path ON files(ext, path);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
   path UNINDEXED, name, tokenize='trigram'
 );

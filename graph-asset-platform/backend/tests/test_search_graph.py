@@ -398,7 +398,7 @@ def test_pool_cap_truncation_returns_bounded(populated, monkeypatch):
     out = search_graph_core(terms=["计费"])  # 种子里 ≥4 个对象元数据含"计费"
     assert out["total"] >= 1
     assert out["total_is_bounded"] is True
-    assert out["diagnostics"]["term_counts"]["计费"]["capped"] is True
+    assert out["diagnostics"]["term_stats"]["计费"]["capped"] is True
     assert any("截断" in s for s in out["suggestions"])
 
 
@@ -417,7 +417,8 @@ def test_zero_result_recovery_remove_term(tmp_data_dir, monkeypatch):
     out = search_graph_core(terms=["计费", "不存在的词xyz"], match="all")
     assert out["total"] == 0
     assert "REMOVE_OR_REPHRASE_TERM" in out["diagnostics"]["recovery_codes"]
-    assert out["diagnostics"]["term_counts"]["不存在的词xyz"] == \
+    assert out["diagnostics"]["term_counts"]["不存在的词xyz"] == 0
+    assert out["diagnostics"]["term_stats"]["不存在的词xyz"] == \
         {"hit": False, "capped": False}
 
 
@@ -432,7 +433,8 @@ def test_zero_result_recovery_relax_filters(tmp_data_dir, monkeypatch):
 def test_term_counts_present_on_success(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     out = search_graph_core(terms=["计费", "免费RG"], match="any")
-    assert out["diagnostics"]["term_counts"]["免费RG"]["hit"] is True
+    assert out["diagnostics"]["term_counts"]["免费RG"] > 0
+    assert out["diagnostics"]["term_stats"]["免费RG"]["hit"] is True
 
 
 # ---------------- 输出契约 ----------------
@@ -505,11 +507,15 @@ def test_broad_term_returns_truncated_not_error(populated):
         assert any("截断" in s for s in out["suggestions"])
 
 
-def test_term_counts_new_shape(populated):
+def test_term_counts_remain_integer_compatible_with_explicit_term_stats(populated):
     out = search_graph_core(terms=["ADD URR", "不存在词xyz"])
     tc = out["diagnostics"]["term_counts"]
-    assert tc["ADD URR"] == {"hit": True, "capped": False}
-    assert tc["不存在词xyz"] == {"hit": False, "capped": False}
+    stats = out["diagnostics"]["term_stats"]
+    # term_counts 是既有公开契约，旧调用方仍可直接做 count > 0。
+    assert tc["ADD URR"] > 0
+    assert tc["不存在词xyz"] == 0
+    assert stats["ADD URR"] == {"hit": True, "capped": False}
+    assert stats["不存在词xyz"] == {"hit": False, "capped": False}
 
 
 def test_total_is_bounded_field_present(populated):
@@ -594,7 +600,7 @@ def test_pool_cap_exact_boundary_not_capped(populated, monkeypatch):
     # 正文恰 2 条命中（ADD URR 新版 + FEAT_BILLING），元数据另 1 条——均不触顶
     assert out["total"] == 2
     assert out["total_is_bounded"] is False
-    assert out["diagnostics"]["term_counts"]["在线计费"]["capped"] is False
+    assert out["diagnostics"]["term_stats"]["在线计费"]["capped"] is False
 
 
 def test_zero_result_suggestion_mentions_skipped_short_terms(populated):
@@ -602,3 +608,138 @@ def test_zero_result_suggestion_mentions_skipped_short_terms(populated):
     out = search_graph_core(terms=["配", "不存在的词xyz"])
     assert out["total"] == 0
     assert any("未搜正文" in s and "配" in s for s in out["suggestions"])
+
+
+def test_exact_name_outside_broad_pool_is_preserved_and_ranked_first(
+        tmp_data_dir, monkeypatch):
+    """宽包含池触顶时，精确名称不得因插入顺序落在池外而消失。"""
+    docs = {}
+    for i, name in enumerate(("needle alpha", "needle beta", "needle gamma")):
+        docs[f"broad-{i}.md"] = (
+            "---\n"
+            f"id: UDG@Feature@BROAD-{i}\n"
+            "type: Feature\n"
+            "version: 20.15.2\n"
+            f"name: {name}\n"
+            "---\n\nbody\n"
+        )
+    # 最后写入，保证旧实现的 LIMIT 2 任意池拿不到它。
+    docs["exact.md"] = (
+        "---\n"
+        "id: UDG@Feature@EXACT\n"
+        "type: Feature\n"
+        "version: 20.15.2\n"
+        "name: needle\n"
+        "---\n\nbody\n"
+    )
+    _setup(tmp_data_dir, monkeypatch, docs)
+    import app.graph_query.search as search_mod
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+
+    out = search_graph_core(terms=["needle"])
+
+    assert out["hits"][0]["id"] == "UDG@Feature@EXACT"
+    assert out["hits"][0]["rank_reasons"][0] == "名称精确匹配"
+    assert out["total_is_bounded"] is True
+
+
+def test_prefix_name_outside_contains_pool_is_preserved_and_ranked_first(
+        tmp_data_dir, monkeypatch):
+    """无精确项时，池外前缀项仍须优先于普通包含项。"""
+    docs = {}
+    for i, name in enumerate(("alpha needle", "beta needle", "gamma needle")):
+        docs[f"contains-{i}.md"] = (
+            "---\n"
+            f"id: UDG@Feature@CONTAINS-{i}\n"
+            "type: Feature\nversion: 20.15.2\n"
+            f"name: {name}\n"
+            "---\n\nbody\n"
+        )
+    docs["prefix.md"] = (
+        "---\n"
+        "id: UDG@Feature@PREFIX\n"
+        "type: Feature\nversion: 20.15.2\n"
+        "name: Needle target\n"
+        "---\n\nbody\n"
+    )
+    _setup(tmp_data_dir, monkeypatch, docs)
+    import app.graph_query.search as search_mod
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+
+    out = search_graph_core(terms=["NEEDLE"])
+
+    assert out["hits"][0]["id"] == "UDG@Feature@PREFIX"
+    assert out["hits"][0]["rank_reasons"][0] == "元数据前缀匹配"
+
+
+@pytest.mark.parametrize(("special_name", "term", "reason"), [
+    ("ＡＢＣ", "abc", "名称精确匹配"),
+    ("Straße", "STRASSE", "名称精确匹配"),
+    ("Ｓｔｒａße target", "strasse", "元数据前缀匹配"),
+])
+def test_normalized_priority_survives_pool_cap(
+        special_name, term, reason, tmp_data_dir, monkeypatch):
+    """Priority 沿用 NFKC+casefold，不能退化成 SQLite ASCII NOCASE。"""
+    norm = "strasse" if "tra" in term.casefold() else "abc"
+    docs = {
+        f"broad-{i}.md": (
+            "---\n"
+            f"id: UDG@Feature@NORM-BROAD-{i}\n"
+            "type: Feature\nversion: 20.15.2\n"
+            f"name: x {norm} {i}\n"
+            "---\n\nbody\n"
+        )
+        for i in range(3)
+    }
+    docs["special.md"] = (
+        "---\n"
+        "id: UDG@Feature@NORM-SPECIAL\n"
+        "type: Feature\nversion: 20.15.2\n"
+        f"name: {special_name}\n"
+        "---\n\nbody\n"
+    )
+    _setup(tmp_data_dir, monkeypatch, docs)
+    import app.graph_query.search as search_mod
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+
+    out = search_graph_core(terms=[term])
+
+    assert out["hits"][0]["id"] == "UDG@Feature@NORM-SPECIAL"
+    assert out["hits"][0]["rank_reasons"][0] == reason
+    assert out["total_is_bounded"] is True
+
+
+def test_three_plus_metadata_search_uses_fts_not_escaped_like(populated):
+    """>=3 字符元数据包含必须走 trigram MATCH，避免罕见多 term 全表 LIKE。"""
+    traced = []
+    populated.db.set_trace_callback(traced.append)
+    try:
+        search_graph_core(terms=["ADD URR", "AFUSRDETECT"], match="any")
+    finally:
+        populated.db.set_trace_callback(None)
+
+    selects = [sql.lower() for sql in traced if sql.lstrip().lower().startswith("select")]
+    assert any("metadata_text :" in sql and " match " in sql for sql in selects)
+    # priority 的行边界判断可用 LIKE，但必须由同一条 MATCH 先缩小候选；
+    # 禁止退回不带 MATCH 的元数据全表 LIKE。
+    metadata_like = [sql for sql in selects if "metadata_text like" in sql]
+    assert metadata_like and all(" match " in sql for sql in metadata_like)
+
+
+@pytest.mark.parametrize("term", ["配额", "配"])
+def test_skipped_short_term_relax_probe_never_scans_body_like(
+        populated, term):
+    """metadata_only 两字词及恒跳的一字词，零结果诊断也不能从后门扫正文。"""
+    populated.db.execute(
+        "INSERT INTO meta(key, value) VALUES('search_short_term_mode', "
+        "'metadata_only') ON CONFLICT(key) DO UPDATE SET value='metadata_only'")
+    populated.db.commit()
+    traced = []
+    populated.db.set_trace_callback(traced.append)
+    try:
+        out = search_graph_core(terms=[term], nf="UNC")
+    finally:
+        populated.db.set_trace_callback(None)
+
+    assert out["total"] == 0
+    assert not any("body_text like" in sql.lower() for sql in traced)

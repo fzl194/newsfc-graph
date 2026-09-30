@@ -223,7 +223,7 @@ class SearchFacets(BaseModel):
 
 
 class TermCountStat(BaseModel):
-    """term_counts 新形状（spec §5.3）：hit=EXISTS 探针语义；capped=池触顶。"""
+    """term_stats：hit=候选池内存在命中；capped=该词的候选池触顶。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -234,7 +234,9 @@ class TermCountStat(BaseModel):
 class SearchDiagnostics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    term_counts: dict[str, TermCountStat]
+    # 保留既有整数契约；旧调用方可继续直接执行 ``count > 0``。
+    term_counts: dict[str, int]
+    term_stats: dict[str, TermCountStat]
     recovery_codes: list[str]
     # 跳过正文搜索的短词展示值（Task 10 两档：1 字符恒跳 / 2 字符 metadata_only 档跳）
     body_skipped_short_terms: list[str] = []

@@ -169,6 +169,15 @@ def test_tools_list_returns_4_public_tools(tmp_data_dir, monkeypatch):
         assert "anyOf" in ap or "oneOf" in ap or "$ref" in ap
         # ids 护栏进 schema
         assert get_md["inputSchema"]["properties"]["ids"]["maxItems"] == 100
+        sf = by["search_files"]["inputSchema"]["properties"]
+        def _max_length(spec):
+            return spec.get("maxLength") or next(
+                (branch.get("maxLength") for branch in spec.get("anyOf", [])
+                 if branch.get("maxLength")), None)
+        assert _max_length(sf["query"]) == 200
+        assert _max_length(sf["path"]) == 1024
+        assert _max_length(sf["ext"]) == 64
+        assert _max_length(sf["after"]) == 1024
 
 
 def test_hidden_legacy_still_callable_with_old_shape(tmp_data_dir, monkeypatch):

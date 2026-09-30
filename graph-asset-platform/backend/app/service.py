@@ -39,6 +39,8 @@ def _commit(db) -> None:
 
 
 class Service:
+    _files_rebuild_state_lock = threading.Lock()
+
     def __init__(self):
         self.store = Store(ASSETS_DIR)
         self.registry = Registry.load_default()
@@ -65,6 +67,7 @@ class Service:
         # 但无标记）都会重跑。flag 先置位再起线程（spec：防构造与线程启动之间的
         # 请求窗口看到空表 + false）。assets 为空时建出 0 行册并写标记，等价于
         # spec 的「assets 非空」守卫（无害偏差）。
+        self._files_rebuild_active = 0
         self.files_building = False
         if not self.db.execute(
             "SELECT value FROM meta WHERE key='files_bootstrapped'"
@@ -115,26 +118,14 @@ class Service:
     def _files_bootstrap_async(self) -> None:
         """后台一次性建 files 册（无完成标记时；百万级为分钟级，不阻塞启动）。
         成功走 ``rebuild_files``（锁内建册 + 写 files_bootstrapped 标记 + 期间置
-        files_building）。失败不抛（清残册并删标记 → 下次启动自动重试；admin 可
-        经 /admin/files-reindex 兜底）。"""
+        files_building）。失败清理由 ``rebuild_files`` 统一保证；本后台
+        入口只记录异常，不向线程外抛出。"""
         try:
             n = self.rebuild_files()
             print(f"[startup] files 户口册首启建册 {n} 行", flush=True)
         except Exception as e:  # noqa: BLE001 后台线程绝不抛
-            try:
-                with import_lock:
-                    self.db.execute("DELETE FROM files")
-                    self.db.execute("DELETE FROM files_fts")
-                    self.db.execute("DELETE FROM files_fts_map")
-                    self.db.execute(
-                        "DELETE FROM meta WHERE key='files_bootstrapped'")
-                _commit(self.db)
-            except Exception:  # noqa: BLE001 清理失败仅留日志（下次 admin 兜底）
-                print("[startup] files 建册失败后清理残册也失败", flush=True)
             print(f"[startup] files 建册失败（已清残册，下次启动自动重试；admin 可经 /admin/files-reindex 手动触发）: {e!r}",
                   flush=True)
-        finally:
-            self.files_building = False
 
     def _table_empty(self, name: str) -> bool:
         return self.db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] == 0
@@ -365,17 +356,46 @@ class Service:
         返回入册行数（文件+目录）。自带 import_lock——调用方不得已持锁（非重入）。"""
         from .repos import files_repo
         n = 0
-        self.files_building = True
+        succeeded = False
+        with self._files_rebuild_state_lock:
+            self._files_rebuild_active = \
+                getattr(self, "_files_rebuild_active", 0) + 1
+            self.files_building = True
         try:
             with import_lock:
-                n = files_repo.rebuild_all(self.db, self.store)
-                self.db.execute(
-                    "INSERT INTO meta(key, value) VALUES('files_bootstrapped','1') "
-                    "ON CONFLICT(key) DO UPDATE SET value='1'")
-                _commit(self.db)
+                try:
+                    # 先持久化撤销完成标记：即使进程在分块重建
+                    # 中被杀，下次启动也会自动重试，不会误认半册已就绪。
+                    self.db.execute(
+                        "DELETE FROM meta WHERE key=?", ("files_bootstrapped",))
+                    _commit(self.db)
+                    n = files_repo.rebuild_all(self.db, self.store)
+                    self.db.execute(
+                        "INSERT INTO meta(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        ("files_bootstrapped", "1"))
+                    _commit(self.db)
+                    succeeded = True
+                except Exception:
+                    # rebuild_all 分块提交，因此 rollback 不足以清除半册。
+                    # 失败时显式清理三表与 marker，保证不暴露静默残缺结果。
+                    self.db.rollback()
+                    self.db.execute("DELETE FROM files")
+                    self.db.execute("DELETE FROM files_fts")
+                    self.db.execute("DELETE FROM files_fts_map")
+                    self.db.execute(
+                        "DELETE FROM meta WHERE key=?", ("files_bootstrapped",))
+                    _commit(self.db)
+                    raise
             return n
         finally:
-            self.files_building = False
+            with self._files_rebuild_state_lock:
+                active = max(
+                    0, getattr(self, "_files_rebuild_active", 1) - 1)
+                self._files_rebuild_active = active
+                # 还有排队/执行中的 rebuild，或本次失败无 marker，
+                # 都不得向 search_files 宣告索引已就绪。
+                self.files_building = active > 0 or not succeeded
 
     # ---------- 正文全文搜索（MCP search_md 的 service 层实现） ----------
 

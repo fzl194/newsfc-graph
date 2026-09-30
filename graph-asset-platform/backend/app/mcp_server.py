@@ -34,6 +34,10 @@ from .graph_query.contracts import (
     INTERNAL_ERROR,
     INTERNAL_ERROR_MESSAGE,
     INVALID_ARGUMENT,
+    MAX_FILES_AFTER_LEN,
+    MAX_FILES_EXT_LEN,
+    MAX_FILES_PATH_LEN,
+    MAX_FILES_QUERY_LEN,
     DomainsResponse,
     GraphError,
     GraphQueryError,
@@ -165,7 +169,7 @@ class _ConfigurableFastMCP(FastMCP):
                 raise _tool_error_json(cause.error) from None
             if isinstance(cause, ValidationError):
                 raise _tool_error_json(GraphError(
-                    code=INVALID_ARGUMENT, message="工具参数校验失败",
+                    code=INVALID_ARGUMENT, message="请求参数校验失败",
                     details=_validation_details(cause))) from None
             if name in _PUBLIC_TOOLS and cause is not None:
                 print(f"[mcp] INTERNAL_ERROR {name}: {cause!r}", flush=True)
@@ -178,7 +182,7 @@ class _ConfigurableFastMCP(FastMCP):
             raise _tool_error_json(e.error) from None
         except ValidationError as e:
             raise _tool_error_json(GraphError(
-                code=INVALID_ARGUMENT, message="工具参数校验失败",
+                code=INVALID_ARGUMENT, message="请求参数校验失败",
                 details=_validation_details(e))) from None
         except Exception as e:  # noqa: BLE001 公开工具 INTERNAL_ERROR 只给通用消息
             if name not in _PUBLIC_TOOLS:
@@ -412,7 +416,7 @@ def search_graph(
                              "top_ids": [h["id"] for h in out["hits"][:10]],
                              "matched_terms_count": sum(
                                  1 for c in out["diagnostics"]["term_counts"].values()
-                                 if c["hit"]),
+                                 if c > 0),
                              "recovery_codes": out["diagnostics"]["recovery_codes"]})
         return SearchGraphResponse(**out)
     except Exception as e:  # noqa: BLE001 失败也留痕后原样抛出
@@ -427,20 +431,24 @@ def search_files(
     AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)],
     AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
     query: Annotated[Optional[str], Field(
+        max_length=MAX_FILES_QUERY_LEN,
         description="文件名关键词（子串，不分大小写；规范化后至少 2 字符）。"
                     "如 'ADD URR' 命中 UDG@MMLCommand@ADD URR.md；"
                     "3 字符以上走索引，2 字符为语料扫描（大库下罕见词稍慢）")] = None,
     path: Annotated[Optional[str], Field(
+        max_length=MAX_FILES_PATH_LEN,
         description="目录限定（相对 assets 根，如 'Command/UDG'）。默认列直接子项"
                     "（ls 语义，含子目录行）；recursive=true 时递归取子树全部文件"
                     "（find -type f 语义）。不传=全库")] = None,
     ext: Annotated[Optional[str], Field(
+        max_length=MAX_FILES_EXT_LEN,
         description="扩展名精确过滤（小写，如 'md'/'png'）")] = None,
     recursive: Annotated[bool, Field(
         description="path 模式下递归子树（仅文件行）；默认 False=直接子项")] = False,
     limit: Annotated[int, Field(
         description="单页条数（1~500，默认 100）", ge=1, le=500)] = 100,
     after: Annotated[Optional[str], Field(
+        max_length=MAX_FILES_AFTER_LEN,
         description="游标：传上一页返回的 next_cursor 翻下一页；循环直到 "
                     "has_more=false 即拿全量。注意 total 是从游标位置起的剩余"
                     "条数（翻页递减），非全集绝对数")] = None,

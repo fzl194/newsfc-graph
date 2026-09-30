@@ -1,4 +1,6 @@
 """files 户口册 repo 单元测试（spec §4.1/§4.2）。"""
+import threading
+
 import pytest
 
 from app.repos import files_repo
@@ -190,11 +192,98 @@ def test_files_bootstrap_async_failure_clears_no_marker(tmp_data_dir, monkeypatc
     monkeypatch.setattr(files_repo, "rebuild_all", _boom)
     s.files_building = True
     s._files_bootstrap_async()                     # 失败不抛（后台线程绝不抛）
-    assert s.files_building is False
+    # 失败后无完成标记，search_files 必须继续表示“未就绪”。
+    assert s.files_building is True
     for t in ("files", "files_fts", "files_fts_map"):
         assert s.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0
     assert s.db.execute(
         "SELECT value FROM meta WHERE key='files_bootstrapped'").fetchone() is None
+
+
+def test_rebuild_files_failure_invalidates_marker_and_partial_catalog(
+        tmp_data_dir, monkeypatch):
+    """admin/full rebuild 分块中途失败：旧 marker 与已提交半册一并清理。"""
+    import app.service as svc_mod
+    from app.file_query import search_files_core
+
+    s = _bare_service(tmp_data_dir)
+    s.files_building = False
+    s.db.execute(
+        "INSERT INTO meta(key, value) VALUES('files_bootstrapped', '1')")
+    s.db.commit()
+
+    def _partial_then_boom(conn, store):
+        files_repo.upsert_entry(
+            conn, path="partial.md", name="partial.md", ext="md",
+            is_dir=0, size=1, mtime=0.0)
+        conn.commit()  # 模拟 rebuild_all 分块已提交
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(files_repo, "rebuild_all", _partial_then_boom)
+    monkeypatch.setattr(svc_mod, "_service", s)
+
+    with pytest.raises(RuntimeError, match="scan failed"):
+        s.rebuild_files()
+
+    for table in ("files", "files_fts", "files_fts_map"):
+        assert _count(s.db, table) == 0
+    assert s.db.execute(
+        "SELECT value FROM meta WHERE key='files_bootstrapped'").fetchone() is None
+    out = search_files_core(ext="md")
+    assert out["files"] == []
+    assert out["index_building"] is True
+
+
+def test_concurrent_rebuild_keeps_building_true_until_last_finishes(
+        tmp_data_dir, monkeypatch):
+    """两个 rebuild 排队时，第一个完成不得提前拉低共享状态。"""
+    s = _bare_service(tmp_data_dir)
+    s.files_building = False
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    release_second = threading.Event()
+    first_done = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def _blocking_rebuild(conn, store):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            current = calls
+        if current == 1:
+            first_started.set()
+            assert release_first.wait(2)
+        else:
+            second_started.set()
+            assert release_second.wait(2)
+        return 0
+
+    monkeypatch.setattr(files_repo, "rebuild_all", _blocking_rebuild)
+
+    def _first():
+        try:
+            s.rebuild_files()
+        finally:
+            first_done.set()
+
+    t1 = threading.Thread(target=_first)
+    t2 = threading.Thread(target=s.rebuild_files)
+    t1.start()
+    assert first_started.wait(2)
+    t2.start()
+    release_first.set()
+    assert second_started.wait(2)
+    assert first_done.wait(2)
+    try:
+        assert s.files_building is True
+    finally:
+        release_second.set()
+        t1.join(2)
+        t2.join(2)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert s.files_building is False
 
 
 def test_upsert_tree_heals_dotfile_rows(conn_db, store):
@@ -255,6 +344,24 @@ def test_upsert_many_from_disk_mixed_batch(conn_db, store):
     assert files_repo.integrity_ok(conn_db)
     row = conn_db.execute("SELECT size FROM files WHERE path='new.md'").fetchone()
     assert row["size"] == 3
+
+
+def test_upsert_many_heals_fts_row_when_map_is_missing(conn_db, store):
+    """批量 upsert 遇到 FTS 行在、map 丢失时，按 path 自愈而不造重复行。"""
+    store.write("a.md", "old")
+    files_repo.upsert_from_disk(conn_db, store, "a.md")
+    conn_db.execute("DELETE FROM files_fts_map WHERE path=?", ("a.md",))
+    conn_db.commit()
+
+    store.write("a.md", "new")
+    out = files_repo.upsert_many_from_disk(conn_db, store, ["a.md"])
+
+    assert out == {"upserted": 1, "removed": 0}
+    assert conn_db.execute(
+        "SELECT COUNT(*) FROM files_fts WHERE path=?", ("a.md",)
+    ).fetchone()[0] == 1
+    assert _count(conn_db, "files_fts_map") == 1
+    assert files_repo.integrity_ok(conn_db)
 
 
 def test_upsert_many_from_disk_empty_and_missing_only(conn_db, store):

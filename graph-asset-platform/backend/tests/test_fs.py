@@ -177,6 +177,20 @@ def test_fs_put_rejects_id_change(tmp_data_dir, monkeypatch):
         assert r.status_code == 400
 
 
+def test_fs_put_new_file_registers_parent_directories(tmp_data_dir, monkeypatch):
+    """PUT 可新建文件；新建的多级父目录必须与文件同步入册。"""
+    s = _setup(tmp_data_dir, monkeypatch)
+    path = "Command/alpha/20.15.2/alpha@MMLCommand@ADD DEMO.md"
+    with TestClient(app) as c:
+        response = c.put(
+            "/api/v1/fs/file", params={"path": path}, json={"content": CMD})
+    assert response.status_code == 200, response.text
+    rows = {row["path"] for row in s.db.execute(
+        "SELECT path FROM files ORDER BY path")}
+    assert rows == {
+        "Command", "Command/alpha", "Command/alpha/20.15.2", path}
+
+
 # ---------- DELETE / mkdir ----------
 
 def test_fs_delete_cleans_empty_dirs(tmp_data_dir, monkeypatch):
@@ -188,6 +202,10 @@ def test_fs_delete_cleans_empty_dirs(tmp_data_dir, monkeypatch):
         assert c.delete("/api/v1/fs/file", params={"path": p}).status_code == 200
     assert not s.store.exists(p)
     assert not s.store.abspath("Command").exists()
+    assert s.db.execute(
+        "SELECT COUNT(*) FROM files WHERE path IN (?,?,?)",
+        ("Command", "Command/alpha", "Command/alpha/20.15.2"),
+    ).fetchone()[0] == 0
 
 
 def test_fs_delete_dir_recursive(tmp_data_dir, monkeypatch):
@@ -327,11 +345,25 @@ def test_fs_trash_empty(tmp_data_dir, monkeypatch):
 
 
 def test_fs_mkdir(tmp_data_dir, monkeypatch):
-    _setup(tmp_data_dir, monkeypatch)
+    s = _setup(tmp_data_dir, monkeypatch)
     with TestClient(app) as c:
         r = c.post("/api/v1/fs/mkdir", json={"path": "Feature/newnf/newver"})
         assert r.status_code == 200
     assert svc.get_service().store.abspath("Feature/newnf/newver").is_dir()
+    rows = {r["path"] for r in s.db.execute(
+        "SELECT path FROM files WHERE path IN (?,?,?)",
+        ("Feature", "Feature/newnf", "Feature/newnf/newver"),
+    )}
+    assert rows == {"Feature", "Feature/newnf", "Feature/newnf/newver"}
+
+
+@pytest.mark.parametrize("path", ["", "/", "\\"])
+def test_fs_mkdir_rejects_assets_root(path, tmp_data_dir, monkeypatch):
+    s = _setup(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        r = c.post("/api/v1/fs/mkdir", json={"path": path})
+    assert r.status_code == 400
+    assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
 
 
 # ---------- move（target_dir 驱动）----------
@@ -348,6 +380,12 @@ def test_fs_move_to_target_dir(tmp_data_dir, monkeypatch):
     assert new_path == "Command/alpha/20.16.0/alpha@MMLCommand@ADD DEMO.md"
     assert s.store.exists(new_path)
     assert not s.store.exists(p)
+    rows = {r["path"] for r in s.db.execute(
+        "SELECT path FROM files WHERE path IN (?,?,?,?)",
+        ("Command", "Command/alpha", "Command/alpha/20.15.2",
+         "Command/alpha/20.16.0"),
+    )}
+    assert rows == {"Command", "Command/alpha", "Command/alpha/20.16.0"}
 
 
 def test_fs_move_with_fm_override(tmp_data_dir, monkeypatch):
@@ -379,6 +417,10 @@ def test_fs_rename_dry_run_and_apply(tmp_data_dir, monkeypatch):
     s.store.write(pa, a_md)
     s.store.write(pb, b_md)
     s.rebuild()
+    # 模拟历史漂移：文件在册，父目录行丢失。rename 应随目标补齐。
+    from app.repos import files_repo
+    files_repo.remove_path(s.db, "Command/alpha/20.15.2")
+    s.db.commit()
     with TestClient(app) as c:
         d = c.post("/api/v1/fs/rename",
                    json={"path": pa, "new_id": "alpha@MMLCommand@AAA2", "dry_run": True}).json()
@@ -400,6 +442,10 @@ def test_fs_rename_dry_run_and_apply(tmp_data_dir, monkeypatch):
         "SELECT 1 FROM files WHERE path=?", (new_pa,)).fetchone() is not None
     assert s.db.execute(
         "SELECT 1 FROM files WHERE path=?", (pa,)).fetchone() is None
+    # 使现有册目缺目录行，rename 也应补齐目标父目录。
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", ("Command/alpha/20.15.2",)
+    ).fetchone() is not None
 
 
 # ---------- upload（target_dir 驱动）----------
@@ -420,6 +466,9 @@ def test_fs_upload_to_target_dir(tmp_data_dir, monkeypatch):
     # files 户口册：上传文件行在册（upload 挂钩）
     assert s.db.execute(
         "SELECT 1 FROM files WHERE path=?", (p,)).fetchone() is not None
+    rows = {row["path"] for row in s.db.execute(
+        "SELECT path FROM files WHERE is_dir=1")}
+    assert rows == {"Command", "Command/alpha", "Command/alpha/20.99.99"}
 
 
 def test_fs_upload_overrides_fm(tmp_data_dir, monkeypatch):

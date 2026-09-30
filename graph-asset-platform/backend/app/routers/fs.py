@@ -147,6 +147,7 @@ def put_file(path: str, req: FileContentIn, request: Request):
                 )
         store.write(path, req.content)
         files_repo.upsert_from_disk(svc.db, svc.store, path)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [path])
         svc.reindex_path(path)
         svc.reload_index()
     _record(request, "/fs/file", path)
@@ -181,6 +182,7 @@ def delete_file(path: str, request: Request):
         files_repo.remove_prefix(svc.db, path)  # path 自身 + 子树（文件/目录通吃）
         trash_id = store.soft_delete(path)
         store.cleanup_empty_dirs(path)
+        files_repo.upsert_parents_from_disk(svc.db, store, [path])
         trash_repo.insert(
             svc.db, trash_id=trash_id, original_path=path, is_dir=is_dir,
             md_count=len(md_rels),
@@ -272,12 +274,22 @@ class PathIn(BaseModel):
 def mkdir(req: PathIn, request: Request):
     _require_assets(request)
     svc = get_service()
+    normalized = req.path.replace("\\", "/")
+    if not normalized.strip("/"):
+        raise HTTPException(status_code=400, detail="不能创建 assets 根")
+    if normalized.startswith("/"):
+        raise HTTPException(status_code=400, detail="目录必须是 assets 内的相对路径")
+    path = normalized.strip("/")
     with import_lock:
-        svc.store.makedirs(req.path)
-        files_repo.upsert_from_disk(svc.db, svc.store, req.path)
+        try:
+            svc.store.makedirs(path)
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
+        files_repo.upsert_from_disk(svc.db, svc.store, path)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [path])
         svc.db.commit()
-    _record(request, "/fs/mkdir", req.path)
-    return {"ok": True, "path": req.path}
+    _record(request, "/fs/mkdir", path)
+    return {"ok": True, "path": path}
 
 
 # ---------- POST /move（target_dir 驱动）----------
@@ -320,9 +332,11 @@ def move(req: MoveIn, request: Request):
             return {"ok": True, "new_path": target, "moved": False}
         store.write(target, text)
         files_repo.upsert_from_disk(svc.db, svc.store, target)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [target])
         store.delete(req.src)
         files_repo.remove_path(svc.db, req.src)  # 盘删成功后再删册行（镜像 rename：盘删失败不悬空册删）
         store.cleanup_empty_dirs(req.src)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [req.src])
         svc.reindex_path(target)
         svc.unindex_path(req.src)
         svc.reload_index()
@@ -377,11 +391,13 @@ def rename(req: RenameIn, request: Request):
         new_text = rewrite_frontmatter(text2, {"id": new_id})
         store.write(target, new_text)
         files_repo.upsert_from_disk(svc.db, svc.store, target)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [target])
         svc.reindex_path(target)
         if target != req.path:
             store.delete(req.path)
             files_repo.remove_path(svc.db, req.path)
             store.cleanup_empty_dirs(req.path)
+            files_repo.upsert_parents_from_disk(svc.db, svc.store, [req.path])
             svc.unindex_path(req.path)
         svc.reload_index()
     _record(request, "/fs/rename", req.path)
@@ -447,6 +463,7 @@ async def upload(
     # 2. 逐 md 写入 target_dir（一把锁，最后一次 rebuild）
     with import_lock:
         store = svc.store
+        written_paths: list = []
         for origin, text in md_items:
             try:
                 id_, typ = validate_md(text, svc.registry)
@@ -472,7 +489,9 @@ async def upload(
                 added += 1
             store.write(target, text)
             files_repo.upsert_from_disk(svc.db, svc.store, target)
+            written_paths.append(target)
             svc.reindex_path(target)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, written_paths)
         svc.reload_index()
     _record(request, "/fs/upload", target_dir)
     return {"added": added, "updated": updated, "skipped": skipped, "warnings": warnings}

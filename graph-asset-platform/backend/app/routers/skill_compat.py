@@ -193,7 +193,7 @@ async def search_graph(request: Request):
                          "top_ids": [h["id"] for h in out["hits"][:10]],
                          "matched_terms_count": sum(
                              1 for c in out["diagnostics"]["term_counts"].values()
-                             if c["hit"]),
+                             if c > 0),
                          "recovery_codes": out["diagnostics"]["recovery_codes"]})
     return out
 

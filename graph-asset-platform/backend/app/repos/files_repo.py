@@ -96,8 +96,8 @@ def upsert_many_from_disk(conn: sqlite3.Connection, store, rels,
     语义与逐路径 ``upsert_from_disk`` 一致（存在→stat 入册，不存在/点文件→
     删行）；块内自管提交（容错版 ``_commit``），异常 rollback 后原样抛。
     to_remove 的 ``path IN`` 批删是本函数唯一按 path 扫 FTS 的点（单次/块）；
-    upsert 侧旧 FTS 行按预取 rowid 删（map 缺失的历史脏 fts 行不在册即视为
-    不存在，由 upsert_entry/rebuild_all 的兜底口径负责）。
+    upsert 侧旧 FTS 行优先按预取 rowid 删；map 缺失则按 path 批删
+    历史脏行，避免追加重复 FTS 记录。
     """
     from ..service import _commit
 
@@ -136,13 +136,19 @@ def upsert_many_from_disk(conn: sqlite3.Connection, store, rels,
                 conn.execute(f"DELETE FROM files WHERE path IN {marks}",
                              to_remove)
                 removed += len(to_remove)
-            # 插入侧：先按预取 rowid 删旧 FTS（仅命中），再批量插 + map 回填
+            # 插入侧：map 命中按 rowid O(1) 删；map 缺失可能仍有
+            # 历史 FTS 行，必须按 path 批删自愈，否则会追加重复行。
             if to_upsert:
                 hit_rowids = [rid_map[u[0]] for u in to_upsert if u[0] in rid_map]
                 if hit_rowids:
                     conn.execute(
                         "DELETE FROM files_fts WHERE rowid IN "
                         + _in_marks(hit_rowids), hit_rowids)
+                miss_paths = [u[0] for u in to_upsert if u[0] not in rid_map]
+                if miss_paths:
+                    conn.execute(
+                        "DELETE FROM files_fts WHERE path IN "
+                        + _in_marks(miss_paths), miss_paths)
                 conn.executemany(
                     "INSERT INTO files(path, name, ext, is_dir, size, mtime) "
                     "VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "

@@ -281,13 +281,23 @@ def _check_combination(conn, layer, type_, nf, version, domain, scenario):
         details={"available_values": available}))
 
 
-def _probe_without_filters(conn, norm_term: str) -> bool:
-    """有界 count probe（§7.8）：移除全部可选过滤后该 term 是否有命中（LIMIT 1）。"""
+def _probe_without_filters(conn, norm_term: str, *, probe_body: bool) -> bool:
+    """移除过滤后的有界 EXISTS 探针；沿用主查询的短词正文降级策略。"""
     like = f"%{_like_escape(norm_term)}%"
-    if conn.execute(
-        "SELECT 1 FROM graph_search_fts WHERE metadata_text LIKE ? ESCAPE '\\' "
-        "LIMIT 1", (like,)).fetchone():
+    if len(norm_term) >= 3:
+        metadata_hit = conn.execute(
+            "SELECT 1 FROM graph_search_fts WHERE graph_search_fts MATCH ? LIMIT 1",
+            (f"metadata_text : {_fts_phrase(norm_term)}",),
+        ).fetchone()
+    else:
+        metadata_hit = conn.execute(
+            "SELECT 1 FROM graph_search_fts "
+            "WHERE metadata_text LIKE ? ESCAPE '\\' LIMIT 1", (like,),
+        ).fetchone()
+    if metadata_hit:
         return True
+    if not probe_body:
+        return False
     if len(norm_term) >= 3:
         return conn.execute(
             "SELECT 1 FROM graph_search_fts WHERE graph_search_fts MATCH ? "
@@ -367,16 +377,57 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
     for _disp, norm in norm_terms:
         seen_keys: set = set()
         capped = False
-        # 元数据：规范化后字面包含（trigram 索引加速 LIKE），池内限量。
-        # LIMIT+1 探测触顶：正好 POOL_CAP 个命中不算 capped（fetch 后截回）
-        rows = conn.execute(
+        # 先取精确/前缀候选，再补普通包含候选。二者合成一条 priority 查询，
+        # 避免为每个 term 额外全表扫描两次；>=3 字符同时用 MATCH 先缩候选。
+        norm_like = _like_escape(norm)
+        prefix_patterns = (norm_like + "%", "%\n" + norm_like + "%")
+        exact_patterns = (norm_like, norm_like + "\n%",
+                          "%\n" + norm_like + "\n%", "%\n" + norm_like)
+        prefix_predicate = (
+            "(graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
+            "OR graph_search_fts.metadata_text LIKE ? ESCAPE '\\')")
+        exact_order = (
+            "CASE WHEN graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
+            "OR graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
+            "OR graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
+            "OR graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
+            "THEN 0 ELSE 1 END")
+        if len(norm) >= 3:
+            metadata_predicate = "graph_search_fts MATCH ?"
+            metadata_param = f"metadata_text : {_fts_phrase(norm)}"
+            priority_guard = "AND graph_search_fts MATCH ? "
+            priority_params = [*params, metadata_param, *prefix_patterns,
+                               *exact_patterns]
+        else:
+            metadata_predicate = "graph_search_fts.metadata_text LIKE ? ESCAPE '\\'"
+            metadata_param = f"%{_like_escape(norm)}%"
+            priority_guard = ""
+            priority_params = [*params, *prefix_patterns, *exact_patterns]
+        priority_rows = conn.execute(
             f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
-            "AND graph_search_fts.metadata_text LIKE ? ESCAPE '\\' "
-            f"LIMIT {POOL_CAP + 1}",
-            [*params, f"%{_like_escape(norm)}%"]).fetchall()
-        if len(rows) > POOL_CAP:
+            f"{priority_guard}AND {prefix_predicate} "
+            f"ORDER BY {exact_order} LIMIT {POOL_CAP + 1}",
+            priority_params).fetchall()
+        broad_rows = conn.execute(
+            f"SELECT {meta_sel} {from_sql} WHERE 1=1{scope_and} "
+            f"AND {metadata_predicate} LIMIT {POOL_CAP + 1}",
+            [*params, metadata_param]).fetchall()
+        capped = len(priority_rows) > POOL_CAP or len(broad_rows) > POOL_CAP
+        rows = []
+        metadata_keys = set()
+        candidates = [*priority_rows[:POOL_CAP], *broad_rows[:POOL_CAP]]
+        for r in candidates:
+            key = (r["obj_id"], r["version"])
+            if key in metadata_keys:
+                continue
+            metadata_keys.add(key)
+            rows.append(r)
+            if len(rows) == POOL_CAP:
+                break
+        if any((r["obj_id"], r["version"]) not in metadata_keys
+               for r in [*priority_rows[:POOL_CAP + 1],
+                         *broad_rows[:POOL_CAP + 1]]):
             capped = True
-        rows = rows[:POOL_CAP]
         for r in rows:
             key = (r["obj_id"], r["version"])
             level, fields = _meta_level(
@@ -425,7 +476,8 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
                 e["fields"].add("body")
                 e["body_terms"].add(norm)
                 seen_keys.add(key)
-        term_stats[norm] = {"hit": bool(seen_keys), "capped": capped}
+        term_stats[norm] = {
+            "hit": bool(seen_keys), "capped": capped, "count": len(seen_keys)}
         any_capped = any_capped or capped
 
     # ---------- any/all 合并 + 排序 ----------
@@ -500,17 +552,27 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
         })
 
     # ---------- 诊断与建议 ----------
-    # term_counts（新形状 §5.3）：EXISTS 语义的 hit + 池触顶标记 capped
-    term_counts = {disp: term_stats[norm] for disp, norm in norm_terms}
+    # term_counts 保持旧整数形状；新增 term_stats 承载明确的 hit/capped。
+    term_counts = {disp: term_stats[norm]["count"] for disp, norm in norm_terms}
+    term_status = {
+        disp: {"hit": term_stats[norm]["hit"],
+               "capped": term_stats[norm]["capped"]}
+        for disp, norm in norm_terms
+    }
     recovery_codes: list = []
     if total == 0:
         if match == "all" and all(st["hit"] for st in term_stats.values()) \
-                and len(term_counts) > 1:
+                and len(term_status) > 1:
             recovery_codes.append("USE_MATCH_ANY")
         if any(not st["hit"] for st in term_stats.values()):
             recovery_codes.append("REMOVE_OR_REPHRASE_TERM")
         if any(v is not None for v in (layer, type_, nf, version, domain, scenario)) \
-                and any(_probe_without_filters(conn, norm) for _, norm in norm_terms):
+                and any(_probe_without_filters(
+                    conn, norm,
+                    probe_body=not (
+                        len(norm) == 1
+                        or (len(norm) == 2 and short_mode == "metadata_only")),
+                ) for _, norm in norm_terms):
             recovery_codes.append("RELAX_FILTERS")
     if total == 0:
         suggestions = [
@@ -540,6 +602,7 @@ def search_graph_core(*, terms, match: str = "any", layer=None, type=None,
         hits=hits,
         facets=facets,
         diagnostics={"term_counts": term_counts,
+                     "term_stats": term_status,
                      "recovery_codes": recovery_codes,
                      "body_skipped_short_terms": body_skipped},
         suggestions=suggestions,

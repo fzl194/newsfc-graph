@@ -10,6 +10,10 @@
 
 **Spec:** `graph-asset-platform/docs/superpowers/specs/2026-09-29-search-files-and-search-perf-design.md`（决策 D1~D7 已拍板；get_md/get_domains 参数与机制**冻结**，只改描述词——见 Chunk 3 Task 12）。
 
+> **2026-09-30 复审勘误：** 下文 Task 9 保留原实施记录；最终公开契约以 spec/接口
+> 文档为准：`diagnostics.term_counts` 继续返回整数，新增 `term_stats.{hit,capped}`；
+> ≥3 字符元数据改走 FTS，并以 exact → prefix → broad 三段去重候选保证排序承诺。
+
 **工作目录：** 所有命令在 `graph-asset-platform/backend/` 下执行（pytest、uvicorn）。
 
 **⚠️ GIT 陷阱（README）：** 仓库里 `三层图谱构建规范/scripts/product_doc_md_exporter_optimized.py` 长期处于暂存态。**必须**路径限定提交：`git add graph-asset-platform/<具体文件> && git commit -m "..." -- graph-asset-platform/`，绝不用 `git add -A` / `git add .` / `git commit -am`。
@@ -2055,4 +2059,3 @@ git commit -m "docs: 接口文档/配置指南/README 收录 search_files 与超
 1. 全量 `python -m pytest -q` 绿 + `GAP_PERF=1 python -m pytest tests/test_search_perf.py -q` 绿；
 2. 手工冒烟（可选但推荐）：起后端 `python -m uvicorn app.main:app --port 8000`，导入样例 bundle 后用 curl 各打一遍 `POST /api/v1/files`（query / path / recursive+游标翻到 has_more=false）；
 3. 内网上线 checklist（spec §7/§9）：sync.sh pack/apply → v14 自动迁移 → 首启后台建册日志确认 → **真实数据量**复测宽词/两字词 <2s（不达标切 `search_short_term_mode=metadata_only`）→ Agent 侧 MCP 配置更新工具清单。
-

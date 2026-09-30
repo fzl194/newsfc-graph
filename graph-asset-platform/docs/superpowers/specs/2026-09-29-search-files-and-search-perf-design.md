@@ -160,8 +160,9 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 
 ### 5.2 重构方案
 
-1. **候选池有界化**：每 term 每来源（元数据 LIKE / 正文 FTS）只取 **top K=2000** 进
-   Python 合并池（10 terms × 2 来源 ≤ 4 万条，内存无压力）。正文来源带 bm25 rank 供 RRF。
+1. **候选池有界化**：每 term 每来源只取 **top K=2000** 进 Python 合并池。
+   ≥3 字符元数据与正文均走 trigram FTS；元数据按 exact → prefix → broad 三段
+   去重入池，避免最相关的精确/前缀项被宽包含池挤掉。正文来源带 bm25 rank 供 RRF。
    深翻页翻到池底即止，响应标注截断（见 5.3）。
 2. **总数封顶**：total = 合并池大小的精确值不再保证全局精确；任一来源触顶 K 时
    `total_is_bounded=true`。语义="至少 total 条，已按相关度截断"。
@@ -181,7 +182,8 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 5. **catalog 校验缓存**：`_validate_filters` 每请求最多 5 次 DISTINCT 全表扫，改为模块级
    缓存 + rebuild/reload_index 时失效。
 6. 兜底保留：`fts_rebuilding` 拒绝窗口、组合校验（INVALID_FILTER_COMBINATION）、
-   `_probe_without_filters` 诊断探针（EXISTS LIMIT 1，本就有界）。
+   `_probe_without_filters` 诊断探针（EXISTS LIMIT 1）。诊断探针必须服从主查询的
+   短词档位：一字词与 `metadata_only` 两字词不得从诊断路径重新执行正文 LIKE。
 
 ### 5.3 契约变化清单（MCP 与 REST 同步，共享核心）
 
@@ -189,7 +191,8 @@ skill_compat.py 加 `POST /api/v1/files`（同契约同 envelope）。
 |---|---|---|
 | `total` | 全局精确 | 合并池精确值；触顶时配合 `total_is_bounded=true` |
 | `total_is_bounded` | 无 | 新增 bool |
-| `diagnostics.term_counts` | 每 term 精确命中数 | `{hit: bool, capped: bool}`（EXISTS 探针 + 池触顶标记）。**连带改造**：mcp_server.py get 打点摘要（`matched_terms_count` 计算）与 skill_compat.py 同款摘要按新形状适配，否则 dict 与 `>0` 比较直接 TypeError |
+| `diagnostics.term_counts` | 每 term 精确命中数 | 保持整数形状，改为有界候选池内去重数（旧客户端可继续 `count > 0`） |
+| `diagnostics.term_stats` | 无 | 新增 `{hit: bool, capped: bool}`（候选池命中 + 触顶标记） |
 | SEARCH_TOO_BROAD 错误 | 命中超 200 万抛出 | 不再触发 |
 | 其余（terms/match/filters/page/size/hits/facets 结构） | — | **不变**；facets 基于合并池计算（截断时为池内构成，语义在接口文档标注） |
 

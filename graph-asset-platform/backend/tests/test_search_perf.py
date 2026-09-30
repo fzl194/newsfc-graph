@@ -81,11 +81,14 @@ def _seed_files_ledger(s) -> None:
     """files 三表 SQL 批插（见模块 docstring：rebuild_all 扫盘会建出 0 行）。"""
     from app.repos.graph_search_repo import normalize_search_text
     conn = s.db
+    if conn.execute("SELECT 1 FROM files LIMIT 1").fetchone():
+        return
     paths = [_rel_path(i) for i in range(N)]
     names = [p.rsplit("/", 1)[-1] for p in paths]
     conn.executemany(
         "INSERT INTO files(path, name, ext, is_dir, size, mtime) VALUES(?,?,?,?,?,?)",
-        [(p, n, "md", 0, 1024, 1.0) for p, n in zip(paths, names)])
+        [(p, n, "drawio" if i % RARE_EVERY == RARE_EVERY - 1 else "md",
+          0, 1024, 1.0) for i, (p, n) in enumerate(zip(paths, names))])
     max_rid = conn.execute(
         "SELECT COALESCE(MAX(rowid), 0) FROM files_fts").fetchone()[0]
     conn.executemany(
@@ -119,6 +122,23 @@ def test_broad_three_char_term_under_2s(big):
     assert out["total"] > 0
 
 
+def test_rare_multi_metadata_terms_use_fts_under_2s(big):
+    """三个罕见元数据词走 MATCH；防每 term 的 ESCAPE LIKE 全表扫描回归。"""
+    from app.graph_query.search import search_graph_core
+    traced = []
+    big.db.set_trace_callback(traced.append)
+    try:
+        out, dt = _timed(lambda: search_graph_core(
+            terms=["CMD 099999", "CMD 088888", "CMD 077777"], match="any"))
+    finally:
+        big.db.set_trace_callback(None)
+    assert dt < 2.0, f"罕见多 term 耗时 {dt:.2f}s"
+    assert out["total"] == 3
+    metadata_like = [sql.lower() for sql in traced
+                     if "metadata_text like" in sql.lower()]
+    assert metadata_like and all(" match " in sql for sql in metadata_like)
+
+
 def test_two_char_term_under_2s(big):
     from app.graph_query.search import search_graph_core
     out, dt = _timed(lambda: search_graph_core(terms=["配额"]))
@@ -145,4 +165,19 @@ def test_search_files_rare_two_char_and_path_traversal(big):
                 return seen
             after = o["next_cursor"]
     n, dt2 = _timed(_walk)
-    assert n == N and dt2 < 5.0, f"游标遍历 {n} 条 {dt2:.2f}s"
+    expected_md = N - N // RARE_EVERY
+    assert n == expected_md and dt2 < 5.0, f"游标遍历 {n} 条 {dt2:.2f}s"
+
+
+def test_search_files_rare_ext_uses_composite_index_under_2s(big):
+    from app.file_query import search_files_core
+    _seed_files_ledger(big)
+    out, dt = _timed(lambda: search_files_core(ext="drawio"))
+    assert out["total"] == N // RARE_EVERY
+    assert dt < 2.0, f"稀有 ext 耗时 {dt:.2f}s"
+    plan = big.db.execute(
+        "EXPLAIN QUERY PLAN SELECT path FROM files "
+        "WHERE ext=? AND path>? ORDER BY path LIMIT ?",
+        ("drawio", "", 100),
+    ).fetchall()
+    assert any("idx_files_ext_path" in r[3] for r in plan)
