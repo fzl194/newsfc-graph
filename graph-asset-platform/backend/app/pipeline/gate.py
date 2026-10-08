@@ -497,6 +497,12 @@ def _reconcile_applying(job, res: dict, svc, extract_files_repo, fts_repo) -> No
     if all_applied:
         all_applied = fts_repo.integrity_ok(svc.db)
     if all_applied:
+        # apply 的耐久顺序是 objects/FTS → files 户口 → job done。若进程恰好
+        # 崩在前两者之间，重启对账必须补齐完整清单及父目录后才能确认终态。
+        from ..repos import files_repo
+        paths = [row["path"] for row in manifest]
+        files_repo.upsert_many_from_disk(svc.db, svc.store, paths)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, paths)
         stats = dict(res.get("applied") or {})
         stats.update(
             added=sum(1 for row in manifest if row["op"] == "add"

@@ -22,9 +22,11 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from ..frontmatter_rw import rewrite_frontmatter, validate_md
+from ..logical_id import split_id
 from ..md_parser import parse_md  # noqa: F401  (保留供未来按需解析)
 from ..repos import files_repo, trash_repo
 from ..service import get_service, import_lock
+from ..store import normalize_relpath
 from ..telemetry.recorder import record
 from ..users.service import check_perm
 
@@ -59,8 +61,18 @@ def _safe_filename(name: str) -> str:
 
 def _join(target_dir: str, filename: str) -> str:
     """target_dir + filename → 归一化相对路径（去首尾斜杠，防空）。"""
-    td = target_dir.strip("/")
-    return f"{td}/{filename}" if td else filename
+    if "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="文件名不能包含路径分隔符")
+    td = _request_path(target_dir, allow_root=True)
+    return _request_path(f"{td}/{filename}" if td else filename)
+
+
+def _request_path(value: str, *, allow_root: bool = False) -> str:
+    """规范化用户提供的 assets 相对路径；非法输入统一返回 400。"""
+    try:
+        return normalize_relpath(value, allow_root=allow_root)
+    except ValueError as ex:
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
 
 
 # 顶层目录 → 允许的 type（上传时校验 md.type 属于所选层，防错位：如选 Command 但 md 是 AtomTask）。
@@ -83,12 +95,13 @@ _TYPE_TO_DIR = {t: d for d, types in _DIR_ALLOWED_TYPES.items() for t in types}
 @router.get("/fs/children")
 def list_children(path: str = ""):
     """列 path 目录直接子项（懒加载）；path="" → assets 根（真实顶层目录）。"""
-    return get_service().store.list_children(path)
+    return get_service().store.list_children(_request_path(path, allow_root=True))
 
 
 @router.get("/fs/file", response_class=PlainTextResponse)
 def read_file(path: str):
     svc = get_service()
+    path = _request_path(path)
     if not svc.store.exists(path):
         raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
     return PlainTextResponse(svc.store.read(path), media_type="text/markdown; charset=utf-8")
@@ -128,6 +141,7 @@ def put_file(path: str, req: FileContentIn, request: Request):
     """
     _require_assets(request)
     svc = get_service()
+    path = _request_path(path)
     with import_lock:
         store = svc.store
         try:
@@ -166,8 +180,7 @@ def delete_file(path: str, request: Request):
     路径经 ``store._resolve`` 校验未逃逸 assets 根；空 path（根）拒绝。
     """
     _require_assets(request)
-    if not path:
-        raise HTTPException(status_code=400, detail="不能删除 assets 根")
+    path = _request_path(path)
     svc = get_service()
     with import_lock:
         store = svc.store
@@ -225,6 +238,7 @@ def trash_restore(req: TrashIdIn, request: Request):
         except (FileNotFoundError, ValueError) as ex:
             raise HTTPException(status_code=404, detail=str(ex))
         files_repo.upsert_tree(svc.db, svc.store, rel)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [rel])
         prefix = rel.rstrip("/") + "/"
         for r in store.list_md():
             if r == rel or r.startswith(prefix):
@@ -274,12 +288,7 @@ class PathIn(BaseModel):
 def mkdir(req: PathIn, request: Request):
     _require_assets(request)
     svc = get_service()
-    normalized = req.path.replace("\\", "/")
-    if not normalized.strip("/"):
-        raise HTTPException(status_code=400, detail="不能创建 assets 根")
-    if normalized.startswith("/"):
-        raise HTTPException(status_code=400, detail="目录必须是 assets 内的相对路径")
-    path = normalized.strip("/")
+    path = _request_path(req.path)
     with import_lock:
         try:
             svc.store.makedirs(path)
@@ -311,11 +320,13 @@ def move(req: MoveIn, request: Request):
     """
     _require_assets(request)
     svc = get_service()
+    src = _request_path(req.src)
+    target_dir = _request_path(req.target_dir, allow_root=True)
     with import_lock:
         store = svc.store
-        if not store.exists(req.src):
-            raise HTTPException(status_code=404, detail=f"文件不存在: {req.src}")
-        text = store.read(req.src)
+        if not store.exists(src):
+            raise HTTPException(status_code=404, detail=f"文件不存在: {src}")
+        text = store.read(src)
         try:
             id_, _typ = validate_md(text, svc.registry)
         except ValueError as ex:
@@ -326,21 +337,21 @@ def move(req: MoveIn, request: Request):
         }.items() if v}
         if overrides:
             text = rewrite_frontmatter(text, overrides)
-        target = _join(req.target_dir, f"{id_}.md")
-        if target == req.src:
+        target = _join(target_dir, f"{id_}.md")
+        if target == src:
             svc.reload_index()
             return {"ok": True, "new_path": target, "moved": False}
         store.write(target, text)
         files_repo.upsert_from_disk(svc.db, svc.store, target)
         files_repo.upsert_parents_from_disk(svc.db, svc.store, [target])
-        store.delete(req.src)
-        files_repo.remove_path(svc.db, req.src)  # 盘删成功后再删册行（镜像 rename：盘删失败不悬空册删）
-        store.cleanup_empty_dirs(req.src)
-        files_repo.upsert_parents_from_disk(svc.db, svc.store, [req.src])
+        store.delete(src)
+        files_repo.remove_path(svc.db, src)  # 盘删成功后再删册行（镜像 rename：盘删失败不悬空册删）
+        store.cleanup_empty_dirs(src)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [src])
         svc.reindex_path(target)
-        svc.unindex_path(req.src)
+        svc.unindex_path(src)
         svc.reload_index()
-    _record(request, "/fs/move", req.src)
+    _record(request, "/fs/move", src)
     return {"ok": True, "new_path": target, "moved": True}
 
 
@@ -361,19 +372,35 @@ def rename(req: RenameIn, request: Request):
     """
     _require_assets(request)
     svc = get_service()
+    path = _request_path(req.path)
     with import_lock:
         store = svc.store
-        if not store.exists(req.path):
-            raise HTTPException(status_code=404, detail=f"文件不存在: {req.path}")
-        text = store.read(req.path)
+        if not store.exists(path):
+            raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+        text = store.read(path)
         try:
             old_id, _typ = validate_md(text, svc.registry)
         except ValueError as ex:
             raise HTTPException(status_code=400, detail=str(ex))
         new_id = req.new_id
+        try:
+            if not new_id or new_id != new_id.strip():
+                raise ValueError("new_id 不能为空或带首尾空白")
+            old_nf, old_type, _old_local = split_id(old_id)
+            new_nf, new_type, new_local = split_id(new_id)
+            if not new_type or not new_local or (new_nf is not None and not new_nf):
+                raise ValueError(f"非法逻辑ID（存在空段）: {new_id!r}")
+            if new_type != old_type:
+                raise ValueError("重命名不能改变对象 type")
+            if new_nf != old_nf:
+                raise ValueError("重命名不能改变 nf；请使用移动功能")
+        except ValueError as ex:
+            raise HTTPException(status_code=400, detail=str(ex)) from ex
         # target = 原目录 + new_id.md（不跨目录）
-        parent_dir = "/".join(req.path.split("/")[:-1])
-        target = f"{parent_dir}/{new_id}.md" if parent_dir else f"{new_id}.md"
+        parent_dir = "/".join(path.split("/")[:-1])
+        target = _join(parent_dir, f"{new_id}.md")
+        if target != path and store.exists(target):
+            raise HTTPException(status_code=409, detail=f"目标文件已存在: {target}")
         pattern = re.compile(r"\[\[" + re.escape(old_id) + r"\]\]")
         affected = [rel for rel in store.list_md() if pattern.search(store.read(rel))]
         if req.dry_run:
@@ -387,20 +414,20 @@ def rename(req: RenameIn, request: Request):
                 store.write(rel, nt)
                 files_repo.upsert_from_disk(svc.db, svc.store, rel)
                 svc.reindex_path(rel)
-        text2 = store.read(req.path)  # 重读（可能刚被上面改过 wikilink）
+        text2 = store.read(path)  # 重读（可能刚被上面改过 wikilink）
         new_text = rewrite_frontmatter(text2, {"id": new_id})
         store.write(target, new_text)
         files_repo.upsert_from_disk(svc.db, svc.store, target)
         files_repo.upsert_parents_from_disk(svc.db, svc.store, [target])
         svc.reindex_path(target)
-        if target != req.path:
-            store.delete(req.path)
-            files_repo.remove_path(svc.db, req.path)
-            store.cleanup_empty_dirs(req.path)
-            files_repo.upsert_parents_from_disk(svc.db, svc.store, [req.path])
-            svc.unindex_path(req.path)
+        if target != path:
+            store.delete(path)
+            files_repo.remove_path(svc.db, path)
+            store.cleanup_empty_dirs(path)
+            files_repo.upsert_parents_from_disk(svc.db, svc.store, [path])
+            svc.unindex_path(path)
         svc.reload_index()
-    _record(request, "/fs/rename", req.path)
+    _record(request, "/fs/rename", path)
     return {"ok": True, "old_id": old_id, "new_id": new_id,
             "affected": len(affected), "new_path": target}
 
@@ -425,6 +452,7 @@ async def upload(
     """
     _require_assets(request)
     svc = get_service()
+    target_dir = _request_path(target_dir, allow_root=True)
     added = updated = skipped = 0
     warnings: list = []
     overrides = {k: v for k, v in {

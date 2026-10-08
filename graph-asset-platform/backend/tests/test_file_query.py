@@ -70,6 +70,12 @@ def test_path_direct_children_ls_semantics(populated):
         "Command/UDG/20.15.2": True, "Command/UDG/20.16.0": True}
 
 
+def test_path_filter_normalizes_windows_separator(populated):
+    out = search_files_core(path=r"Command\UDG")
+    assert {f["path"] for f in out["files"]} == {
+        "Command/UDG/20.15.2", "Command/UDG/20.16.0"}
+
+
 def test_path_recursive_files_only(populated):
     out = search_files_core(path="Feature/UDG", recursive=True)
     assert [f["path"] for f in out["files"]] == [
@@ -109,6 +115,18 @@ def test_bad_path_structured_error(populated):
         search_files_core(path="NoSuchDir")
     assert ei.value.error.code == "INVALID_FILTER"
     assert ei.value.error.details.get("field") == "path"
+
+
+def test_missing_path_while_catalog_building_is_retryable(populated):
+    """首启扫描未走到合法目录时不能谎报非法筛选，调用方应收到可重试语义。"""
+    populated.files_building = True
+    try:
+        with pytest.raises(GraphQueryError) as ei:
+            search_files_core(path="Command/NotScannedYet")
+    finally:
+        populated.files_building = False
+    assert ei.value.error.code == "INDEX_REBUILDING"
+    assert ei.value.error.retryable is True
 
 
 def test_glob_metachar_dir(populated):

@@ -102,6 +102,16 @@ def test_store_path_traversal_rejected(tmp_data_dir):
         store.move("a.md", "../escape.md")
 
 
+@pytest.mark.parametrize("path", [
+    "Command/bad:name.md", "Command/NUL.md", "Command/trailing. ",
+    "Command/control\x01.md",
+])
+def test_store_rejects_nonportable_windows_path_aliases(tmp_data_dir, path):
+    store = Store(tmp_data_dir)
+    with pytest.raises(ValueError):
+        store.write(path, "x")
+
+
 # ---------- frontmatter_rw ----------
 
 def test_rewrite_frontmatter_overrides():
@@ -262,6 +272,71 @@ def test_fs_soft_delete_file_to_trash_and_restore(tmp_data_dir, monkeypatch):
     assert s.store.exists(p)
     assert s.index.resolve_node("alpha@MMLCommand@ADD DEMO", "20.15.2") is not None
     assert trash_repo.get(s.db, tid) is None
+
+
+def test_fs_restore_single_file_registers_recreated_parent_dirs(
+        tmp_data_dir, monkeypatch):
+    """单文件是目录中唯一内容时，删除会清空父目录；还原须把重建的目录也入册。"""
+    from app.file_query import search_files_core
+
+    s = _setup(tmp_data_dir, monkeypatch)
+    parent = "Command/alpha/20.15.2"
+    path = f"{parent}/alpha@MMLCommand@ADD DEMO.md"
+    s.store.write(path, CMD)
+    s.rebuild()
+
+    with TestClient(app) as c:
+        deleted = c.delete("/api/v1/fs/file", params={"path": path})
+        assert deleted.status_code == 200, deleted.text
+        restored = c.post(
+            "/api/v1/fs/trash/restore",
+            json={"id": deleted.json()["trash_id"]},
+        )
+        assert restored.status_code == 200, restored.text
+
+    parents = {row["path"] for row in s.db.execute(
+        "SELECT path FROM files WHERE is_dir=1")}
+    assert {"Command", "Command/alpha", parent} <= parents
+    listed = search_files_core(path=parent)
+    assert [item["path"] for item in listed["files"]] == [path]
+
+
+@pytest.mark.parametrize("request_path", [
+    r"Command\alpha\20.15.2\alpha@MMLCommand@ADD DEMO.md",
+    "Command/alpha/./20.15.2/alpha@MMLCommand@ADD DEMO.md",
+    "Command/alpha/temp/../20.15.2/alpha@MMLCommand@ADD DEMO.md",
+    r"C:\outside\alpha@MMLCommand@ADD DEMO.md",
+])
+def test_fs_write_path_variants_are_rejected_or_use_one_canonical_identity(
+        tmp_data_dir, monkeypatch, request_path):
+    """同一物理文件不得因 Windows 分隔符或点段产生 files/objects 双重身份。"""
+    from app.file_query import search_files_core
+
+    s = _setup(tmp_data_dir, monkeypatch)
+    canonical = "Command/alpha/20.15.2/alpha@MMLCommand@ADD DEMO.md"
+    with TestClient(app) as c:
+        response = c.put(
+            "/api/v1/fs/file", params={"path": request_path},
+            json={"content": CMD},
+        )
+
+    # API 可以选择严格拒绝非规范输入；一旦接受，就必须只留下规范路径身份。
+    if 400 <= response.status_code < 500:
+        assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+        assert s.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
+        return
+    assert response.status_code == 200, response.text
+    file_paths = [row["path"] for row in s.db.execute(
+        "SELECT path FROM files WHERE is_dir=0")]
+    object_paths = [row["source_path"] for row in s.db.execute(
+        "SELECT source_path FROM objects")]
+    assert file_paths == [canonical]
+    assert object_paths == [canonical]
+
+    hit = search_files_core(query="ADD DEMO")["files"]
+    assert [(item["path"], item["obj_id"], item["version"])
+            for item in hit] == [
+        (canonical, "alpha@MMLCommand@ADD DEMO", "20.15.2")]
 
 
 def test_fs_soft_delete_dir_recursive_to_trash(tmp_data_dir, monkeypatch):
@@ -448,6 +523,53 @@ def test_fs_rename_dry_run_and_apply(tmp_data_dir, monkeypatch):
     ).fetchone() is not None
 
 
+@pytest.mark.parametrize("new_id", [
+    "../escape", "", "foo", "alpha@Feature@AAA", "beta@MMLCommand@AAA",
+])
+def test_fs_rename_rejects_invalid_target_before_rewriting_references(
+        tmp_data_dir, monkeypatch, new_id):
+    s = _setup(tmp_data_dir, monkeypatch)
+    src = "Command/alpha/20.15.2/alpha@MMLCommand@AAA.md"
+    ref = "Command/alpha/20.15.2/alpha@MMLCommand@BBB.md"
+    src_md = CMD.replace("alpha@MMLCommand@ADD DEMO",
+                         "alpha@MMLCommand@AAA")
+    original_ref = ("---\nid: alpha@MMLCommand@BBB\ntype: MMLCommand\n---\n"
+                    "[[alpha@MMLCommand@AAA]]\n")
+    s.store.write(src, src_md)
+    s.store.write(ref, original_ref)
+    s.rebuild()
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        response = c.post("/api/v1/fs/rename", json={
+            "path": src, "new_id": new_id, "dry_run": False})
+
+    assert response.status_code == 400
+    assert s.store.exists(src)
+    assert s.store.read(ref) == original_ref
+
+
+def test_fs_rename_rejects_existing_target_without_overwrite(
+        tmp_data_dir, monkeypatch):
+    s = _setup(tmp_data_dir, monkeypatch)
+    src = "Command/alpha/20.15.2/alpha@MMLCommand@AAA.md"
+    target = "Command/alpha/20.15.2/alpha@MMLCommand@BBB.md"
+    src_md = CMD.replace("alpha@MMLCommand@ADD DEMO",
+                         "alpha@MMLCommand@AAA")
+    target_md = CMD.replace("alpha@MMLCommand@ADD DEMO",
+                            "alpha@MMLCommand@BBB")
+    s.store.write(src, src_md)
+    s.store.write(target, target_md)
+    s.rebuild()
+
+    with TestClient(app) as c:
+        response = c.post("/api/v1/fs/rename", json={
+            "path": src, "new_id": "alpha@MMLCommand@BBB", "dry_run": False})
+
+    assert response.status_code == 409
+    assert s.store.read(src) == src_md
+    assert s.store.read(target) == target_md
+
+
 # ---------- upload（target_dir 驱动）----------
 
 def test_fs_upload_to_target_dir(tmp_data_dir, monkeypatch):
@@ -508,6 +630,18 @@ def test_fs_upload_rejects_missing_id(tmp_data_dir, monkeypatch):
                       data={"target_dir": "Command/alpha/20.15.2"},
                       files={"files": ("bad.md", md, "text/markdown")}).json()
     assert body["skipped"] == 1 and body["added"] == 0
+
+
+def test_fs_upload_rejects_path_like_id_as_bad_request(tmp_data_dir, monkeypatch):
+    s = _setup(tmp_data_dir, monkeypatch)
+    bad = CMD.replace("alpha@MMLCommand@ADD DEMO", "../escape")
+    with TestClient(app, raise_server_exceptions=False) as c:
+        response = c.post(
+            "/api/v1/fs/upload", data={"target_dir": "Command/alpha/20.15.2"},
+            files={"files": ("bad.md", bad, "text/markdown")},
+        )
+    assert response.status_code == 400
+    assert s.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
 
 
 def test_fs_upload_wrong_layer_skipped(tmp_data_dir, monkeypatch):

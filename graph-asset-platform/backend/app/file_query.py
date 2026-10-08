@@ -17,12 +17,14 @@ temp B-tree 排序），全量遍历场景请用 path 模式（索引干净）�
 from datetime import datetime, timezone
 from typing import Optional
 
-from .graph_query.contracts import (INVALID_ARGUMENT, INVALID_FILTER,
+from .graph_query.contracts import (INDEX_REBUILDING, INVALID_ARGUMENT, INVALID_FILTER,
+                                    GraphError, GraphQueryError,
                                     MAX_FILES_AFTER_LEN, MAX_FILES_EXT_LEN,
                                     MAX_FILES_PATH_LEN, MAX_FILES_QUERY_LEN,
                                     err)
 from .repos.graph_search_repo import normalize_search_text
 from .service import get_service
+from .store import normalize_relpath
 
 TOTAL_CAP = 10_000
 MAX_QUERY_LEN = 80            # 规范化后（NFKC→strip→casefold）；原始输入上限
@@ -65,11 +67,15 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
     if len(norm_query) > MAX_QUERY_LEN:
         raise err(INVALID_ARGUMENT, f"query 规范化后最长 {MAX_QUERY_LEN} 字符")
     ext_n = (ext or "").strip().lstrip(".").lower() or None
-    path_n = (path or "").strip().strip("/") or None
+    raw_path = (path or "").strip()
+    if len(raw_path) > MAX_FILES_PATH_LEN:
+        raise err(INVALID_ARGUMENT, f"path 最长 {MAX_FILES_PATH_LEN} 字符")
+    try:
+        path_n = (normalize_relpath(raw_path) or None) if raw_path else None
+    except ValueError as ex:
+        raise err(INVALID_ARGUMENT, str(ex), field="path") from None
     if len(ext_n or "") > MAX_FILES_EXT_LEN:
         raise err(INVALID_ARGUMENT, f"ext 最长 {MAX_FILES_EXT_LEN} 字符")
-    if len(path_n or "") > MAX_FILES_PATH_LEN:
-        raise err(INVALID_ARGUMENT, f"path 最长 {MAX_FILES_PATH_LEN} 字符")
     if len(after or "") > MAX_FILES_AFTER_LEN:
         raise err(INVALID_ARGUMENT, f"after 游标最长 {MAX_FILES_AFTER_LEN} 字符")
     if not (norm_query or path_n or ext_n):
@@ -80,6 +86,13 @@ def search_files_core(*, query: Optional[str] = None, path: Optional[str] = None
         ok = conn.execute("SELECT 1 FROM files WHERE path=? AND is_dir=1",
                           (path_n,)).fetchone()
         if ok is None:
+            if bool(getattr(svc, "files_building", False)):
+                raise GraphQueryError(GraphError(
+                    code=INDEX_REBUILDING,
+                    message="文件索引正在构建，目录尚未可用，请稍后重试",
+                    retryable=True,
+                    details={"field": "path", "value": path_n[:ECHO_CAP]},
+                ))
             raise err(INVALID_FILTER,
                       f"path 不存在或不是目录: {path_n[:ECHO_CAP]}"
                       f"（首启建册期间可能未建全，稍后重试或联系管理员执行 "

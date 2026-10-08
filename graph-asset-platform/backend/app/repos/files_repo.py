@@ -13,15 +13,15 @@ import sqlite3
 from pathlib import Path
 
 from ..config import win_long
+from ..store import normalize_relpath
 from .graph_search_repo import normalize_search_text
 
 _CHUNK = 5000
 
 
 def _norm(rel: str) -> str:
-    """入口路径规范化：反斜杠→正斜杠、去首尾斜杠。非规范路径会造出半开
-    前缀区间外的幽灵行（如带尾斜杠的 mkdir path、Windows 反斜杠 rel）。"""
-    return rel.replace("\\", "/").strip("/")
+    """入口路径规范化：反斜杠→正斜杠、折叠空段并拒绝点段。"""
+    return normalize_relpath(rel)
 
 
 def _stat_row(rel: str, st, is_dir: int) -> tuple:

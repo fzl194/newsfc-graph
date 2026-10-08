@@ -503,6 +503,38 @@ def test_reconcile_completed_stale_apply_marks_done(env, monkeypatch):
     assert jobs_mod.pending_for("product_doc_mine") is None
 
 
+def test_reconcile_completed_stale_apply_repairs_files_catalog_before_done(
+        env, monkeypatch):
+    """崩在对象索引完成、files 户口未写之间时，对账须先补册再确认 done。"""
+    from app import jobs as jobs_mod
+    from app.service import get_service
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    svc = get_service()
+    manifest = _rows(confirmed.job_id)
+    assert manifest
+
+    # 模拟 apply 在 files_repo 同步之前崩溃：资产、objects/FTS/清单均已完成，户口为空。
+    for table in ("files", "files_fts", "files_fts_map"):
+        svc.db.execute(f"DELETE FROM {table}")
+    result = dict(jobs_mod.get_job(confirmed.job_id).result)
+    jobs_mod.update_job(
+        confirmed.job_id, status="processing",
+        result={**result, "stage": "applying"}, added=0, finished_at=0,
+    )
+    jobs_mod._registry.clear()
+
+    assert gate.reconcile_interrupted() >= 1
+    restored = jobs_mod.get_job(confirmed.job_id)
+    assert restored.status == "done"
+    catalog_paths = {row["path"] for row in svc.db.execute(
+        "SELECT path FROM files")}
+    manifest_paths = {row["path"] for row in manifest}
+    assert manifest_paths <= catalog_paths
+    assert all("/".join(path.split("/")[:-1]) in catalog_paths
+               for path in manifest_paths)
+
+
 def test_get_job_is_read_only_for_stale_apply(env, monkeypatch):
     """GET 任务轮询必须无写副作用，不得隐式执行孤儿清扫/终止 PID。"""
     from app import jobs as jobs_mod

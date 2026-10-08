@@ -13,7 +13,7 @@ from .config import ASSETS_DIR
 from .db import get_shared_db
 from .index import Index
 from .registry import Registry
-from .store import Store
+from .store import Store, normalize_relpath
 
 # 模块级写锁：写盘 + DB UPSERT + reload 内存必须串行化（单例跨线程共享）。
 import_lock = threading.Lock()
@@ -176,6 +176,7 @@ class Service:
         按 ``old_ids ∪ new_ids`` 刷新（v12 统一搜索，§12.1）——刷新在未提交事务
         内执行，不产生额外 commit（reindex_paths 的分块节奏不受影响）。
         """
+        rel = normalize_relpath(rel, allow_root=False)
         from .edges import parse_edges
         from .logical_id import split_id
         from .md_parser import parse_md
@@ -269,7 +270,8 @@ class Service:
         每 ``chunk_size`` 个文件提交一次，既避免逐文件事务，也不长时间
         饿死 jobs/telemetry 的独立 SQLite 写者。
         """
-        unique = sorted({str(path).replace("\\", "/") for path in paths
+        unique = sorted({normalize_relpath(str(path), allow_root=False)
+                         for path in paths
                          if str(path).lower().endswith(".md")})
         if not unique:
             return {"indexed": 0, "removed": 0}
@@ -306,8 +308,8 @@ class Service:
         prefixes 如 ``["Command/UDG/20.15.2", "Feature/UDG/20.15.2"]``；
         **调用方须持 import_lock**（与 fs 写端点一致）。返回 {"indexed", "removed"}。
         """
-        normalized = sorted({p.strip().strip("/") for p in prefixes
-                             if p and p.strip(" / ")})
+        normalized = sorted({normalize_relpath(p, allow_root=False)
+                             for p in prefixes if p and p.strip(" / ")})
         if not normalized:
             return {"indexed": 0, "removed": 0}
         disk = sorted({rel for prefix in normalized

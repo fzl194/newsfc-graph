@@ -160,6 +160,30 @@ def test_files_bootstrap_async(tmp_data_dir):
     ).fetchone()[0] == "1"
 
 
+def test_mtime_sync_canonicalizes_legacy_backslash_source_without_deleting_object(
+        tmp_data_dir):
+    """存量反斜杠 source_path 自愈后，不得被 deleted 阶段再次删掉。"""
+    s = _bare_service(tmp_data_dir)
+    rel = "Command/UDG/20.15.2/UDG@MMLCommand@ADD URR.md"
+    md = ("---\nid: UDG@MMLCommand@ADD URR\ntype: MMLCommand\n"
+          "nf: UDG\nversion: 20.15.2\n---\nbody\n")
+    s.store.write(rel, md)
+    s.reindex_path(rel)
+    legacy = rel.replace("/", "\\")
+    s.db.execute("UPDATE objects SET source_path=? WHERE id=?",
+                 (legacy, "UDG@MMLCommand@ADD URR"))
+    s.db.commit()
+
+    changed, deleted = s._scan_mtime_changes()
+    assert rel in changed and legacy in deleted
+    s._sync_mtime()
+
+    rows = s.db.execute(
+        "SELECT source_path FROM objects WHERE id=?",
+        ("UDG@MMLCommand@ADD URR",)).fetchall()
+    assert [row["source_path"] for row in rows] == [rel]
+
+
 def test_bootstrap_reruns_when_table_nonempty_without_marker(tmp_data_dir):
     """门控行为锁定：表非空但无完成标记（进程被杀留半截册）→ bootstrap 重跑。"""
     s = _bare_service(tmp_data_dir)

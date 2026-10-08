@@ -1,9 +1,9 @@
 """MCP 服务（Streamable HTTP，同进程挂载 /mcp；CR：MCP 服务化 2026-08-24）。
 
 设计要点（docs/需求分析与实施计划-MCP服务化-2026-08-24.md）：
-- 5 工具：get_domains / get_md / search_objects / search_md / get_object——
-  继承 REST 兼容接口（POST /domains、POST /md）的查询语义，并增加
-  search_md 正文召回等能力（FTS5）；两条通道并行提供。
+- 7 个注册工具：公开 get_domains / get_md / search_graph / search_files；
+  legacy search_objects / search_md / get_object 默认 hidden，仅用于旧客户端兼容。
+  REST 兼容通道与公开工具共享核心契约。
 - 上下文参数 AGENT_USERNAME / AGENT_SESSION_ID：Agent 从沙箱环境变量
   ``_AGENT_USERNAME`` / ``_AGENT_SESSION_ID`` 读取后传入（打点归因，不影响结果；
   SDK 禁止下划线前缀参数名，故工具参数名去掉前导下划线）。
@@ -59,7 +59,7 @@ _CTX_SID = ("【必传】当前会话ID：每次调用从环境变量 _AGENT_SES
 # 服务总体说明 canonical（§9.3 短决策树）。admin 补充经 meta.mcp_instructions
 # **追加**在 canonical 之后——不再全文覆盖（旧覆盖值已由 v13 迁移备份）。
 DEFAULT_INSTRUCTIONS = (
-    "三层电信图谱（业务层→任务层→特性层→命令层）查询服务。使用决策树：\n"
+    "配置知识图谱（业务层→任务层→特性层→命令层）查询服务。使用决策树：\n"
     "1. 按业务意图找方案：get_domains 读业务域 md 的全文 [[ID]] 引用后 get_md 下钻。\n"
     "2. 按关键词找对象：search_graph 定位候选（多关键词放 terms 数组，任一命中用 "
     "match=any，全部命中用 match=all）；选定候选后必须 get_md 取完整原文——"
@@ -68,7 +68,8 @@ DEFAULT_INSTRUCTIONS = (
     "get_md 读该文件内容；非 md 文件只有元数据；全量获取用 after 游标循环翻页）。\n"
     "4. 参数字段范围：定位 MMLCommand 后 get_md，读取 CommandParameter 段。\n"
     "5. get_md 单项失败不重试整批（失败项回带 available_versions，改版本或移除该 id）。\n"
-    "所有搜索与读取默认作用于每个 ID 的最新现存版本（version 参数可锁定旧版）。"
+    "图谱对象的搜索与读取默认作用于每个 ID 的最新现存版本（version 参数可锁定旧版）；"
+    "search_files 遍历磁盘上的具体版本文件，不做最新版折叠。"
 )
 
 # legacy 工具替换映射（§11.3：deprecated 打点 + 错误指引）
@@ -263,7 +264,7 @@ def _validation_details(e: ValidationError) -> dict:
 
 @mcp.tool()
 def get_domains(AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)], ctx: Context = None) -> DomainsResponse:
-    """获取三层图谱全部业务域（BusinessDomain）的完整 markdown。
+    """获取配置知识图谱全部业务域（BusinessDomain）的完整 markdown。
 
     业务域是业务归属的顶层定位层，按业务意图定位（找业务方案/场景归属）时的
     第一步；按关键词找对象请用 search_graph，按文件名找文件请用 search_files。
@@ -386,13 +387,13 @@ def search_graph(
     size: Annotated[int, Field(
         description="单页条数（1~50，默认 20——防止单页撑爆上下文）", ge=1, le=50)] = 20,
     ctx: Context = None) -> SearchGraphResponse:
-    """统一搜索三层图谱（元数据 id/name/name_zh + md 正文），定位候选对象 ID。
+    """统一搜索配置知识图谱（元数据 id/name/name_zh + md 正文），定位候选对象 ID。
 
-    不知道对象 ID 时的唯一入口（业务方案定位用 get_domains）。
+    按对象关键词定位 ID 的统一入口（业务方案定位用 get_domains；按文件名定位用 search_files）。
     默认作用于每个 ID 的最新现存版本（version 参数可锁定旧版）。命中量过大时
     正常返回按相关度截断的候选（total_is_bounded=true，宽词 match=all 的交集
-    可能不含池外命中；全量获取场景请用 search_files 的 after 游标），加过滤词
-    可提升质量。返回候选列表 +
+    可能不含池外命中，因此不保证正文搜索结果找全）；增加过滤词可提升质量。
+    若目标是全量枚举物理文件，请另用 search_files 的 after 游标。返回候选列表 +
     matched_terms/matched_in/snippets/facets/diagnostics：
     - snippet 只是定位线索，**不是权威依据**——选定候选后必须调 get_md 取完整
       原文（MMLCommand 参数字段范围以 get_md 返回的 CommandParameter 段为准）；
@@ -432,7 +433,7 @@ def search_files(
     AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
     query: Annotated[Optional[str], Field(
         max_length=MAX_FILES_QUERY_LEN,
-        description="文件名关键词（子串，不分大小写；规范化后至少 2 字符）。"
+        description="文件名关键词（子串，不分大小写；规范化后 2~80 字符）。"
                     "如 'ADD URR' 命中 UDG@MMLCommand@ADD URR.md；"
                     "3 字符以上走索引，2 字符为语料扫描（大库下罕见词稍慢）")] = None,
     path: Annotated[Optional[str], Field(
@@ -465,7 +466,8 @@ def search_files(
     md 文件命中回带 obj_id+version——用 get_md(ids=[obj_id], version=version)
     读**该文件**的完整内容（不带 version 会取最新版，可能不是这个文件）；
     非 md 文件（图片等）只有元数据。
-    query/path/ext 至少给一个；total 精确到 10000，超过时 total_is_bounded=true。
+    query/path/ext 至少给一个；空 path（path='' 或 '/'）不代表 assets 根目录，
+    不能单独用于列根；total 精确到 10000，超过时 total_is_bounded=true。
     index_building=true 表示首启建册未完成，结果不全可稍后重试。
     """
     user = _identity(ctx)
@@ -495,11 +497,11 @@ def search_objects(AGENT_USERNAME: Annotated[AgentUsername, Field(description=_C
                    nf: Optional[str] = None, version: Optional[str] = None,
                    domain: Optional[str] = None, scenario: Optional[str] = None,
                    page: int = 1, size: int = 50, ctx: Context = None) -> dict:
-    """按关键词搜索图谱对象的元数据（匹配 id / name / name_zh，不搜正文）。
+    """已废弃（deprecated）：请改用 search_graph。仅搜索图谱对象元数据。
 
     支持按层（命令层/特性层/任务层/业务层）、类型、网元、版本、业务域过滤。
     用于：已知大致名称/编号时定位对象 ID，或浏览某层某网元的对象清单。
-    要搜正文内容请用 search_md。
+    兼容旧客户端保留；新调用不要再使用本工具或 search_md。
 
     Args:
         AGENT_USERNAME: 当前使用者工号（从环境变量 _AGENT_USERNAME 读取传入）
@@ -541,7 +543,7 @@ def search_md(q: str, AGENT_USERNAME: Annotated[AgentUsername, Field(description
               layer: Optional[str] = None, type: Optional[str] = None,
               nf: Optional[str] = None, version: Optional[str] = None,
               limit: int = 20, offset: int = 0, ctx: Context = None) -> dict:
-    """全文搜索图谱所有对象的 markdown 正文，按相关度排序返回高亮摘要片段。
+    """已废弃（deprecated）：请改用 search_graph 搜索对象及 markdown 正文。
 
     用于：①用户意图式召回——不确定对象 ID 时按业务关键词找相关 md；②查某个
     参数/命令/特性名出现在哪些对象里。返回片段摘要而非全文，选中后用 get_md
@@ -580,7 +582,7 @@ def search_md(q: str, AGENT_USERNAME: Annotated[AgentUsername, Field(description
 @mcp.tool()
 def get_object(id: str, AGENT_USERNAME: Annotated[AgentUsername, Field(description=_CTX)], AGENT_SESSION_ID: Annotated[AgentSessionId, Field(description=_CTX_SID)],
                version: Optional[str] = None, ctx: Context = None) -> dict:
-    """获取单个图谱对象的结构化详情：frontmatter 元数据、正文、出边列表。
+    """已废弃（deprecated）：请改用 get_md 获取权威原文与全文引用。
 
     需要看对象的关联关系（如某 FeatureTask 引用了哪些命令）时用。
     ⚠ 出边仅含 curated 边（## 边段声明的显式边），完备遍历必须读 md 全文提取
